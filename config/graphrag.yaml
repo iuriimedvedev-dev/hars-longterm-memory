@@ -1,0 +1,117 @@
+# GraphRAG Configuration — all model bindings are config, NOTHING hardcoded.
+# Override any value with the matching env var (see .env.example).
+
+# ---------------------------------------------------------------------------
+# LLM roles
+# ---------------------------------------------------------------------------
+llm:
+  # Extraction LLM — quality-critical, GPU-exclusive (Qwen3.6-27B GGUF via llama-server).
+  # DO NOT start this server while vea/expert/ai_tuner/finetune/distillation is running.
+  extractor:
+    base_url: "${GRAPHRAG_EXTRACTOR_BASE_URL:-http://localhost:8080/v1}"
+    model: "${GRAPHRAG_EXTRACTOR_MODEL:-Qwen3.6-27B-Q4_K_M}"
+    max_tokens: 4096
+    temperature: 0.1
+    timeout: 120
+
+  # Query / keyword LLM — light, CPU-feasible if small enough.
+  query:
+    base_url: "${GRAPHRAG_QUERY_BASE_URL:-http://localhost:8081/v1}"
+    model: "${GRAPHRAG_QUERY_MODEL:-Qwen3.5-4B-Q4_K_M}"
+    max_tokens: 2048
+    temperature: 0.1
+    timeout: 60
+
+# ---------------------------------------------------------------------------
+# Embedder — ALWAYS on CPU, e5-large-v2 already in HF cache.
+# ---------------------------------------------------------------------------
+embedder:
+  model: "${GRAPHRAG_EMBED_MODEL:-intfloat/e5-large-v2}"
+  hf_cache_dir: "${HF_HOME:-/mnt/datasets/models/.hf_home}"
+  device: "cpu"
+  batch_size: 32
+  max_length: 512
+  # Swap to nomic-embed-text or bge-m3 here — zero code change required.
+
+# ---------------------------------------------------------------------------
+# Vector store — Qdrant
+# ---------------------------------------------------------------------------
+qdrant:
+  url: "${GRAPHRAG_QDRANT_URL:-http://localhost:6333}"
+  collection: "${GRAPHRAG_QDRANT_COLLECTION:-hars_graphrag}"
+  vector_size: 1024  # e5-large-v2 output dim; update when swapping embedder
+
+# ---------------------------------------------------------------------------
+# Graph (KV) store — NetworkX file-backed for PoC
+# ---------------------------------------------------------------------------
+graph:
+  backend: "networkx"  # Migrate to postgres/neo4j later; change here
+  storage_dir: "${GRAPHRAG_STORAGE_DIR:-/tmp/hars_graphrag_store}"
+
+# ---------------------------------------------------------------------------
+# Ingestion sources
+# ---------------------------------------------------------------------------
+ingest:
+  # Root paths to walk — can be overridden via --paths CLI flag
+  default_paths:
+    - ".reports"
+    - ".plans"
+    - ".session"
+
+  # Include/exclude globs (fnmatch-style, relative or absolute)
+  include_globs:
+    - "**/*.md"
+    - "**/*.txt"
+    - "**/*.json"
+    - "**/*.py"
+
+  exclude_globs:
+    - "**/.env*"
+    - "**/secrets*"
+    - "**/*.ckpt"
+    - "**/*.pt"
+    - "**/*.safetensors"
+    - "**/*.bin"
+    - "**/*.pkl"
+    - "**/*.zarr"
+    - "**/__pycache__/**"
+    - "**/node_modules/**"
+    - "**/.git/**"
+    - "**/target/**"       # Rust build output
+    - "**/htmlcov/**"
+    - "**/unsloth_compiled_cache/**"
+
+  # .graphragignore is also respected (gitignore syntax, one pattern per line)
+  ignore_file: ".graphragignore"
+
+  # Chunking
+  chunk_size: 1200        # characters
+  chunk_overlap: 200
+
+# ---------------------------------------------------------------------------
+# Postgres source export
+# ---------------------------------------------------------------------------
+postgres:
+  dsn: "${GRAPHRAG_POSTGRES_DSN:-postgresql://localhost:5432/hars}"
+  tables:
+    - experiments
+    - hypotheses
+    - hypothesis_links
+
+# ---------------------------------------------------------------------------
+# GPU guard — mirrors distillation.py pattern
+# ---------------------------------------------------------------------------
+gpu_guard:
+  api_base_url: "${HARS_API_BASE_URL:-http://localhost:8765}"
+  exclusive_workflows:
+    - vea
+    - expert
+    - ai_tuner
+    - finetune
+    - distillation
+
+# ---------------------------------------------------------------------------
+# LightRAG working directory (graph + KV files)
+# ---------------------------------------------------------------------------
+lightrag:
+  working_dir: "${GRAPHRAG_WORKING_DIR:-/tmp/hars_graphrag_lightrag}"

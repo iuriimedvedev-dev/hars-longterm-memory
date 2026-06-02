@@ -1,0 +1,1 @@
+"""HARS GraphRAG ingestion layer."""

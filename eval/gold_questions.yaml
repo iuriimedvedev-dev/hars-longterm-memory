@@ -1,0 +1,93 @@
+# Gold multi-hop evaluation questions for HARS GraphRAG.
+# Each question requires traversing ≥2 hops across DB + prose sources.
+# Run check.py after indexing to assert correct source-node retrieval.
+
+questions:
+  - id: gq1
+    question: >
+      Which hypotheses were invalidated by Phase-C results, and what checkpoint
+      produced the regressing metric?
+    hops: 3
+    hop_chain: "Hypothesis → Report/Finding → Checkpoint → Metric"
+    expected_entities:
+      - type: Hypothesis
+        id_prefix: "hyp:"
+      - type: Checkpoint
+      - type: Metric
+    expected_relations:
+      - invalidates
+      - produces
+      - regresses
+    notes: >
+      Phase C destroys Phase A gains — hyp:h6, hyp:h7 should appear.
+      Source files: .reports/2026-*_phase_c*.md, hypothesis_links table.
+
+  - id: gq2
+    question: >
+      What did we conclude about ROCm gfx1201 page faults across all reports,
+      and what was the fix?
+    hops: 2
+    hop_chain: "Finding → Report → Component (ROCm/HSA)"
+    expected_entities:
+      - type: Finding
+        keywords: ["page fault", "gfx1201", "HSA", "TheRock"]
+      - type: Component
+        keywords: ["ROCm", "llama-server", "HSA"]
+    expected_relations:
+      - documented_in
+      - depends_on
+    notes: >
+      TheRock wheels bundle HSA 1.18.14 fix. Sources: .reports/2026-*rocm*.md,
+      .session/2026-04-15_rocm-smoke-tests.md.
+
+  - id: gq3
+    question: >
+      Which encoder or backbone choices outperformed others and in which experiment?
+    hops: 2
+    hop_chain: "Encoder/Backbone → Experiment → Metric"
+    expected_entities:
+      - type: Model/Backbone
+        keywords: ["Qwen3.5-4B", "Qwen3.6-27B", "e5-large-v2"]
+      - type: Experiment
+      - type: Metric
+    expected_relations:
+      - outperforms
+      - evaluated_on
+    notes: >
+      Scale flip: 4B VEA hurts, 9B VEA helps.  Sources: .reports/2026-*h6_h7*.md,
+      project_h6_h7_scale_flip.md.
+
+  - id: gq4
+    question: >
+      What is the VEA Phase A to C pipeline and how does each phase relate
+      to the next?
+    hops: 3
+    hop_chain: "Pipeline/Phase A → Pipeline/Phase B → Pipeline/Phase C → Checkpoint"
+    expected_entities:
+      - type: Pipeline/Phase
+        keywords: ["Phase A", "Phase B", "Phase C"]
+    expected_relations:
+      - derived_from
+      - produces
+      - supersedes
+    notes: >
+      Sources: .plans/2026-*_vea-*.md, vea-direct-lm-pipeline.md.
+
+  - id: gq5
+    question: >
+      Which eval templates were used for VEA evaluation and what scores did the
+      top hypotheses achieve?
+    hops: 2
+    hop_chain: "Experiment → Hypothesis → Metric/Score"
+    expected_entities:
+      - type: Experiment
+        keywords: ["eval", "vea"]
+      - type: Hypothesis
+      - type: Metric
+        keywords: ["F1", "BERTScore", "Prometheus"]
+    expected_relations:
+      - evaluated_on
+      - confirms
+      - tests
+    notes: >
+      Sources: .reports/2026-*eval*.md, eval_templates.md, hypothesis_links table.
