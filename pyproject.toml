@@ -14,7 +14,7 @@ dependencies = [
   "lightrag-hku>=1.4.16",
 
   # CPU-only sentence embeddings (e5-large-v2, bge-m3, nomic-embed-text)
-  "sentence-transformers>=3.0.0",
+  "sentence-transformers>=5.0.0",
 
   # torch CPU wheel — resolved via the pytorch-cpu named index below
   "torch>=2.0.0",
@@ -46,13 +46,14 @@ dev = [
 ]
 
 [project.scripts]
-graphrag-index = "tools.graphrag.server.index:main"
-graphrag-mcp   = "plugins.hars-graphrag.scripts.hars_graphrag_mcp:main"
+graphrag-index = "hars_graphrag.cli:index_main"
+graphrag-mcp   = "hars_graphrag.cli:mcp_main"
+graphrag-eval-battle = "hars_graphrag.cli:eval_battle_main"
 
 [tool.hatch.build.targets.wheel]
 # This is an application, not a library.  Packages are declared explicitly to
 # prevent hatchling from scanning for a matching package name.
-packages = ["ingest", "schema", "server"]
+packages = ["hars_graphrag"]
 
 # ---------------------------------------------------------------------------
 # UV configuration — CPU-only torch via an EXPLICIT named index

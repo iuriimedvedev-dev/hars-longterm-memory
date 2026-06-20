@@ -10,7 +10,17 @@ from enum import Enum
 
 
 class EntityType(str, Enum):
-    """Typed entities extracted from HARS corpus."""
+    """Typed entities extracted from HARS corpus.
+
+    IMPORTANT: LightRAG rejects entity types that contain ``/``, ``|``, or
+    other special characters (see lightrag/operate.py).  All values here must
+    be slash-free.  The extractor LLM lowercases and strips spaces before
+    storing, so names are matched case-insensitively at insertion time.
+
+    ``Model/Backbone`` was split into ``Model`` + ``Backbone`` and
+    ``Pipeline/Phase`` was split into ``Pipeline`` + ``Phase`` to ensure the
+    LLM's output is accepted rather than silently dropped.
+    """
 
     HYPOTHESIS = "Hypothesis"
     EXPERIMENT = "Experiment"
@@ -18,9 +28,11 @@ class EntityType(str, Enum):
     CHECKPOINT = "Checkpoint"
     METRIC = "Metric"
     DATASET = "Dataset"
-    MODEL_BACKBONE = "Model/Backbone"
+    MODEL = "Model"
+    BACKBONE = "Backbone"
     ENCODER = "Encoder"
-    PIPELINE_PHASE = "Pipeline/Phase"
+    PIPELINE = "Pipeline"
+    PHASE = "Phase"
     REPORT = "Report"
     PLAN = "Plan"
     FINDING = "Finding"

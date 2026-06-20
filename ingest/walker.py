@@ -171,9 +171,15 @@ def walk(
         extra_excludes = _load_ignore_patterns(base_path, ignore_file)
         effective_excludes = list(exclude_globs) + extra_excludes
 
+        is_single_file = base_path.is_file()
         candidates: list[Path] = (
-            [base_path] if base_path.is_file() else list(base_path.rglob("*"))
+            [base_path] if is_single_file else list(base_path.rglob("*"))
         )
+        # When the caller passes an individual file, use its parent directory as
+        # the base for relative-path and glob computation.  Without this,
+        # file_path.relative_to(base_path) resolves to '.' which matches no
+        # include glob and silently drops the document.
+        rel_base = base_path.parent if is_single_file else base_path
 
         for file_path in candidates:
             if not file_path.is_file() or file_path.is_symlink():
@@ -181,7 +187,7 @@ def walk(
 
             stats.files_seen += 1
             try:
-                rel = str(file_path.relative_to(base_path))
+                rel = str(file_path.relative_to(rel_base))
             except ValueError:
                 rel = str(file_path)
 

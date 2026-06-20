@@ -47,16 +47,22 @@ def transform_experiment_row(row: dict[str, object]) -> Document:
     name = row.get("name") or row.get("workflow_type") or row_id
     status = row.get("status", "unknown")
     workflow = row.get("workflow_type", "")
+    operation = row.get("operation", "")
+    checkpoint_path = row.get("checkpoint_path", "")
     config_snippet = json.dumps(row.get("config") or {}, indent=2)[:800]
+    metrics_snippet = json.dumps(row.get("final_metrics") or {}, indent=2)[:800]
 
     content = (
         f"Experiment ID: {row_id}\n"
         f"Name: {name}\n"
         f"Workflow: {workflow}\n"
+        f"Operation: {operation}\n"
         f"Status: {status}\n"
+        f"Checkpoint path: {checkpoint_path}\n"
+        f"Final metrics (excerpt):\n{metrics_snippet}\n"
         f"Config (excerpt):\n{config_snippet}\n"
     )
-    for extra_key in ("description", "notes", "tags"):
+    for extra_key in ("project", "job_id", "pipeline_id", "tags", "error", "baseline_experiment_id"):
         value = row.get(extra_key)
         if value:
             content += f"{extra_key.capitalize()}: {value}\n"
@@ -143,8 +149,10 @@ def transform_hypothesis_link_row(row: dict[str, object]) -> Document:
 
 _EXPORT_QUERIES: dict[str, str] = {
     "experiments": (
-        "SELECT id, name, workflow_type, status, config, description, "
-        "created_at, updated_at FROM experiments ORDER BY created_at DESC"
+        "SELECT id, project, name, operation, job_id, pipeline_id, config, tags, "
+        "status, checkpoint_path, final_metrics, created_at, updated_at, "
+        "workflow_type, error, baseline_experiment_id "
+        "FROM experiments ORDER BY created_at DESC"
     ),
     "hypotheses": (
         "SELECT id, slug, title, status, description, rationale, "

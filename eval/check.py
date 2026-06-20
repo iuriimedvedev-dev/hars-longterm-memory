@@ -71,51 +71,69 @@ async def _run_checks(mode: str) -> bool:
     questions = _load_gold()
 
     # Import the query function from the MCP server logic
-    from tools.graphrag.server.lightrag_init import create_lightrag
+    from tools.graphrag.server.lightrag_init import create_lightrag, create_query_model_func
     from lightrag import QueryParam  # type: ignore[import-not-found]
 
     rag = create_lightrag()
+    await rag.initialize_storages()
+    lightrag_mode = "mix" if mode == "hybrid" else mode
 
     passed = 0
     failed = 0
     results: list[dict[str, Any]] = []
 
-    for q in questions:
-        qid = q["id"]
-        question_text = q["question"].strip()
-        logger.info("Running: %s — %s", qid, question_text[:80])
+    try:
+        for q in questions:
+            qid = q["id"]
+            question_text = q["question"].strip()
+            logger.info("Running: %s — %s", qid, question_text[:80])
 
-        try:
-            raw = await rag.aquery(  # type: ignore[attr-defined]
-                question_text,
-                param=QueryParam(mode=mode, top_k=12),
-            )
-            answer = str(raw) if not isinstance(raw, dict) else raw.get("answer", str(raw))
-            citations = []
-            if isinstance(raw, dict):
-                citations = raw.get("citations") or raw.get("sources") or []
+            try:
+                raw = await rag.aquery_llm(  # type: ignore[attr-defined]
+                    question_text,
+                    param=QueryParam(
+                        mode=lightrag_mode,
+                        top_k=12,
+                        chunk_top_k=12,
+                        model_func=create_query_model_func(),
+                        include_references=True,
+                    ),
+                )
+                data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+                chunks = data.get("chunks", []) if isinstance(data, dict) else []
+                citations = [
+                    {
+                        "source_path": chunk.get("file_path", ""),
+                        "snippet": chunk.get("content", ""),
+                    }
+                    for chunk in chunks
+                    if isinstance(chunk, dict)
+                ]
+                answer = str((raw.get("llm_response") or {}).get("content") or "")
 
-            result = {"answer": answer, "citations": citations}
-            ok, reason = _check_answer(q, result)
+                result = {"answer": answer, "citations": citations}
+                ok, reason = _check_answer(q, result)
 
-            status = "PASS" if ok else "FAIL"
-            if ok:
-                passed += 1
-            else:
+                status = "PASS" if ok else "FAIL"
+                if ok:
+                    passed += 1
+                else:
+                    failed += 1
+
+                logger.info("[%s] %s — %s", status, qid, reason)
+                results.append({
+                    "id": qid,
+                    "status": status,
+                    "reason": reason,
+                    "answer_preview": answer[:300],
+                })
+
+            except Exception as exc:
+                logger.error("[ERROR] %s — %s: %s", qid, type(exc).__name__, exc)
                 failed += 1
-
-            logger.info("[%s] %s — %s", status, qid, reason)
-            results.append({
-                "id": qid,
-                "status": status,
-                "reason": reason,
-                "answer_preview": answer[:300],
-            })
-
-        except Exception as exc:
-            logger.error("[ERROR] %s — %s: %s", qid, type(exc).__name__, exc)
-            failed += 1
-            results.append({"id": qid, "status": "ERROR", "reason": str(exc)})
+                results.append({"id": qid, "status": "ERROR", "reason": str(exc)})
+    finally:
+        await rag.finalize_storages()
 
     print("\n" + "=" * 60)
     print(f"EVAL RESULT: {passed}/{len(questions)} passed, {failed} failed (mode={mode})")

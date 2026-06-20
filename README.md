@@ -2,7 +2,7 @@
 
 Local, model-agnostic GraphRAG service for the HARS/Cortex project.
 
-**Stack**: LightRAG (lightrag-hku 1.4.16) · e5-large-v2 on CPU · Qdrant · NetworkX (PoC) · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
+**Stack**: LightRAG (lightrag-hku 1.4.16) · e5-large-v2 on CPU · NanoVectorDB (file-backed PoC) · NetworkX · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
 
 **Package manager**: [UV](https://docs.astral.sh/uv/) — standalone project at `tools/graphrag/` with its own `pyproject.toml` + `uv.lock`. Fully isolated from the main workspace and the ROCm training venv.
 
@@ -17,13 +17,17 @@ Local, model-agnostic GraphRAG service for the HARS/Cortex project.
 uv sync --project tools/graphrag --extra dev
 ```
 
-### 2. Start Qdrant
+### 2. Start Qdrant (optional prepared backend)
 
 ```bash
 docker compose -f docker-compose.dev.yml up hars-graphrag-qdrant -d
 # Confirm health:
-curl http://localhost:6333/readyz
+curl http://localhost:6335/readyz
 ```
+
+The current pinned LightRAG package uses `NanoVectorDBStorage` by default because
+this installed build does not include a Qdrant storage implementation. The
+dedicated Qdrant service is kept ready for the next backend swap.
 
 ### 3. Configure
 
@@ -35,9 +39,19 @@ cp tools/graphrag/config/.env.example tools/graphrag/config/.env
 ### 4. Run indexing (GPU MUST be free)
 
 Wait until no `vea/expert/ai_tuner/finetune/distillation` experiment is running.
+Confirm the OpenAI-compatible extractor endpoint is live before starting:
+
+```bash
+curl http://localhost:8080/v1/models  # extractor
+```
+
 Then:
 
 ```bash
+GRAPHRAG_EXTRACTOR_BASE_URL=http://localhost:8080/v1 \
+GRAPHRAG_EXTRACTOR_MODEL=Qwen3.6-27B-Q4_K_M \
+GRAPHRAG_QUERY_BASE_URL=http://localhost:8080/v1 \
+GRAPHRAG_QUERY_MODEL=Qwen3.6-27B-Q4_K_M \
 uv run --project tools/graphrag python tools/graphrag/server/index.py \
     --paths .reports .plans .session \
     --db-export
@@ -51,6 +65,13 @@ uv run --project tools/graphrag python tools/graphrag/server/index.py \
     --paths .reports .plans --dry-run
 ```
 
+If either endpoint is down, start `llama-server` with a real local `.gguf` file
+first. The battle-tested failure mode is:
+
+- no `*.gguf` under the expected model cache path, so `llama-server` cannot start;
+- no `/v1/models` response on the configured endpoint, so real indexing/querying cannot run;
+- dry-run ingest, Postgres export, MCP status, and MCP dry-run reindex still work.
+
 ---
 
 ## Swapping models
@@ -62,7 +83,8 @@ All model bindings are in `config/.env` (or environment variables). No code chan
 | Extraction LLM | `GRAPHRAG_EXTRACTOR_BASE_URL` + `GRAPHRAG_EXTRACTOR_MODEL` | GPU-exclusive; update llama-server launch cmd |
 | Query LLM | `GRAPHRAG_QUERY_BASE_URL` + `GRAPHRAG_QUERY_MODEL` | Can be CPU if small |
 | Embedder | `GRAPHRAG_EMBED_MODEL` | Also update `qdrant.vector_size` in `graphrag.yaml` |
-| Qdrant URL | `GRAPHRAG_QDRANT_URL` | Point at any Qdrant instance |
+| Vector backend | `GRAPHRAG_VECTOR_STORAGE` | Current default: `NanoVectorDBStorage`; switch only to an installed LightRAG backend |
+| Qdrant URL | `GRAPHRAG_QDRANT_URL` | Dedicated compose service is `http://localhost:6335` |
 | Postgres DSN | `GRAPHRAG_POSTGRES_DSN` | hars-postgres; read-only |
 
 After swapping embedder: run `index.py --full` to rebuild all vectors.
@@ -71,7 +93,7 @@ After swapping embedder: run `index.py --full` to rebuild all vectors.
 
 ## MCP tool usage (from an AI session)
 
-Register: already in `.mcp.json` as `hars-graphrag` (launched via `uv run`).
+Register: already in `.mcp.json` as `hars-graphrag` (launched via `uv run --project tools/graphrag graphrag-mcp`).
 
 ```
 # Check index status (always GPU-free)
@@ -110,12 +132,12 @@ ingest/postgres_export.py — stable-ID docs from hars-postgres
     │
     ▼
 server/gpu_guard.py       — refuses indexing while training runs
-server/lightrag_init.py   — LightRAG wired to e5-large (CPU) + Qdrant + llama.cpp
+server/lightrag_init.py   — LightRAG wired to e5-large (CPU) + NanoVectorDB/NetworkX + llama.cpp
 server/index.py           — CLI entrypoint (GPU-guarded)
     │
     ▼
-LightRAG KV store         — /tmp/hars_graphrag_lightrag/ (NetworkX .graphml)
-Qdrant                    — http://localhost:6333 (vector search)
+LightRAG working dir      — /tmp/hars_graphrag_lightrag/ (NetworkX .graphml + NanoVectorDB JSON)
+Qdrant                    — http://localhost:6335 (prepared optional backend)
     │
     ▼
 plugins/hars-graphrag/scripts/hars_graphrag_mcp.py
@@ -141,10 +163,28 @@ plugins/hars-graphrag/scripts/hars_graphrag_mcp.py
 ```bash
 # After indexing, run gold-question harness:
 uv run --project tools/graphrag python tools/graphrag/eval/check.py --mode hybrid
+
+# Generated retrieval battle test; context-only avoids one LLM answer per case.
+uv run --project tools/graphrag python -m tools.graphrag.eval.battle \
+    --paths .reports .plans .session \
+    --db-export \
+    --cases 100 \
+    --context-only \
+    --report tools/graphrag/eval/battle_report.json
+
+# Scale to 1000 when the 100-case run is stable:
+uv run --project tools/graphrag python -m tools.graphrag.eval.battle \
+    --paths .reports .plans .session \
+    --db-export \
+    --cases 1000 \
+    --context-only \
+    --report tools/graphrag/eval/battle_report_1000.json
 ```
 
 5 gold multi-hop questions are in `eval/gold_questions.yaml`.
-The harness exits non-zero if any question fails source-node retrieval.
+The gold harness exits non-zero if any question fails source-node retrieval.
+The battle harness exits non-zero if any generated case fails, or if the pass
+rate drops below `--min-pass-rate`.
 
 ---
 
