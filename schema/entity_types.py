@@ -38,6 +38,12 @@ class EntityType(str, Enum):
     FINDING = "Finding"
     CONFIG = "Config"
     COMPONENT = "Component"
+    # Added 2026-07-10: the extractor kept emitting these on real corpus chunks
+    # and LightRAG dropped the entities as invalid-type. Keep the list tight.
+    ARTIFACT = "Artifact"    # files, paths, tarballs, logs
+    CONCEPT = "Concept"      # methods, ideas, failure modes
+    TOOL = "Tool"            # CLIs, services, libraries
+    TASK = "Task"            # work items, action points
 
 
 class RelationType(str, Enum):

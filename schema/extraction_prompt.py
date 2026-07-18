@@ -1,7 +1,9 @@
 """Extraction prompt seed for LightRAG.
 
-LightRAG injects this ENTITY_TYPES string into its default extraction prompt
-so the LLM knows which entity and relation types to look for.
+``ENTITY_TYPES`` is injected into LightRAG's default extraction prompt via
+``addon_params``.  ``DOMAIN_EXTRACTION_GUIDANCE`` is appended to LightRAG's
+``PROMPTS["entity_extraction_system_prompt"]`` by ``lightrag_init.create_lightrag``
+— naming normalisation is what keeps the graph from atomising into aliases.
 """
 
 from __future__ import annotations
@@ -14,30 +16,47 @@ ENTITY_TYPES: str = ", ".join(e.value for e in EntityType)
 # Comma-separated relation type list.
 RELATION_TYPES: str = ", ".join(r.value for r in RelationType)
 
-# Full extraction-prompt seed text (injected via LightRAG's custom_prompt_func).
-EXTRACTION_SYSTEM_PROMPT: str = f"""You are extracting a structured knowledge graph from robotics-ML project
-documents.  The project is called HARS (Humanoid Action Reasoning System) and
-uses a VEA (Vision-Encoder Adapter) architecture trained on DROID robot data.
+# Appended verbatim to LightRAG's entity_extraction_system_prompt.
+DOMAIN_EXTRACTION_GUIDANCE: str = f"""
 
-## Entity types to extract
-{ENTITY_TYPES}
+---Domain Context (HARS robotics-ML project)---
+The documents describe the HARS (Humanoid Action Reasoning System) project:
+a VEA (Vision-Encoder Adapter) architecture trained on DROID robot data,
+its hypotheses, experiments, checkpoints, metrics and infrastructure.
 
-## Relation types to extract
+Preferred relation vocabulary (use as relationship keywords when they apply):
 {RELATION_TYPES}
 
-## Stable IDs
-When you encounter references to database objects use the following ID prefixes:
-- Hypothesis → hyp:<id>   (e.g. hyp:h6, hyp:abc-123-uuid)
-- Experiment → exp:<id>   (e.g. exp:42, exp:uuid)
-- Checkpoint → ckpt:<hash-or-path-fragment>
-- JobRun     → run:<id>
+---Entity Naming Normalisation (CRITICAL)---
+1. Experiment/hypothesis codes (A2S32, H6, B1, L1.1, E1, G0, Phase A/B/C):
+   write them UPPERCASE exactly as printed, no added spaces or dots.
+   Never merge different code families: "A2.5" (hypothesis variant) and
+   "A2S5" (experiment session) are DIFFERENT entities — keep each verbatim.
+2. Training runs named like vea_train_20260521_184235_c7981b: keep the full
+   name verbatim as ONE entity; do not shorten or split it.
+3. Database IDs/UUIDs: use stable prefixes — hyp:<id>, exp:<id>, run:<id>,
+   ckpt:<basename>. If prose mentions both a code and its UUID, extract the
+   code as the entity and the UUID form as a second entity related to it.
+4. Models keep their full versioned names verbatim: "Qwen3.5-9B",
+   "Gemma 4 26B", "DINOv3-large-336", "Depth-Anything-V3".
+5. Always "Phase A" / "Phase B" / "Phase C" (capital P, space, capital letter).
 
-## Rules
-1. Extract ONLY entity types and relation types listed above.
-2. For each triple output: (subject_name, relation_type, object_name).
-3. Normalise entity names to canonical forms (e.g. "Phase C" not "phaseC").
-4. Do NOT invent facts not present in the text.
-5. Use the stable-ID prefix if the text contains an explicit ID or UUID.
+---Markdown Tables---
+Table rows and cells are data records, NOT entities. NEVER output a table row,
+a delimiter row (|---|), or a cell fragment as an entity name. Read the table,
+then extract the real-world entities and facts it describes.
+
+---Type Discipline---
+Use ONLY the listed entity types. If nothing fits, use type Other — do not
+invent new types.
 """
 
-__all__ = ["ENTITY_TYPES", "RELATION_TYPES", "EXTRACTION_SYSTEM_PROMPT"]
+# Backwards-compatible alias (tests import this name; contains hyp:/exp: markers).
+EXTRACTION_SYSTEM_PROMPT: str = DOMAIN_EXTRACTION_GUIDANCE
+
+__all__ = [
+    "ENTITY_TYPES",
+    "RELATION_TYPES",
+    "DOMAIN_EXTRACTION_GUIDANCE",
+    "EXTRACTION_SYSTEM_PROMPT",
+]

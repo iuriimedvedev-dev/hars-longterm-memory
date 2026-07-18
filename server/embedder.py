@@ -49,14 +49,27 @@ def _load_model(model_name: str, hf_cache_dir: str, batch_size: int) -> object:
         "false",
         "no",
     }
-    try:
-        model = SentenceTransformer(
-            model_name,
-            device=os.environ.get("GRAPHRAG_EMBED_DEVICE", "cpu"),
-            cache_folder=hf_cache_dir or None,
-            local_files_only=local_files_only,
-        )
-    except Exception as exc:
+    # HF CLI downloads land under <HF_HOME>/hub/, legacy sentence-transformers
+    # downloads under <HF_HOME>/ directly — try both cache roots.
+    cache_candidates = [hf_cache_dir or None]
+    hub_dir = os.path.join(hf_cache_dir, "hub") if hf_cache_dir else ""
+    if hub_dir and os.path.isdir(hub_dir):
+        cache_candidates.append(hub_dir)
+    model = None
+    last_exc: Exception | None = None
+    for cache_folder in cache_candidates:
+        try:
+            model = SentenceTransformer(
+                model_name,
+                device=os.environ.get("GRAPHRAG_EMBED_DEVICE", "cpu"),
+                cache_folder=cache_folder,
+                local_files_only=local_files_only,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+    if model is None:
+        exc = last_exc  # type: ignore[assignment]
         mode = "local cache" if local_files_only else "local cache or Hugging Face"
         raise RuntimeError(
             f"Could not load embedding model '{model_name}' from {mode}. "

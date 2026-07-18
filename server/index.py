@@ -220,7 +220,10 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     shutdown_event = asyncio.Event()
     insert_task_holder: list[asyncio.Task[None]] = []  # populated just before install
 
-    batch_size = 10
+    # Batch size = docs per ainsert() call.  LightRAG only runs max_parallel_insert
+    # docs concurrently WITHIN one call and drains fully between calls, so a small
+    # batch head-of-line-blocks all slots behind the largest doc in the batch.
+    batch_size = int(os.environ.get("GRAPHRAG_INSERT_BATCH_SIZE", "10"))
     interrupted = False
     insert_task: asyncio.Task[None] = loop.create_task(
         _insert_all_batches(rag, all_docs, batch_size)

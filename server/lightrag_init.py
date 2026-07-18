@@ -77,7 +77,17 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                return str(data["choices"][0]["message"]["content"])
+                message = data["choices"][0]["message"]
+                content = str(message.get("content") or "")
+                # Thinking models may leave content empty and put everything in
+                # reasoning_content (server-side reasoning parsing), or emit
+                # inline <think> blocks. Recover the actual result either way.
+                if not content.strip() and message.get("reasoning_content"):
+                    content = str(message["reasoning_content"])
+                if "<think>" in content:
+                    import re as _re
+                    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
+                return content
         except httpx.HTTPError as exc:
             raise RuntimeError(
                 f"LLM endpoint unavailable for model '{model}' at {endpoint}: {exc}"
@@ -130,10 +140,17 @@ def create_lightrag(
         Fully wired instance ready for ``.ainsert()`` / ``.aquery()``.
     """
     from lightrag import LightRAG  # type: ignore[import-not-found]
+    from lightrag.prompt import PROMPTS  # type: ignore[import-not-found]
     from lightrag.utils import EmbeddingFunc, Tokenizer  # type: ignore[import-not-found]
 
     from tools.graphrag.server.embedder import embedding_dimension, make_embedding_func
     from tools.graphrag.schema.entity_types import EntityType
+    from tools.graphrag.schema.extraction_prompt import DOMAIN_EXTRACTION_GUIDANCE
+
+    # Append domain guidance (naming normalisation, table handling, type
+    # discipline) to LightRAG's default extraction prompt.  Idempotent.
+    if DOMAIN_EXTRACTION_GUIDANCE not in PROMPTS["entity_extraction_system_prompt"]:
+        PROMPTS["entity_extraction_system_prompt"] += DOMAIN_EXTRACTION_GUIDANCE
 
     # --- resolve config (param > env > default) ---
     _wdir = working_dir or os.environ.get("GRAPHRAG_WORKING_DIR", "/tmp/hars_graphrag_lightrag")
@@ -238,6 +255,11 @@ def create_lightrag(
             "entity_types": [entity_type.value for entity_type in EntityType],
         },
         max_parallel_insert=int(os.environ.get("GRAPHRAG_MAX_PARALLEL_INSERT", "2")),
+        # Concurrent LLM calls across all inserts.  MUST NOT exceed the number of
+        # llama-server slots (--parallel), otherwise requests queue and time out.
+        llm_model_max_async=int(os.environ.get("GRAPHRAG_LLM_MAX_ASYNC", "4")),
+        # Re-gleaning passes per chunk (LightRAG default 1 doubles LLM calls).
+        entity_extract_max_gleaning=int(os.environ.get("GRAPHRAG_MAX_GLEANING", "1")),
     )
     return rag
 
