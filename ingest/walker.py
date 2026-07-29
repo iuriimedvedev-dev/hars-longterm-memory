@@ -1,4 +1,4 @@
-"""Directory walker — scans paths, respects globs + .graphragignore, yields Documents.
+"""Directory walker — scans paths, respects globs + .memoryignore, yields Documents.
 
 This layer is intentionally LLM-free and GPU-free.
 Chunking is the responsibility of the caller (or server/index.py).
@@ -6,13 +6,22 @@ Chunking is the responsibility of the caller (or server/index.py).
 
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tools.graphrag.ingest.document import Document, SourceKind, file_stable_id, infer_source_kind
+from tools.memory.ingest.document import (
+    HEADER_DATE_UNKNOWN,
+    Document,
+    SourceKind,
+    build_source_header,
+    file_stable_id,
+    infer_source_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +43,87 @@ _DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
     "**/htmlcov/**",
     "**/unsloth_compiled_cache/**",
 )
-_DEFAULT_IGNORE_FILE = ".graphragignore"
+_DEFAULT_IGNORE_FILE = ".memoryignore"
+# Pre-2026-07-29-rename ignore-file name. If found alongside (or instead of)
+# .memoryignore, its patterns are NOT loaded — silently dropping exclusion
+# rules could ingest secret-bearing paths, so this is a loud warning, not a
+# silent no-op. See .plans/2026-07-29_rename-to-hars-longterm-memory.md R2-2.
+_LEGACY_IGNORE_FILE = ".graphragignore"
 _MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MiB per file; skip larger blobs
+
+# ---------------------------------------------------------------------------
+# Attribution header (build_source_header) support
+# ---------------------------------------------------------------------------
+# Section label chosen from the *walked root's* directory name — this is the
+# root the caller (server/index.py --paths / HARS_MEMORY_CLAUDE_MEMORY_DIR) passed in,
+# not the file's own directory, so a file nested under .session/foo/bar.md
+# still resolves to "session".
+_SECTION_BY_ROOT_NAME: dict[str, str] = {
+    ".session": "session",
+    ".reports": "report",
+    ".plans": "plan",
+    "docs": "docs",
+    "memory": "memory",
+}
+_SECTION_DEFAULT_CODE = "code"
+_SECTION_DEFAULT_TEXT = "docs"
+_GIT_LOG_TIMEOUT_SECONDS = 3.0
+
+
+def _infer_section(root: Path, kind: SourceKind) -> str:
+    """Pick a ``Section`` label for the attribution header.
+
+    Falls back to a per-SourceKind default when the walked root's directory
+    name has no explicit mapping (e.g. an ad-hoc ``--paths`` root).
+    """
+    mapped = _SECTION_BY_ROOT_NAME.get(root.name)
+    if mapped is not None:
+        return mapped
+    return _SECTION_DEFAULT_CODE if kind is SourceKind.PYTHON else _SECTION_DEFAULT_TEXT
+
+
+def _git_commit_date(file_path: Path) -> str | None:
+    """Return the last commit date (``YYYY-MM-DD``) for *file_path*, or None.
+
+    None means "no signal from git" (untracked file, not a git repo, git not
+    installed, or the lookup timed out/failed) — callers should fall back to
+    filesystem mtime.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(file_path.parent),
+                "log",
+                "-1",
+                "--format=%ad",
+                "--date=short",
+                "--",
+                file_path.name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_LOG_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("git log lookup failed for %s: %s", file_path, exc)
+        return None
+    if result.returncode != 0:
+        return None
+    date_str = result.stdout.strip()
+    return date_str or None
+
+
+def _file_date(file_path: Path, mtime: float) -> str:
+    """Best-available date for a file: git last-commit date, else mtime, else 'unknown'."""
+    git_date = _git_commit_date(file_path)
+    if git_date:
+        return git_date
+    if mtime > 0:
+        return datetime.date.fromtimestamp(mtime).isoformat()
+    return HEADER_DATE_UNKNOWN
 
 
 @dataclass
@@ -56,8 +144,27 @@ class WalkStats:
         self.per_kind[key] = self.per_kind.get(key, 0) + 1
 
 
+def _warn_if_legacy_ignore_file(root: Path) -> None:
+    """Loudly warn if a pre-rename .graphragignore is present at *root*.
+
+    Its patterns are never loaded (only ignore_file, default .memoryignore,
+    is read) — silently dropping exclusion rules could let secret-bearing
+    paths get ingested, so this must be visible, not a silent no-op.
+    """
+    legacy_path = root / _LEGACY_IGNORE_FILE
+    if legacy_path.exists():
+        logger.warning(
+            "Found legacy %s at %s — its patterns are NOT applied (renamed to "
+            "%s on 2026-07-29). Rename the file to keep its exclusion rules in "
+            "effect: mv %s %s",
+            _LEGACY_IGNORE_FILE, legacy_path, _DEFAULT_IGNORE_FILE,
+            legacy_path, root / _DEFAULT_IGNORE_FILE,
+        )
+
+
 def _load_ignore_patterns(root: Path, ignore_file: str) -> list[str]:
-    """Load patterns from a .graphragignore file at *root*, if present."""
+    """Load patterns from a .memoryignore file at *root*, if present."""
+    _warn_if_legacy_ignore_file(root)
     ignore_path = root / ignore_file
     if not ignore_path.exists():
         return []
@@ -167,7 +274,7 @@ def walk(
             logger.warning("Walk path does not exist, skipping: %s", base_path)
             continue
 
-        # Load .graphragignore from this root
+        # Load .memoryignore from this root
         extra_excludes = _load_ignore_patterns(base_path, ignore_file)
         effective_excludes = list(exclude_globs) + extra_excludes
 
@@ -236,6 +343,18 @@ def walk(
                 mtime = file_path.stat().st_mtime
             except OSError:
                 mtime = 0.0
+
+            if not dry_run:
+                # Frontmatter (if any) is passed through unmodified — the
+                # attribution header is prepended ahead of it. See
+                # server/index.py module docstring / task notes for the
+                # frontmatter-handling rationale.
+                header = build_source_header(
+                    document_name=file_path.name,
+                    section=_infer_section(base_path, kind),
+                    date=_file_date(file_path, mtime),
+                )
+                content = header + content
 
             docs.append(
                 Document(

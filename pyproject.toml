@@ -3,40 +3,33 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hars-graphrag"
+name = "hars-longterm-memory"
 version = "0.1.0"
-description = "Local, model-agnostic GraphRAG service for the HARS/Cortex corpus"
+description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
 requires-python = ">=3.13"
 readme = "README.md"
 
 dependencies = [
-  # Core GraphRAG engine
+  # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall
   "lightrag-hku>=1.4.16",
-
   # CPU-only sentence embeddings (e5-large-v2, bge-m3, nomic-embed-text)
   "sentence-transformers>=5.0.0",
-
   # torch CPU wheel — resolved via the pytorch-cpu named index below
   "torch>=2.0.0",
-
   # Vector store (LightRAG-native backend)
   "qdrant-client>=1.9.0",
-
   # Postgres export — async driver (preferred) + sync fallback
   "asyncpg>=0.29.0",
-
-  # Official MCP SDK — used by hars_graphrag_mcp.py
+  # Official MCP SDK — used by hars_longterm_memory_mcp.py
   "mcp>=1.0.0",
-
   # Config + HTTP
   "pyyaml>=6.0",
   "httpx>=0.27.0",
-
   # Graph operations (entity search / subgraph in MCP server)
   "networkx>=3.3",
-
   # HTTP client used by gpu_guard.py
   "requests>=2.32.0",
+  "bm25s>=0.3.10",
 ]
 
 [project.optional-dependencies]
@@ -46,14 +39,14 @@ dev = [
 ]
 
 [project.scripts]
-graphrag-index = "hars_graphrag.cli:index_main"
-graphrag-mcp   = "hars_graphrag.cli:mcp_main"
-graphrag-eval-battle = "hars_graphrag.cli:eval_battle_main"
+memory-index = "hars_memory.cli:index_main"
+memory-mcp   = "hars_memory.cli:mcp_main"
+memory-eval-battle = "hars_memory.cli:eval_battle_main"
 
 [tool.hatch.build.targets.wheel]
 # This is an application, not a library.  Packages are declared explicitly to
 # prevent hatchling from scanning for a matching package name.
-packages = ["hars_graphrag"]
+packages = ["hars_memory"]
 
 # ---------------------------------------------------------------------------
 # UV configuration — CPU-only torch via an EXPLICIT named index

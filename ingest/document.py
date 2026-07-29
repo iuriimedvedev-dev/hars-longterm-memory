@@ -9,6 +9,13 @@ import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Final
+
+# Literal date value used when no real ingest/commit date could be determined
+# for a document. Matches the convention already used by cleanup_kb.py's
+# HEADER_RE (`[0-9]{4}-[0-9]{2}-[0-9]{2}|unknown`) — an "unknown"-dated doc is
+# never purged by cleanup_kb.py's date-based retention sweep.
+HEADER_DATE_UNKNOWN: Final[str] = "unknown"
 
 
 class SourceKind(str, Enum):
@@ -60,6 +67,21 @@ def file_stable_id(path: Path) -> str:
     """
     digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:12]
     return f"file:{digest}"
+
+
+def build_source_header(*, document_name: str, section: str, date: str) -> str:
+    """Build a ``[Document: ... | Section: ... | Date: ...]`` attribution header.
+
+    MUST byte-for-byte match the format already emitted by
+    ``plugins/hars-longterm-memory/scripts/hars_longterm_memory_mcp.py``'s ``memory_remember``
+    tool, and parsed by ``scripts/cleanup_kb.py``'s ``HEADER_RE``:
+        ``[Document: <name> | Section: <section> | Date: <YYYY-MM-DD|unknown>]``
+
+    This is what downstream retrieval uses for source attribution/recency, and
+    what the KB-cleanup date sweep parses out of the first 400 chars of every
+    stored document — changing the format silently breaks both.
+    """
+    return f"[Document: {document_name} | Section: {section} | Date: {date}]\n\n"
 
 
 def infer_source_kind(path: Path) -> SourceKind:

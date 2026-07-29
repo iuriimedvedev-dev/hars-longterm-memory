@@ -1,4 +1,4 @@
-"""Domain entity and relation type definitions for the HARS GraphRAG knowledge graph.
+"""Domain entity and relation type definitions for the HARS long-term memory knowledge graph.
 
 These types seed the LightRAG extraction prompt.  They are also used by the
 ingest layer when building stable-ID documents from Postgres rows.

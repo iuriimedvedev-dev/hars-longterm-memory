@@ -3,24 +3,58 @@
 One stable-ID document per row.  No LLM calls.  GPU-free.
 
 Usage (dry-run, no DB needed):
-    from tools.graphrag.ingest.postgres_export import transform_experiment_row
+    from tools.memory.ingest.postgres_export import transform_experiment_row
     doc = transform_experiment_row({"id": "abc", "name": "test", "status": "running"})
 
 Usage (live, requires DB):
-    from tools.graphrag.ingest.postgres_export import export_all
+    from tools.memory.ingest.postgres_export import export_all
     docs, stats = await export_all(dsn="postgresql://...")
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from dataclasses import dataclass
 
-from tools.graphrag.ingest.document import Document, SourceKind
-from tools.graphrag.schema.entity_types import make_stable_id
+from tools.memory.ingest.document import HEADER_DATE_UNKNOWN, Document, SourceKind, build_source_header
+from tools.memory.schema.entity_types import make_stable_id
 
 logger = logging.getLogger(__name__)
+
+# Section labels for the attribution header (see document.build_source_header).
+# One constant per Postgres source table — deliberately not derived from
+# SourceKind so the mapping stays an explicit, readable 1:1 table here.
+_SECTION_EXPERIMENT = "experiment"
+_SECTION_HYPOTHESIS = "hypothesis"
+_SECTION_HYPOTHESIS_LINK = "hypothesis_link"
+
+# Row date columns tried in priority order — most-recently-touched first.
+_DATE_COLUMNS: tuple[str, ...] = ("updated_at", "created_at")
+
+
+def _row_date(row: dict[str, object]) -> str:
+    """Best-available date for a Postgres row: updated_at, else created_at, else 'unknown'."""
+    for column in _DATE_COLUMNS:
+        coerced = _coerce_date(row.get(column))
+        if coerced is not None:
+            return coerced
+    return HEADER_DATE_UNKNOWN
+
+
+def _coerce_date(value: object) -> str | None:
+    """Normalise a DB timestamp value (datetime/date/str/None) to 'YYYY-MM-DD'."""
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str) and value:
+        try:
+            return datetime.date.fromisoformat(value[:10]).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 @dataclass
@@ -52,7 +86,9 @@ def transform_experiment_row(row: dict[str, object]) -> Document:
     config_snippet = json.dumps(row.get("config") or {}, indent=2)[:800]
     metrics_snippet = json.dumps(row.get("final_metrics") or {}, indent=2)[:800]
 
-    content = (
+    content = build_source_header(
+        document_name=doc_id, section=_SECTION_EXPERIMENT, date=_row_date(row)
+    ) + (
         f"Experiment ID: {row_id}\n"
         f"Name: {name}\n"
         f"Workflow: {workflow}\n"
@@ -90,7 +126,9 @@ def transform_hypothesis_row(row: dict[str, object]) -> Document:
     tags = row.get("tags") or []
     tags_str = ", ".join(str(t) for t in tags) if tags else ""
 
-    content = (
+    content = build_source_header(
+        document_name=doc_id, section=_SECTION_HYPOTHESIS, date=_row_date(row)
+    ) + (
         f"Hypothesis ID: {row_id} (stable-id: {doc_id})\n"
         f"Slug: {slug}\n"
         f"Title: {title}\n"
@@ -123,7 +161,9 @@ def transform_hypothesis_link_row(row: dict[str, object]) -> Document:
     relation = str(row.get("relation_type", "related"))
     doc_id = f"link:{row_id}"
 
-    content = (
+    content = build_source_header(
+        document_name=doc_id, section=_SECTION_HYPOTHESIS_LINK, date=_row_date(row)
+    ) + (
         f"Hypothesis link ID: {row_id}\n"
         f"Hypothesis: hyp:{hyp_id}\n"
         f"Links to: {entity_type} / {entity_id}\n"

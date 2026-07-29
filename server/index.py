@@ -6,19 +6,31 @@ distillation experiment is currently running on the backend.  It re-uses the
 exact same concurrency-guard pattern as .claude/skills/distillation.py.
 
 Usage (run when GPU is free):
-    python tools/graphrag/server/index.py \\
+    python tools/memory/server/index.py \\
         --paths .reports .plans .session \\
         --db-export \\
-        [--full]          # full reindex (ignore change detection)
-        [--dry-run]       # walk + count only, no LLM calls
+        [--full]              # full reindex (ignore change detection)
+        [--refresh-changed]   # opt-in: delete+reinsert docs whose content
+                               # changed since last ingest (default OFF, never
+                               # deletes on its own)
+        [--dry-run]            # walk + count only, no LLM calls
 
 Environment variables (see config/.env.example):
-    GRAPHRAG_EXTRACTOR_BASE_URL  - llama-server endpoint for Qwen3.6-27B
-    GRAPHRAG_EXTRACTOR_MODEL     - model name
-    GRAPHRAG_WORKING_DIR         - LightRAG KV store dir
-    GRAPHRAG_VECTOR_STORAGE      - LightRAG vector backend
-    GRAPHRAG_POSTGRES_DSN        - hars-postgres DSN (read-only)
-    HARS_API_BASE_URL            - HARS backend (for GPU guard)
+    HARS_MEMORY_EXTRACTOR_BASE_URL         - llama-server endpoint for Qwen3.6-27B
+    HARS_MEMORY_EXTRACTOR_MODEL            - model name
+    HARS_MEMORY_INDEX_DIR                - LightRAG KV store dir
+    HARS_MEMORY_VECTOR_STORAGE             - LightRAG vector backend
+    HARS_MEMORY_POSTGRES_DSN               - hars-postgres DSN (read-only)
+    HARS_API_BASE_URL                   - HARS backend (for GPU guard)
+    HARS_MEMORY_GPU_GUARD_ALLOW_UNREACHABLE - "1" to fail OPEN instead of CLOSED
+                                            when the GPU guard backend is
+                                            unreachable (default: fail closed)
+    HARS_MEMORY_CLAUDE_MEMORY_DIR                 - optional extra ingest root (e.g. the
+                                            Claude Code project-memory dir)
+    HARS_MEMORY_FINGERPRINT_STORE          - sidecar JSON path for
+                                            --refresh-changed content
+                                            fingerprints (default: alongside
+                                            HARS_MEMORY_INDEX_DIR)
 """
 
 from __future__ import annotations
@@ -31,25 +43,50 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Final
 
 # Ensure tools/ is on the path when run as a script from project root.
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tools.graphrag.ingest.walker import walk
-from tools.graphrag.server.gpu_guard import GpuBusyError, assert_gpu_free
+from tools.memory.ingest.change_detection import (
+    FingerprintStore,
+    default_fingerprint_store_path,
+    detect_changed_documents,
+)
+from tools.memory.ingest.document import Document
+from tools.memory.ingest.walker import walk
+from tools.memory.server.gpu_guard import GpuBusyError, GpuGuardUnavailableError, assert_gpu_free
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("graphrag.index")
+logger = logging.getLogger("memory.index")
+
+# Optional extra ingest root, e.g. the Claude Code project-memory directory
+# (~90 curated .md knowledge files). Unset by default — each operator points
+# this at their own path; never hardcoded since it lives outside the repo and
+# is user/machine-specific.
+_MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
+
+# Operator override for gpu_guard's fail-closed-on-unreachable-backend default.
+_GPU_GUARD_ALLOW_UNREACHABLE_ENV: Final[str] = "HARS_MEMORY_GPU_GUARD_ALLOW_UNREACHABLE"
+_TRUE_STRINGS: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+
+
+def _bool_env(name: str, *, default: bool = False) -> bool:
+    """Parse a boolean-ish environment variable ('1'/'true'/'yes'/'on')."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_STRINGS
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build / update the HARS GraphRAG knowledge graph index."
+        description="Build / update the HARS long-term memory knowledge graph index."
     )
     parser.add_argument(
         "--paths",
@@ -70,6 +107,20 @@ def _parse_args() -> argparse.Namespace:
         help="Force full reindex (ignore change detection).",
     )
     parser.add_argument(
+        "--refresh-changed",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-in, default OFF: detect files/rows whose CONTENT changed since "
+            "the last ingest under the same doc_id (a file edited in place is "
+            "otherwise skipped forever) and delete+reinsert only those. Compares "
+            "a sha256 content fingerprint stored in a sidecar JSON "
+            "(HARS_MEMORY_FINGERPRINT_STORE). Documents with no recorded "
+            "fingerprint yet are NEVER deleted — only newly tracked. Without "
+            "this flag, no delete is ever issued."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
@@ -79,6 +130,17 @@ def _parse_args() -> argparse.Namespace:
         "--api-base-url",
         default=None,
         help="HARS backend URL for GPU guard (overrides HARS_API_BASE_URL env).",
+    )
+    parser.add_argument(
+        "--allow-gpu-guard-unreachable",
+        action="store_true",
+        default=_bool_env(_GPU_GUARD_ALLOW_UNREACHABLE_ENV),
+        help=(
+            "Override: proceed with indexing even if the HARS backend is "
+            "unreachable. Normally this fails CLOSED (GpuGuardUnavailableError) "
+            "because GPU state cannot be confirmed. Only use when you know the "
+            f"GPU is idle. Env: {_GPU_GUARD_ALLOW_UNREACHABLE_ENV}=1."
+        ),
     )
     return parser.parse_args()
 
@@ -121,6 +183,66 @@ def _install_signal_handlers(
         loop.add_signal_handler(sig, _handle_signal, sig)
 
 
+def _resolve_ingest_paths(cli_paths: list[str], project_root: Path) -> list[Path]:
+    """Resolve --paths CLI values to absolute Paths, plus the optional
+    Claude memory directory (HARS_MEMORY_CLAUDE_MEMORY_DIR), if configured.
+
+    The memory dir is appended unconditionally when the env var is set —
+    independent of whatever --paths override the caller passed — since it is
+    a standing ingest root (~90 curated knowledge files), not an ephemeral one.
+    """
+    resolved = [
+        project_root / p if not Path(p).is_absolute() else Path(p)
+        for p in cli_paths
+    ]
+    memory_dir_raw = os.environ.get(_MEMORY_DIR_ENV, "").strip()
+    if memory_dir_raw:
+        memory_dir = Path(memory_dir_raw)
+        if memory_dir not in resolved:
+            resolved.append(memory_dir)
+            logger.info(
+                "Including Claude memory directory (%s=%s)", _MEMORY_DIR_ENV, memory_dir
+            )
+    return resolved
+
+
+async def _apply_refresh_changed(
+    rag: object,
+    all_docs: list[Document],
+    *,
+    refresh_changed: bool,
+    fingerprint_store_path: Path,
+) -> None:
+    """Detect content-changed documents and delete+reinsert them — IF opted in.
+
+    Safety contract: when *refresh_changed* is False (the default), this is a
+    strict no-op — the fingerprint sidecar is never read or written, and
+    ``rag.adelete_by_doc_id`` is never called. A normal `index.py` run can
+    never trigger a delete via this path.
+    """
+    if not refresh_changed:
+        logger.info(
+            "--refresh-changed not set: skipping content-change detection "
+            "(no deletes issued)."
+        )
+        return
+
+    store = FingerprintStore.load(fingerprint_store_path)
+    report = detect_changed_documents(all_docs, store)
+    logger.info(
+        "Fingerprint check (%s): %d changed, %d unchanged, %d with no stored "
+        "fingerprint (left untouched, now recorded)",
+        fingerprint_store_path,
+        len(report.changed_doc_ids),
+        report.unchanged_count,
+        report.no_fingerprint_count,
+    )
+    for doc_id in report.changed_doc_ids:
+        logger.info("Deleting stale content for doc_id=%s before reinsert", doc_id)
+        await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
+    store.save()
+
+
 async def _insert_all_batches(
     rag: object,
     all_docs: list,
@@ -149,20 +271,19 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     if not args.dry_run:
         try:
-            assert_gpu_free(api_url)
-        except GpuBusyError as exc:
+            assert_gpu_free(
+                api_url, allow_unreachable_backend=args.allow_gpu_guard_unreachable
+            )
+        except (GpuBusyError, GpuGuardUnavailableError) as exc:
             logger.error("BLOCKED: %s", exc)
             logger.error(
                 "Wait for the training run to complete, then re-run:\n"
-                "  python tools/graphrag/server/index.py --paths .reports .plans --db-export"
+                "  python tools/memory/server/index.py --paths .reports .plans --db-export"
             )
             sys.exit(1)
 
     project_root = _PROJECT_ROOT
-    resolved_paths = [
-        project_root / p if not Path(p).is_absolute() else Path(p)
-        for p in args.paths
-    ]
+    resolved_paths = _resolve_ingest_paths(args.paths, project_root)
 
     # -----------------------------------------------------------------------
     # Directory walk
@@ -180,10 +301,10 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     db_docs: list = []
     if args.db_export:
-        dsn = os.environ.get("GRAPHRAG_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
+        dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
         logger.info("Exporting Postgres tables from: %s", dsn.split("@")[-1])
         try:
-            from tools.graphrag.ingest.postgres_export import export_all
+            from tools.memory.ingest.postgres_export import export_all
             db_docs, db_stats = await export_all(dsn)
             logger.info(
                 "Postgres export: %d experiments, %d hypotheses, %d links",
@@ -209,11 +330,27 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     # LightRAG insertion (requires GPU-free extractor LLM)
     # -----------------------------------------------------------------------
-    from tools.graphrag.server.lightrag_init import create_lightrag
+    from tools.memory.server.lightrag_init import create_lightrag, resolve_working_dir
 
     rag = create_lightrag()
     await rag.initialize_storages()
     logger.info("LightRAG instance ready, starting insertion...")
+
+    # -----------------------------------------------------------------------
+    # Content-change detection (opt-in via --refresh-changed; no-op otherwise)
+    # -----------------------------------------------------------------------
+    fingerprint_store_path = Path(
+        os.environ.get(
+            "HARS_MEMORY_FINGERPRINT_STORE",
+            str(default_fingerprint_store_path(resolve_working_dir())),
+        )
+    )
+    await _apply_refresh_changed(
+        rag,
+        all_docs,
+        refresh_changed=args.refresh_changed,
+        fingerprint_store_path=fingerprint_store_path,
+    )
 
     # Signal-handling state — shared between the handler closure and this coroutine.
     loop = asyncio.get_running_loop()
@@ -223,7 +360,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # Batch size = docs per ainsert() call.  LightRAG only runs max_parallel_insert
     # docs concurrently WITHIN one call and drains fully between calls, so a small
     # batch head-of-line-blocks all slots behind the largest doc in the batch.
-    batch_size = int(os.environ.get("GRAPHRAG_INSERT_BATCH_SIZE", "10"))
+    batch_size = int(os.environ.get("HARS_MEMORY_INSERT_BATCH_SIZE", "10"))
     interrupted = False
     insert_task: asyncio.Task[None] = loop.create_task(
         _insert_all_batches(rag, all_docs, batch_size)
@@ -262,6 +399,13 @@ async def _run_indexing(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Permanent fail-closed guard: refuse to start against a stale GRAPHRAG_*
+    # env (pre-2026-07-29 rename) instead of silently falling back to
+    # HARS_MEMORY_* defaults. See server/legacy_env_guard.py.
+    from tools.memory.server.legacy_env_guard import refuse_if_legacy_graphrag_env
+
+    refuse_if_legacy_graphrag_env()
+
     args = _parse_args()
     asyncio.run(_run_indexing(args))
 
