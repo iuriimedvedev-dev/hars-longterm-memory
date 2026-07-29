@@ -1,1 +1,1 @@
-"""HARS GraphRAG evaluation harness."""
+"""HARS long-term memory evaluation harness."""

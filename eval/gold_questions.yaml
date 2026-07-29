@@ -1,4 +1,4 @@
-# Gold multi-hop evaluation questions for HARS GraphRAG.
+# Gold multi-hop evaluation questions for HARS long-term memory.
 # Each question requires traversing ≥2 hops across DB + prose sources.
 # Run check.py after indexing to assert correct source-node retrieval.
 

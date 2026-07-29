@@ -1,1 +1,1 @@
-"""HARS GraphRAG domain schema."""
+"""HARS long-term memory domain schema."""

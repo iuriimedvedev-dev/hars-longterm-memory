@@ -1,1 +1,1 @@
-"""HARS GraphRAG ingestion layer."""
+"""HARS long-term memory ingestion layer."""

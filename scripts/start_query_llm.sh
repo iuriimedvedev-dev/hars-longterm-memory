@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Query/keyword LLM for local GraphRAG — Qwen3.5-4B on CPU, port 8082.
-# CPU-only BY DESIGN: graphrag queries must stay available while the GPU trains.
-# Usage: tools/graphrag/scripts/start_query_llm.sh [--gpu]
+# Query/keyword LLM for local long-term memory — Qwen3.5-4B on CPU, port 8082.
+# CPU-only BY DESIGN: memory_recall queries must stay available while the GPU trains.
+# Usage: tools/memory/scripts/start_query_llm.sh [--gpu]
 set -euo pipefail
 
 HF_HOME="${HF_HOME:-/mnt/datasets/models/.hf_home}"
@@ -25,7 +25,7 @@ setsid nohup "$BIN" \
     --host 127.0.0.1 --port 8082 \
     --ctx-size 8192 --parallel 2 --n-gpu-layers "$NGL" \
     --jinja --reasoning-budget 0 \
-    > /tmp/graphrag_query_llm.log 2>&1 < /dev/null &
+    > /tmp/memory_recall_llm.log 2>&1 < /dev/null &
 
 for _ in $(seq 30); do
     sleep 2
@@ -33,4 +33,4 @@ for _ in $(seq 30); do
         echo "query LLM healthy on :8082"; exit 0
     fi
 done
-echo "FAILED to start — see /tmp/graphrag_query_llm.log"; exit 1
+echo "FAILED to start — see /tmp/memory_recall_llm.log"; exit 1

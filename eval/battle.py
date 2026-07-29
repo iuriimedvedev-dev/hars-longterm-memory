@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generated GraphRAG battle-test evaluation.
+"""Generated long-term memory battle-test evaluation.
 
 This runner creates 100-1000 deterministic source-grounded cases from the same
 corpus used by indexing, then asks LightRAG for retrieval context only.  It is
@@ -26,10 +26,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tools.graphrag.ingest.document import Document
-from tools.graphrag.ingest.walker import walk
+from tools.memory.ingest.document import Document
+from tools.memory.ingest.walker import walk
 
-logger = logging.getLogger("graphrag.eval.battle")
+logger = logging.getLogger("memory.eval.battle")
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.:/-]{2,}")
 _SPACE_RE = re.compile(r"\s+")
@@ -188,8 +188,8 @@ async def _load_docs(paths: list[str], *, db_export: bool) -> list[Document]:
     )
 
     if db_export:
-        dsn = os.environ.get("GRAPHRAG_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
-        from tools.graphrag.ingest.postgres_export import export_all
+        dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
+        from tools.memory.ingest.postgres_export import export_all
 
         db_docs, db_stats = await export_all(dsn)
         docs.extend(db_docs)
@@ -224,7 +224,7 @@ async def _run_battle(args: argparse.Namespace) -> int:
         return 0
 
     from lightrag import QueryParam  # type: ignore[import-not-found]
-    from tools.graphrag.server.lightrag_init import create_lightrag, create_query_model_func
+    from tools.memory.server.lightrag_init import create_lightrag, create_query_model_func
 
     rag = create_lightrag()
     await rag.initialize_storages()
@@ -289,7 +289,7 @@ async def _run_battle(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run generated GraphRAG battle eval.")
+    parser = argparse.ArgumentParser(description="Run generated long-term memory battle eval.")
     parser.add_argument("--paths", nargs="+", default=[".reports", ".plans", ".session"])
     parser.add_argument("--db-export", action="store_true", default=False)
     parser.add_argument("--cases", type=int, default=100)
@@ -301,7 +301,7 @@ def main() -> None:
     parser.add_argument("--context-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generate-only", action="store_true", default=False)
     parser.add_argument("--write-cases", type=Path, default=None)
-    parser.add_argument("--report", type=Path, default=Path("tools/graphrag/eval/battle_report.json"))
+    parser.add_argument("--report", type=Path, default=Path("tools/memory/eval/battle_report.json"))
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

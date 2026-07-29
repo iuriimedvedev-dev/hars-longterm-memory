@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from tools.graphrag.schema.entity_types import EntityType, RelationType
+from tools.memory.schema.entity_types import EntityType, RelationType
 
 # Comma-separated entity type list injected into LightRAG's extraction prompt.
 ENTITY_TYPES: str = ", ".join(e.value for e in EntityType)

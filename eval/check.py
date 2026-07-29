@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Post-index evaluation harness — asserts correct source-node retrieval.
 
-Runs the 5 gold multi-hop questions through graphrag_query (hybrid mode) and
+Runs the 5 gold multi-hop questions through memory_recall (hybrid mode) and
 checks that at least one expected entity type or keyword appears in the answer
 or citations.
 
 Usage (requires index to be built):
-    python tools/graphrag/eval/check.py [--mode hybrid]
+    python tools/memory/eval/check.py [--mode hybrid]
 
 Exits non-zero if any gold question fails retrieval.
 """
@@ -28,7 +28,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("graphrag.eval")
+logger = logging.getLogger("memory.eval")
 
 GOLD_FILE = Path(__file__).parent / "gold_questions.yaml"
 
@@ -71,7 +71,7 @@ async def _run_checks(mode: str) -> bool:
     questions = _load_gold()
 
     # Import the query function from the MCP server logic
-    from tools.graphrag.server.lightrag_init import create_lightrag, create_query_model_func
+    from tools.memory.server.lightrag_init import create_lightrag, create_query_model_func
     from lightrag import QueryParam  # type: ignore[import-not-found]
 
     rag = create_lightrag()
