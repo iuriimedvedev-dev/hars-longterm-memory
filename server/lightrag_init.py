@@ -56,35 +56,88 @@ _RETRYABLE_HTTP_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 50
 def _is_retryable_llm_error(exc: BaseException) -> bool:
     """True if ``exc`` is a transient LLM-endpoint failure worth retrying.
 
+    ``exc`` is one of the OpenAI SDK's typed exceptions, raised by
+    ``AsyncOpenAI.chat.completions.create`` (``openai._exceptions`` /
+    ``openai.APIStatusError`` and friends) since this module's LLM calls go
+    through the official ``openai`` client rather than raw ``httpx``.
+
     Retryable:
-      * ``httpx.HTTPStatusError`` with a 429/5xx status — server-side
-        throttling or transient unavailability.
-      * Any other ``httpx.HTTPError`` (``httpx.ConnectError``,
-        ``httpx.ReadTimeout``, ``httpx.RemoteProtocolError``,
-        ``httpx.PoolTimeout``, etc.) — transport-level hiccups, e.g. a
-        connection refused/reset during llama-server's prompt-cache
-        reorganisation pass (``srv get_availabl: prompt cache update took
-        N ms``), where the server is not actually down.
+      * ``openai.APIStatusError`` (its subclasses map 1:1 to HTTP status,
+        e.g. ``RateLimitError`` for 429, ``InternalServerError`` for 5xx)
+        whose ``status_code`` is in ``_RETRYABLE_HTTP_STATUS_CODES`` —
+        server-side throttling or transient unavailability.
+      * ``openai.APIConnectionError`` (and its subclass ``APITimeoutError``)
+        — transport-level hiccups, e.g. a connection refused/reset during
+        llama-server's prompt-cache reorganisation pass (``srv get_availabl:
+        prompt cache update took N ms``), where the server is not actually
+        down.
 
     NOT retryable:
-      * ``httpx.HTTPStatusError`` with any other 4xx status (400/401/403/404/
-        422) — a malformed request, bad auth, or a genuinely wrong model
+      * ``openai.APIStatusError`` with any other 4xx status (400/401/403/404/
+        422 → ``BadRequestError``/``AuthenticationError``/
+        ``PermissionDeniedError``/``NotFoundError``/``UnprocessableEntityError``)
+        — a malformed request, bad auth, or a genuinely wrong model
         name/route. Retrying these wastes the backoff budget on an error
         that cannot succeed.
-      * Anything that is not an ``httpx.HTTPError`` at all (e.g. a bug in
-        the response-parsing code below) — that is a programming error, not
-        a transient endpoint failure, and must fail immediately/loudly.
+      * Anything that is not an ``openai.APIStatusError``/``APIConnectionError``
+        at all (e.g. a bug in the response-parsing code below, or a
+        malformed/empty response body raising ``IndexError``) — that is a
+        programming error or a permanently invalid response, not a
+        transient endpoint failure, and must fail immediately/loudly.
     """
-    import httpx
+    import openai
 
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in _RETRYABLE_HTTP_STATUS_CODES
-    return isinstance(exc, httpx.HTTPError)
+    if isinstance(exc, openai.APIStatusError):
+        return exc.status_code in _RETRYABLE_HTTP_STATUS_CODES
+    return isinstance(exc, openai.APIConnectionError)
 
 
 def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float) -> object:
-    """Return an async LLM function compatible with LightRAG (OpenAI-compatible)."""
-    import httpx
+    """Return an async LLM function compatible with LightRAG (OpenAI-compatible).
+
+    This is a thin adapter over the official OpenAI SDK's ``AsyncOpenAI``
+    client, built via ``lightrag.llm.openai.create_openai_async_client`` so
+    base_url/api_key resolution, connection pooling, headers, and the typed
+    error taxonomy all come from the SDK rather than being reimplemented
+    here on top of raw ``httpx`` (as this module did before).
+
+    It deliberately does NOT call
+    ``lightrag.llm.openai.openai_complete_if_cache`` — that function's own
+    Chain-of-Thought handling only activates via its ``enable_cot=True``
+    parameter, and even then it WRAPS ``reasoning_content`` in
+    ``<think>...</think>`` tags around the (in our failure case, empty)
+    regular ``content`` field, rather than surfacing the reasoning text
+    itself as the answer; with ``content`` empty, the wrapped result is just
+    ``<think>{reasoning}</think>`` with nothing after it, which is not
+    equivalent to treating ``reasoning_content`` as the payload. That is a
+    different contract than this deployment needs: Qwen3.6-27B's
+    thinking-mode leak puts the ENTIRE extraction payload in
+    ``reasoning_content`` with ``content`` empty, and that payload IS the
+    answer, not a discardable thought trace to be marked and later stripped.
+    Expressing our exact fallback (use ``reasoning_content`` verbatim as the
+    answer when ``content`` is empty) through ``openai_complete_if_cache``
+    would require monkeypatching its response-handling branch — so this
+    module keeps writing that fallback itself, unchanged from the pre-SDK
+    implementation, directly against the SDK's response object.
+
+    Likewise, ``openai_complete_if_cache``'s own tenacity ``@retry`` (see its
+    docstring) only retries ``RateLimitError | APIConnectionError |
+    APITimeoutError | InvalidResponseError`` — it does NOT retry generic
+    ``InternalServerError`` (500/502/503/504) responses that are not also
+    connection errors, which is exactly the class of failure that lost
+    document 108/241 during a real consolidation run (see this module's
+    module-level docstring). The SDK client's OWN built-in retry
+    (``AsyncOpenAI(max_retries=...)``) does cover 5xx, but its backoff
+    timing (0.5s initial / 8s max) is not configurable through the public
+    constructor and it has no attempt-level hook to emit our structured
+    per-attempt warning log (model, endpoint, attempt number) — required by
+    this deployment's observability rules. So the SDK's own retry is
+    disabled (``max_retries=0``) and this module's own tenacity-based
+    retry/backoff (env-configurable, structured-logged) wraps the SDK call
+    instead — the ONE piece of retry logic that is genuinely ours.
+    """
+    import openai
+    from lightrag.llm.openai import create_openai_async_client
     from tenacity import (
         AsyncRetrying,
         RetryCallState,
@@ -102,15 +155,8 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
     timeout_seconds = float(os.environ.get("HARS_MEMORY_LLM_TIMEOUT_SECONDS", "300"))
 
     # Bounded retry/backoff for transient endpoint failures (see
-    # _is_retryable_llm_error). This is deliberately NOT wired through
-    # LightRAG's own decorators: LightRAG's tenacity-based retry
-    # (lightrag.llm.openai.openai_complete_if_cache) is never invoked because
-    # this module hand-rolls its own httpx call instead of using that
-    # function, and LightRAG's priority_limit_async_func_call concurrency
-    # decorator (the "Error in decorated function" log line) has no retry
-    # logic at all — it only logs and propagates. Without a retry here, a
-    # single multi-second stall (e.g. llama-server's prompt-cache
-    # reorganisation pass) fails the whole document's merge stage.
+    # _is_retryable_llm_error and the make_llm_func docstring above for why
+    # this is not simply the SDK's own built-in retry).
     #
     # HARS_MEMORY_LLM_RETRY_ATTEMPTS total attempts (1 disables retrying).
     # Worst-case added latency is bounded by (attempts - 1) *
@@ -125,6 +171,29 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
     )
     retry_backoff_max_seconds = float(
         os.environ.get("HARS_MEMORY_LLM_RETRY_BACKOFF_MAX_SECONDS", "8.0")
+    )
+
+    # llama-server (llama.cpp) does not check bearer auth at all, but
+    # create_openai_async_client falls back to os.environ["OPENAI_API_KEY"]
+    # (raising KeyError if unset) whenever api_key is falsy, so this must
+    # always be a non-empty string. A real OpenAI-compatible provider that
+    # does require auth can set HARS_MEMORY_LLM_API_KEY.
+    api_key = os.environ.get("HARS_MEMORY_LLM_API_KEY") or "not-needed"
+
+    # One AsyncOpenAI client per llm_func closure, reused across every call —
+    # real connection pooling from the SDK, instead of the pre-SDK
+    # implementation's httpx.AsyncClient created (and torn down) on every
+    # single request. max_retries=0 disables the SDK's own built-in retry so
+    # this module's tenacity retry (below) is the only retry layer — see the
+    # make_llm_func docstring for why both cannot be active at once (attempts
+    # would multiply: N of ours × M of the SDK's, undermining the exact
+    # attempt-count guarantees HARS_MEMORY_LLM_RETRY_ATTEMPTS is meant to
+    # provide).
+    client = create_openai_async_client(
+        api_key=api_key,
+        base_url=endpoint,
+        timeout=timeout_seconds,
+        client_configs={"max_retries": 0},
     )
 
     def _log_retry(retry_state: RetryCallState) -> None:
@@ -155,36 +224,42 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
             messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
+        # LightRAG may pass internal storage objects via **kwargs (e.g.
+        # hashing_kv); only forward JSON-serializable primitives, exactly as
+        # before. A primitive matching a Chat Completions parameter this
+        # function already sets (max_tokens/temperature) overrides our
+        # default, mirroring the pre-SDK payload.update() semantics;
+        # anything else rides along in the request body via extra_body — the
+        # SDK's mechanism for provider-specific fields it does not itself
+        # model as named parameters (the pre-SDK code had no such named/extra
+        # split because it built one flat httpx JSON payload dict instead).
         _JSON_PRIMITIVES = (str, int, float, bool, type(None))
-        payload: dict[str, object] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        # LightRAG may pass internal storage objects via **kwargs; only forward
-        # JSON-serializable primitives to avoid TypeError in httpx serialization.
-        payload.update({k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)})
+        _NAMED_PARAMS = {"max_tokens", "temperature"}
+        forwarded = {k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)}
+        call_max_tokens = forwarded.get("max_tokens", max_tokens)
+        call_temperature = forwarded.get("temperature", temperature)
+        extra_body = {k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS}
 
-        async def _post_once() -> str:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                resp = await client.post(
-                    f"{endpoint}/chat/completions",
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                message = data["choices"][0]["message"]
-                content = str(message.get("content") or "")
-                # Thinking models may leave content empty and put everything in
-                # reasoning_content (server-side reasoning parsing), or emit
-                # inline <think> blocks. Recover the actual result either way.
-                if not content.strip() and message.get("reasoning_content"):
-                    content = str(message["reasoning_content"])
-                if "<think>" in content:
-                    import re as _re
-                    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
-                return content
+        async def _complete_once() -> str:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=call_max_tokens,
+                temperature=call_temperature,
+                extra_body=extra_body or None,
+            )
+            message = response.choices[0].message
+            content = str(message.content or "")
+            # Thinking models may leave content empty and put everything in
+            # reasoning_content (server-side reasoning parsing), or emit
+            # inline <think> blocks. Recover the actual result either way.
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if not content.strip() and reasoning_content:
+                content = str(reasoning_content)
+            if "<think>" in content:
+                import re as _re
+                content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
+            return content
 
         retrying = AsyncRetrying(
             stop=stop_after_attempt(retry_attempts),
@@ -196,8 +271,8 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
             reraise=True,
         )
         try:
-            return await retrying(_post_once)
-        except httpx.HTTPError as exc:
+            return await retrying(_complete_once)
+        except openai.APIError as exc:
             raise RuntimeError(
                 f"LLM endpoint unavailable for model '{model}' at {endpoint}: {exc}"
             ) from exc

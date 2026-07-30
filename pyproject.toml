@@ -34,6 +34,22 @@ dependencies = [
   # (server/lightrag_init.py::make_llm_func). Already pulled in transitively
   # by lightrag-hku, but declared explicitly since we import it directly.
   "tenacity>=9.0.0",
+  # Official OpenAI SDK — used directly by server/lightrag_init.py::make_llm_func
+  # as a thin adapter (AsyncOpenAI client construction, connection pooling,
+  # typed error taxonomy) around our own llama.cpp-server-facing completion
+  # call. lightrag-hku only declares this behind its optional "api" extra
+  # (see lightrag.llm.openai, which pip-installs it at import time via
+  # pipmaster if absent); we declare it explicitly so it is uv-managed
+  # instead of side-installed outside the lockfile. Version bound matches
+  # lightrag-hku's own "api" extra constraint.
+  "openai>=2.0.0,<3.0.0",
+  # trec_eval-standard retrieval metrics (Recall@k, nDCG@k, RR) for
+  # tools/memory/eval/metrics.py — wraps pytrec_eval_terrier (the actively
+  # maintained fork of the actual trec_eval C binary; ships prebuilt cp313
+  # wheels, unlike upstream pytrec_eval which is sdist-only and requires a
+  # C build). See metrics.py module docstring for the conventions this
+  # replaces vs keeps.
+  "ir-measures>=0.4.0",
 ]
 
 [project.optional-dependencies]
