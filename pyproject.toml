@@ -30,6 +30,10 @@ dependencies = [
   # HTTP client used by gpu_guard.py
   "requests>=2.32.0",
   "bm25s>=0.3.10",
+  # Bounded retry/backoff for transient LLM-endpoint failures
+  # (server/lightrag_init.py::make_llm_func). Already pulled in transitively
+  # by lightrag-hku, but declared explicitly since we import it directly.
+  "tenacity>=9.0.0",
 ]
 
 [project.optional-dependencies]

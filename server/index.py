@@ -58,11 +58,9 @@ from tools.memory.ingest.change_detection import (
 from tools.memory.ingest.document import Document
 from tools.memory.ingest.walker import walk
 from tools.memory.server.gpu_guard import GpuBusyError, GpuGuardUnavailableError, assert_gpu_free
+from tools.memory.server.logging_setup import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+setup_logging()
 logger = logging.getLogger("memory.index")
 
 # Optional extra ingest root, e.g. the Claude Code project-memory directory

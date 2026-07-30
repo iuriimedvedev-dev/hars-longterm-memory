@@ -48,13 +48,24 @@ from dataclasses import dataclass
 from tools.memory.retrieval.supersession import apply_supersession_scoring
 
 # Guards the supersession-aware re-scoring pass (retrieval/supersession.py)
-# behind an explicit opt-in, following the HARS_MEMORY_* env convention used
-# elsewhere in this package (e.g. HARS_MEMORY_HYBRID_ALPHA). Default OFF: the
-# mechanism must be measured against the eval harness
-# (tools/memory/eval/ab_bench.py `ab`) before it changes shipped ranking
-# behaviour for any caller of `fuse()` — see retrieval/supersession.py's
-# module docstring for what it does and why each of its two signals is
-# scoped the way it is.
+# behind an env flag, following the HARS_MEMORY_* env convention used
+# elsewhere in this package (e.g. HARS_MEMORY_HYBRID_ALPHA).
+#
+# Default ON (flipped 2026-07-30, after being measured against the eval
+# harness — tools/memory/eval/ab_bench.py `ab`). Measured on the 46-query
+# tools/memory/eval/retrieval_queries.yaml labeled set, current index,
+# context_priority=merged, top_k=10:
+#
+#   variant                     recall@1  recall@10  ndcg@10  mrr    supersession_err
+#   merged, supersession off     0.5324    0.8241     0.7126   0.7003  0.3333
+#   merged, supersession on      0.5324    0.8241     0.7151   0.7030  0.1667
+#
+# No regression on any metric or query type (per-query-type breakdown is
+# byte-identical except conceptual ndcg@10, which improves 0.6679->0.6711);
+# added latency ~0.04ms. Escape hatch: set HARS_MEMORY_SUPERSESSION_SCORING=0
+# to restore pre-flip behaviour (raw fused ranking, no marker/recency
+# rescoring) for any caller of `fuse()` — see
+# tools/memory/tests/test_supersession_scoring.py::TestFusionEnvGating.
 HARS_MEMORY_SUPERSESSION_SCORING_ENV = "HARS_MEMORY_SUPERSESSION_SCORING"
 
 
@@ -62,7 +73,7 @@ _TRUTHY = {"1", "true", "yes"}
 
 
 def _supersession_scoring_enabled() -> bool:
-    return os.environ.get(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "0").strip().lower() in _TRUTHY
+    return os.environ.get(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "1").strip().lower() in _TRUTHY
 
 
 # Per-signal overrides for retrieval/supersession.py's two independent
@@ -101,6 +112,31 @@ def _sub_flag_enabled(env_name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in _TRUTHY
+
+
+def supersession_scoring_enabled() -> bool:
+    """Public: same env-derived truth `fuse()` itself consults for its master
+    `HARS_MEMORY_SUPERSESSION_SCORING` gate, read fresh on every call (not
+    cached at import time) — exposed so other callers that need to know
+    whether supersession-aware scoring is active right now don't have to
+    duplicate this env check. See `marker_penalty_enabled` below for the
+    caller this was added for."""
+    return _supersession_scoring_enabled()
+
+
+def marker_penalty_enabled() -> bool:
+    """Public: whether `fuse()`'s marker-penalty sub-signal would fire right
+    now (master flag AND sub-flag, matching `fuse()`'s own two-flag gating
+    exactly) — read fresh on every call. Added for
+    `hars_longterm_memory_mcp.py`'s `_merge_context_with_fusion` (item:
+    supersession-aware scoring on the FINAL MERGED context, not just this
+    fusion channel's own input — see `retrieval/supersession.py`'s
+    `apply_marker_penalty_to_ranked_list`), which needs to know whether to
+    apply the SAME marker-penalty policy to the merged list without
+    duplicating (and risking drifting from) this two-flag env logic."""
+    return _supersession_scoring_enabled() and _sub_flag_enabled(
+        HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV, default=True
+    )
 
 # UNTUNED DEFAULT. Bruch et al. 2022 (and the production writeup cited above)
 # tune alpha on a labeled query/relevance set; no such set exists yet for this
@@ -201,6 +237,8 @@ __all__ = [
     "HARS_MEMORY_SUPERSESSION_SCORING_ENV",
     "HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV",
     "HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV",
+    "supersession_scoring_enabled",
+    "marker_penalty_enabled",
     "ChannelHit",
     "FusedChunk",
     "fuse",

@@ -162,6 +162,19 @@ plugins/hars-longterm-memory/scripts/hars_longterm_memory_mcp.py
 | `global` | Broad summarisation (ROCm page fault across all reports) |
 | `naive` | Pure vector similarity fallback |
 
+Not to be confused with `memory_recall`'s separate `context_priority` param
+(`context_only=True` path only): default `merged` as of 2026-07-30, reorders
+LightRAG's own graph/vector context with the additive dense+BM25 `hybrid`
+channel (round-robin, fusion first) and applies supersession-aware rescoring.
+Measured on the 46-query labeled eval set: recall@1 0.477→0.5324, recall@10
+0.727→0.8241, ndcg@10 0.637→0.7151, mrr 0.634→0.7030, supersession error rate
+0.333→0.1667 vs the pre-2026-07-30 default, no regressions. Escape hatches:
+pass `context_priority="lightrag"` on any single call, or set
+`HARS_MEMORY_CONTEXT_PRIORITY_DEFAULT=lightrag` server-wide. Supersession
+rescoring itself is also on by default (`HARS_MEMORY_SUPERSESSION_SCORING=1`)
+— set to `0` to disable. See `config/.env.example` for the full retrieval-
+tuning env var list.
+
 ---
 
 ## Evaluation
