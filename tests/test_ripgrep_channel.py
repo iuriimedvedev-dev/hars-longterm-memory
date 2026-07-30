@@ -63,6 +63,34 @@ class TestExtractTerms:
     def test_empty_question_no_keywords_yields_no_terms(self) -> None:
         assert extract_terms("") == []
 
+    def test_identifiers_supplied_only_via_ll_keywords_are_extracted(self) -> None:
+        # Reproduces the live "Call A" regression exactly: the question text
+        # carries no identifier at all, and ll_keywords mixes identifier-
+        # shaped entries ("qdrant_transplant", "full_scan_threshold") with
+        # plain-English ones ("Qdrant", "retrieval parity") — only the
+        # identifier-shaped entries must survive.
+        terms = extract_terms(
+            "What was the outcome of the Qdrant vector storage migration "
+            "executed on 2026-07-30, and what was the retrieval parity result?",
+            ll_keywords=["Qdrant", "qdrant_transplant", "full_scan_threshold", "retrieval parity"],
+        )
+        assert terms == ["qdrant_transplant", "full_scan_threshold"]
+
+    def test_terms_are_capped_at_max_query_terms(self) -> None:
+        many_keywords = [f"identifier_{i}" for i in range(rgc.MAX_QUERY_TERMS + 5)]
+        terms = extract_terms("plain question with no identifiers", ll_keywords=many_keywords)
+        assert len(terms) == rgc.MAX_QUERY_TERMS
+        assert terms == many_keywords[: rgc.MAX_QUERY_TERMS]
+
+    def test_question_terms_survive_the_cap_ahead_of_keyword_overflow(self) -> None:
+        # Question-derived terms are appended first (see extract_terms'
+        # docstring), so when the combined list would exceed MAX_QUERY_TERMS,
+        # the question's own identifier must never be the one truncated away.
+        many_keywords = [f"identifier_{i}" for i in range(rgc.MAX_QUERY_TERMS + 5)]
+        terms = extract_terms("What about A2S32?", ll_keywords=many_keywords)
+        assert terms[0] == "A2S32"
+        assert len(terms) == rgc.MAX_QUERY_TERMS
+
 
 class TestAvailabilityFailSoft:
     """Item: the rg-missing fail-soft path — never an exception."""
@@ -127,6 +155,28 @@ class TestNoIdentifierTermsReturnsNothing:
         monkeypatch.setattr(rgc.subprocess, "run", _fail_if_called)
 
         result = search("How is training going in general today?", roots=[tmp_path])
+
+        assert result.hits == []
+        assert result.query_terms == ()
+
+    def test_non_identifier_ll_keywords_alone_returns_no_hits_without_invoking_rg(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Plain-English ll_keywords (no identifier shape) must not sneak a
+        # noisy substring search in through the keyword side-channel either
+        # — this channel exists for exact identifiers, not keyword recall.
+        _write(tmp_path / "note.md", "Some prose about Qdrant retrieval parity.\n")
+
+        def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("rg must not be invoked when no term is identifier-shaped")
+
+        monkeypatch.setattr(rgc.subprocess, "run", _fail_if_called)
+
+        result = search(
+            "What was the outcome of the Qdrant migration?",
+            ll_keywords=["Qdrant", "retrieval parity"],
+            roots=[tmp_path],
+        )
 
         assert result.hits == []
         assert result.query_terms == ()
@@ -263,6 +313,31 @@ class TestSearchAgainstSyntheticTree:
 
         matched_names = {Path(h.file_path).name for h in result.hits}
         assert matched_names == {"real.md"}
+
+    def test_identifiers_supplied_only_via_ll_keywords_find_real_hits(
+        self, tmp_path: Path
+    ) -> None:
+        """Real, non-monkeypatched end-to-end reproduction of the live "Call
+        A" regression: an identifier-shaped term arrives ONLY through
+        ll_keywords, the question text is clean prose. `rg` must still be
+        invoked and must find the file."""
+        _write(
+            tmp_path / ".session" / "2026-07-30_qdrant-migration-execution.md",
+            "# Qdrant migration\n\nqdrant_transplant.py ran the migration; "
+            "full_scan_threshold stayed at its configured default throughout.\n",
+        )
+        result = search(
+            "What was the outcome of the Qdrant vector storage migration "
+            "executed on 2026-07-30, and what was the retrieval parity result?",
+            ll_keywords=["Qdrant", "qdrant_transplant", "full_scan_threshold", "retrieval parity"],
+            roots=[tmp_path],
+            top_k=5,
+        )
+
+        assert result.available is True
+        assert result.query_terms == ("qdrant_transplant", "full_scan_threshold")
+        assert result.hits, "expected the ll_keywords-only identifiers to find the file"
+        assert result.hits[0].file_path.endswith("2026-07-30_qdrant-migration-execution.md")
 
     def test_measured_latency_is_reported_and_reasonable(self, tmp_path: Path) -> None:
         corpus = self._corpus(tmp_path)

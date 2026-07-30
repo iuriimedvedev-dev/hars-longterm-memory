@@ -88,7 +88,10 @@ Query construction
     principled `-e` pattern to search for, and a channel whose entire
     reason to exist is exact-identifier recall should stay silent rather
     than degrade into fuzzy noise on plain-English questions (that job
-    already belongs to dense + BM25).
+    already belongs to dense + BM25). The combined term list is capped at
+    MAX_QUERY_TERMS (see that constant's own docstring for the chosen bound
+    and why) — question-derived terms take priority, `ll_keywords` fill the
+    remaining slots.
 
 Scoring (see `_score_file` for the implementation)
     `rg` returns matches, not a relevance score, so one is synthesized here,
@@ -234,6 +237,30 @@ _DEFAULT_MAX_COUNT_PER_FILE: Final[int] = 20  # rg's own -m cap, per file
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 2.0
 _DEFAULT_TOP_K: Final[int] = 10
 
+# --- term-count bound ----------------------------------------------------
+# `_build_rg_command` hands every term to a SINGLE `rg` invocation as its own
+# `-e` alternation (see that function's docstring) — this is one subprocess
+# call regardless of term count, but each additional `-e` pattern still adds
+# real matching cost: measured live against this repo, a 2-term query
+# (`qdrant_transplant.py`, `full_scan_threshold`) cost 93.88ms, ~7x the
+# 13ms mean measured for the (at the time, question-only) 46-query labeled
+# set (tools/memory/eval/retrieval_queries.yaml; see
+# .session/2026-07-30_longterm-memory-overhaul.md). `ll_keywords` is an
+# open-ended, schema-unbounded array (`list[str]`, no `maxItems`) that a
+# caller could in principle supply with dozens of entries, which would make
+# per-query rg cost scale with an input this channel does not control.
+# MAX_QUERY_TERMS bounds that worst case while staying well above realistic
+# usage: the memory_recall tool's own documented example supplies 3
+# ll_keywords (['A2S32', 'Phase C', 'DINOv3']), and `extract_identifier_terms`
+# rarely yields more than 2-3 distinct identifiers out of one natural-
+# language question. 8 comfortably covers "a question's own identifiers plus
+# a full documented-example-sized keyword list" with margin, while still
+# capping a caller that supplies an unusually long array. Question-derived
+# terms are appended first (see `extract_terms` below) and therefore always
+# occupy the first slots when the cap truncates — the question's own text
+# takes priority over the keyword side-channel.
+MAX_QUERY_TERMS: Final[int] = 8
+
 # --- scoring constants (see module docstring "Scoring" for the formula) -
 WHOLE_TOKEN_WEIGHT: Final[float] = 2.0
 SUBSTRING_WEIGHT: Final[float] = 1.0
@@ -353,7 +380,10 @@ def extract_terms(question: str, ll_keywords: list[str] | None = None) -> list[s
             seen.add(key)
             terms.append(keyword)
 
-    return terms
+    # Bounded — see MAX_QUERY_TERMS's docstring above for why and how the
+    # value was chosen. Question-derived terms were appended first, so they
+    # always survive the truncation ahead of any keyword-side overflow.
+    return terms[:MAX_QUERY_TERMS]
 
 
 def _load_ignore_patterns(root: Path) -> list[str]:
@@ -714,6 +744,7 @@ def search(
 __all__ = [
     "RG_BINARY_NAME",
     "HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV",
+    "MAX_QUERY_TERMS",
     "WHOLE_TOKEN_WEIGHT",
     "SUBSTRING_WEIGHT",
     "MAX_COUNTED_MATCHES_PER_TERM",
