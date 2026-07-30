@@ -258,17 +258,106 @@ _VDB_PROBE_BYTES = 256
 _EMBEDDING_DIM_RE = re.compile(r'"embedding_dim"\s*:\s*(\d+)')
 
 
-def resolve_index_embedding_dim(working_dir: str) -> int | None:
+# LightRAG's QdrantVectorDBStorage collapses every namespace to exactly
+# ``lightrag_vdb_{namespace}`` (see qdrant_impl.py::__post_init__) because
+# EmbeddingFunc in lightrag_init.create_lightrag() carries no model_name, so
+# model_suffix is always None. This is NOT a config value — it is a fixed
+# consequence of that call site — so it is intentionally not env-driven here.
+_QDRANT_COLLECTION_NAMES: tuple[str, ...] = (
+    "lightrag_vdb_chunks",
+    "lightrag_vdb_entities",
+    "lightrag_vdb_relationships",
+)
+
+
+def _resolve_qdrant_embedding_dim(qdrant_url: str) -> int | None:
+    """Return the configured vector size of the deployed ``lightrag_vdb_*``
+    collections, or ``None`` if none of them exist yet (fresh Qdrant volume —
+    nothing to validate against, mirrors the NanoVectorDBStorage semantics of
+    "no vdb_*.json yet").
+
+    Vector dimension is a collection-level property in Qdrant (not per
+    tenant/workspace), so checking collection existence is sufficient here —
+    no need to filter by workspace_id for a dimension-only check.
+
+    Raises ``RuntimeError`` if the collections disagree on dimension with each
+    other (a corrupt/partial migration) — that is a real error, not a "no
+    index yet" case. On a connection failure, logs a warning and returns
+    ``None``: this guard exists to catch wrong-dimension embedding configs,
+    not to duplicate the reachability check that memory_status/memory_recall
+    already perform with an actionable error at call time.
+    """
+    try:
+        from qdrant_client import QdrantClient  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning(
+            "qdrant-client not installed; skipping embedder/index dimension "
+            "validation against Qdrant at %s.",
+            qdrant_url,
+        )
+        return None
+
+    try:
+        client = QdrantClient(url=qdrant_url, timeout=3)
+        dims: dict[str, int] = {}
+        for name in _QDRANT_COLLECTION_NAMES:
+            if not client.collection_exists(name):
+                continue
+            info = client.get_collection(name)
+            dims[name] = int(info.config.params.vectors.size)
+    except Exception as exc:
+        logger.warning(
+            "Could not reach Qdrant at %s to validate embedder dimension "
+            "(vector_info.error only, not fatal here — memory_status/"
+            "memory_recall will surface reachability separately): %s",
+            qdrant_url,
+            exc,
+        )
+        return None
+
+    if not dims:
+        return None
+    distinct = set(dims.values())
+    if len(distinct) > 1:
+        raise RuntimeError(
+            f"Qdrant collections disagree on embedding dimension at {qdrant_url}: "
+            f"{dims!r} — this indicates a corrupt or partial migration, not a "
+            "normal embedder/index mismatch."
+        )
+    return distinct.pop()
+
+
+def resolve_index_embedding_dim(
+    working_dir: str,
+    *,
+    vector_storage: str | None = None,
+    qdrant_url: str | None = None,
+) -> int | None:
     """Return the ``embedding_dim`` recorded in an existing vector index, or ``None``.
 
-    Checks LightRAG's ``vdb_*.json`` sibling files in ``working_dir`` in priority
-    order (chunks first — it is both the smallest file and the one used by
-    local/naive retrieval) and reads only the first bytes of whichever file is
-    found first, since NanoVectorDBStorage writes ``embedding_dim`` as the first
-    key. Returns ``None`` when none of the vdb files exist yet (brand-new,
-    not-yet-indexed working dir) — callers must treat that as "nothing to
-    validate against", not as an error.
+    Branches on the configured vector backend (``vector_storage`` param, else
+    ``HARS_MEMORY_VECTOR_STORAGE`` env, else ``NanoVectorDBStorage`` default):
+
+    - NanoVectorDBStorage: checks LightRAG's ``vdb_*.json`` sibling files in
+      ``working_dir`` in priority order (chunks first — it is both the
+      smallest file and the one used by local/naive retrieval) and reads only
+      the first bytes of whichever file is found first, since
+      NanoVectorDBStorage writes ``embedding_dim`` as the first key.
+    - Any Qdrant backend (name contains "qdrant"): reads the vector size off
+      the deployed ``lightrag_vdb_{chunks,entities,relationships}``
+      collections instead — the JSON files are gone once vectors move to
+      Qdrant, so probing them would silently return None here and this guard
+      would degrade to a no-op (the exact bug class it exists to prevent).
+
+    Returns ``None`` when nothing has been indexed yet under the configured
+    backend (brand-new, not-yet-indexed working dir / empty Qdrant volume) —
+    callers must treat that as "nothing to validate against", not as an error.
     """
+    _vector_storage = vector_storage or os.environ.get("HARS_MEMORY_VECTOR_STORAGE", "NanoVectorDBStorage")
+    if "qdrant" in _vector_storage.lower():
+        _qdrant_url = qdrant_url or os.environ.get("HARS_MEMORY_QDRANT_URL", "http://localhost:6335")
+        return _resolve_qdrant_embedding_dim(_qdrant_url)
+
     for filename in _VDB_FILENAMES:
         path = Path(working_dir) / filename
         if not path.is_file():
@@ -289,13 +378,24 @@ def resolve_index_embedding_dim(working_dir: str) -> int | None:
     return None
 
 
-def validate_embedder_against_index(working_dir: str, model_name: str, configured_dim: int) -> None:
+def validate_embedder_against_index(
+    working_dir: str,
+    model_name: str,
+    configured_dim: int,
+    *,
+    vector_storage: str | None = None,
+    qdrant_url: str | None = None,
+) -> None:
     """Fail fast if the configured embedder disagrees with an existing index.
 
-    No-op when ``working_dir`` has no vector index yet (brand-new working dir) —
-    there is nothing to validate against and a fresh index will simply be built
-    with ``configured_dim``.
+    No-op when there is no vector index yet under the configured backend
+    (brand-new working dir, or empty Qdrant volume) — there is nothing to
+    validate against and a fresh index will simply be built with
+    ``configured_dim``. See ``resolve_index_embedding_dim`` for the
+    NanoVectorDBStorage vs. Qdrant branching.
     """
-    index_dim = resolve_index_embedding_dim(working_dir)
+    index_dim = resolve_index_embedding_dim(
+        working_dir, vector_storage=vector_storage, qdrant_url=qdrant_url
+    )
     if index_dim is not None and index_dim != configured_dim:
         raise EmbeddingDimensionMismatchError(working_dir, model_name, configured_dim, index_dim)
