@@ -202,6 +202,180 @@ class TestFusionMath:
         assert fuse({}, {}, alpha=0.5) == []
 
 
+class TestRipgrepFusion:
+    """Item: ripgrep-channel fusion wiring (retrieval/fusion.py's
+    `apply_ripgrep_gate` / `fuse_ripgrep_as_third_weight` /
+    `ripgrep_channel_enabled`). See `apply_ripgrep_gate`'s own module-level
+    design note in fusion.py for the measured rationale these tests pin.
+    """
+
+    def _sample_fused(self):
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        dense_hits = {
+            "chunk-a": ChannelHit(score=0.9, content="dense top", file_path="a.md"),
+            "chunk-b": ChannelHit(score=0.5, content="dense mid", file_path="b.md"),
+        }
+        sparse_hits = {
+            "chunk-b": ChannelHit(score=10.0, content="sparse top", file_path="b.md"),
+            "chunk-c": ChannelHit(score=5.0, content="sparse mid", file_path="c.md"),
+        }
+        return fuse(dense_hits, sparse_hits, alpha=0.5)
+
+    def test_empty_ripgrep_hits_is_a_pure_passthrough(self) -> None:
+        from tools.memory.retrieval.fusion import apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        gated = apply_ripgrep_gate(fused, {}, top_k=2)
+        assert gated == fused[:2]
+
+    def test_injection_never_evicts_appends_past_top_k(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        ripgrep_hits = {
+            "off_index.md": ChannelHit(score=4.0, content="found only by rg", file_path="off_index.md"),
+        }
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_boost=False)
+        # The real top-2 candidates are unchanged, in the same order/score.
+        assert [c.chunk_id for c in gated[:2]] == [c.chunk_id for c in fused[:2]]
+        assert gated[:2] == fused[:2]
+        # The off-index file is appended, not substituted for anything.
+        assert len(gated) == 3
+        assert gated[2].chunk_id == "ripgrep:off_index.md"
+        assert gated[2].file_path == "off_index.md"
+        assert gated[2].ripgrep_score == 4.0
+
+    def test_matching_is_by_basename_not_chunk_id(self) -> None:
+        """The whole reason for basename matching: ripgrep's chunk_id
+        (file_stable_id of whatever path it was given) essentially never
+        equals a real dense/sparse chunk_id -- see fusion.py's design note.
+        A ripgrep hit whose FILE PATH's basename matches an existing fused
+        chunk's file_path basename must be treated as the SAME document even
+        though the two `chunk_id`s are completely different strings.
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        # "b.md" is already in the fused pool (chunk-b); ripgrep reports it
+        # under an absolute path with a totally different chunk_id scheme.
+        ripgrep_hits = {
+            "b.md": ChannelHit(score=6.0, content="rg found b.md too", file_path="/abs/path/to/b.md"),
+        }
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True)
+        matched = next(c for c in gated if c.chunk_id == "chunk-b")
+        assert matched.ripgrep_score == 6.0
+        # No new "ripgrep:b.md" entry was injected -- it was recognized as
+        # the SAME document as chunk-b, not a distinct off-index one.
+        assert not any(c.chunk_id == "ripgrep:b.md" for c in gated)
+        assert len(gated) == 3  # still exactly the fused pool, no injection
+
+    def test_boost_default_off_leaves_fused_score_untouched(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        by_id = {c.chunk_id: c for c in fused}
+        ripgrep_hits = {"b.md": ChannelHit(score=6.0, content="x", file_path="b.md")}
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3)  # enable_boost defaults False
+        matched = next(c for c in gated if c.chunk_id == "chunk-b")
+        assert matched.fused_score == pytest.approx(by_id["chunk-b"].fused_score)
+        assert matched.ripgrep_score == 6.0  # still recorded, even though score is untouched
+
+    def test_boost_enabled_increases_fused_score_but_stays_bounded(self) -> None:
+        from tools.memory.retrieval.fusion import (
+            RIPGREP_BOOST_CAP,
+            ChannelHit,
+            apply_ripgrep_gate,
+        )
+
+        fused = self._sample_fused()
+        by_id = {c.chunk_id: c for c in fused}
+        # A huge raw ripgrep score must still saturate at RIPGREP_BOOST_CAP,
+        # never overwhelm a real dense/sparse-earned fused_score.
+        ripgrep_hits = {"b.md": ChannelHit(score=1_000_000.0, content="x", file_path="b.md")}
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True)
+        matched = next(c for c in gated if c.chunk_id == "chunk-b")
+        assert matched.fused_score == pytest.approx(by_id["chunk-b"].fused_score + RIPGREP_BOOST_CAP)
+
+    def test_max_injected_caps_off_index_appends(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        ripgrep_hits = {
+            f"off_{i}.md": ChannelHit(score=float(10 - i), content="x", file_path=f"off_{i}.md")
+            for i in range(5)
+        }
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, max_injected=2)
+        injected = [c for c in gated if c.chunk_id.startswith("ripgrep:")]
+        assert len(injected) == 2
+        # Highest-scoring off-index hits win the limited slots.
+        assert {c.chunk_id for c in injected} == {"ripgrep:off_0.md", "ripgrep:off_1.md"}
+
+    def test_injection_disabled_never_appends(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+
+        fused = self._sample_fused()
+        ripgrep_hits = {"off_index.md": ChannelHit(score=9.0, content="x", file_path="off_index.md")}
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_injection=False)
+        assert len(gated) == 2
+        assert not any(c.chunk_id.startswith("ripgrep:") for c in gated)
+
+    def test_channel_enabled_env_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_RIPGREP_CHANNEL_ENV,
+            ripgrep_channel_enabled,
+        )
+
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, raising=False)
+        assert ripgrep_channel_enabled() is True  # measured default -- see fusion.py's comment
+
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "0")
+        assert ripgrep_channel_enabled() is False
+
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "1")
+        assert ripgrep_channel_enabled() is True
+
+
+class TestRipgrepThirdWeightRejectedVariant:
+    """Item: `fuse_ripgrep_as_third_weight` -- kept importable as a measured,
+    falsifiable rejected alternative (see fusion.py's design note), not
+    deleted. These tests pin its (deliberately naive, chunk_id-keyed)
+    behavior, not endorse it for production use.
+    """
+
+    def test_weights_must_sum_to_one(self) -> None:
+        from tools.memory.retrieval.fusion import fuse_ripgrep_as_third_weight
+
+        with pytest.raises(ValueError, match="sum to 1.0"):
+            fuse_ripgrep_as_third_weight({}, {}, {}, 0.5, 0.5, 0.5)
+
+    def test_negative_weight_rejected(self) -> None:
+        from tools.memory.retrieval.fusion import fuse_ripgrep_as_third_weight
+
+        with pytest.raises(ValueError, match=">= 0.0"):
+            fuse_ripgrep_as_third_weight({}, {}, {}, 1.2, -0.1, -0.1)
+
+    def test_ripgrep_hit_with_non_overlapping_chunk_id_becomes_a_new_entry(self) -> None:
+        """Demonstrates the id-space mismatch this variant was rejected for:
+        a ripgrep hit keyed by its OWN chunk_id (not a real dense/sparse
+        chunk_id) never merges with an existing entry -- it always shows up
+        as a brand-new, dense_norm=sparse_norm=0 entry, exactly the
+        distortion described in fusion.py's design note.
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, fuse_ripgrep_as_third_weight
+
+        dense_hits = {"chunk-a": ChannelHit(score=0.9, content="x", file_path="a.md")}
+        ripgrep_hits = {
+            "file:deadbeef0000": ChannelHit(score=5.0, content="rg only", file_path="fresh.md"),
+        }
+        fused = fuse_ripgrep_as_third_weight(dense_hits, {}, ripgrep_hits, 0.7, 0.2, 0.1)
+        by_id = {c.chunk_id: c for c in fused}
+        assert by_id["file:deadbeef0000"].dense_norm == 0.0
+        assert by_id["file:deadbeef0000"].sparse_norm == 0.0
+        assert by_id["file:deadbeef0000"].ripgrep_score == 5.0
+        assert by_id["file:deadbeef0000"].fused_score > 0.0  # contributes via alpha_ripgrep alone
+
+
 class TestBM25IndexCache:
     """Item: index cache invalidates on kv_store_text_chunks.json mtime change."""
 

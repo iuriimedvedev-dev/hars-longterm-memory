@@ -43,7 +43,9 @@ favor or penalize a channel that legitimately found exactly one candidate).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Final
 
 from tools.memory.retrieval.supersession import apply_supersession_scoring
 
@@ -165,6 +167,14 @@ class FusedChunk:
     sparse_norm: float  # 0.0 if sparse had no hit for this chunk
     content: str
     file_path: str
+    # Raw (unbounded) ripgrep_channel score for this chunk's FILE, or None if
+    # the ripgrep channel had no hit for it (disabled, unavailable, no
+    # identifier terms in the query, or genuinely no match). Populated only
+    # by `apply_ripgrep_gate` below — `fuse()` itself never touches this
+    # field (stays None for every chunk on the pre-existing dense+sparse
+    # path, so old callers/tests that construct FusedChunk positionally
+    # without it are unaffected by this addition).
+    ripgrep_score: float | None = None
 
 
 def _min_max_normalize(scores: dict[str, float]) -> dict[str, float]:
@@ -232,6 +242,373 @@ def fuse(
     return fused
 
 
+# ---------------------------------------------------------------------------
+# Ripgrep channel wiring (retrieval/ripgrep_channel.py) — additive gate, not a
+# third convex weight. See the design note below for why, and
+# `fuse_ripgrep_as_third_weight` (further down) for the rejected alternative,
+# kept as a measurable, importable function rather than deleted so the
+# decision stays falsifiable instead of asserted.
+#
+# WHY ADDITIVE GATE, NOT A THIRD CONVEX WEIGHT (measured, not guessed — via
+# a scratch harness built only on tools/memory/eval/ab_bench.py's own
+# scoring primitives plus this module's real functions, imported not
+# reimplemented, per this task's constraint not to edit tools/memory/eval/*
+# — same pattern the 2026-07-30 context_priority=merged measurement used;
+# see the report this constant's sibling comments were written from):
+#
+# 1. Id-space mismatch. `fuse()`'s `dense_hits`/`sparse_hits` are keyed by
+#    LightRAG's own per-CHUNK `chunk_id` (e.g. "file:<hash>-chunk-000").
+#    `ripgrep_channel.search()` returns one hit per FILE, keyed by
+#    `file_stable_id()` of the path `rg` was given. On THIS deployment's
+#    actual corpus (confirmed empirically against the live index, not
+#    assumed), that id does not even reliably identify the same document:
+#    LightRAG's `full_docs`/`text_chunks` stores were built from a curated
+#    staging/consolidation pipeline (`memory_remember` -> staging ->
+#    `update_kb.sh`), not a direct `file_stable_id()` hash of the live
+#    worktree path ripgrep searches — e.g. `.session/2026-02-09_tui-status.md`
+#    hashes to `file:8beabca59ca7` via `file_stable_id()`, but that same
+#    document's real LightRAG `_id` in `kv_store_full_docs.json` is
+#    `file:ef03e323a35f`. Treating ripgrep's `chunk_id` as a third dict key
+#    alongside dense/sparse's `chunk_id`s (the literal reading of "third
+#    convex weight") therefore almost never overlaps a real chunk at all —
+#    every ripgrep hit becomes a brand-new entry with `dense_norm=sparse_norm
+#    =0`, and every existing dense/sparse entry gets `alpha_ripgrep * 0`
+#    silently subtracted from its share of the convex sum on EVERY query,
+#    whether or not ripgrep fired. That is exactly the distortion flagged
+#    before this was measured, and `fuse_ripgrep_as_third_weight` below
+#    reproduces it faithfully (on purpose) for the A/B comparison.
+# 2. Sparsity asymmetry. ripgrep fires on a minority of queries (only
+#    identifier-shaped ones) and returns a handful of file-level hits, not a
+#    ranked-and-sized-like-the-others candidate pool; per-query min-max
+#    normalizing a 1-3 item pool stretches its top hit to ~1.0 regardless of
+#    true relevance — the identical degeneracy already documented for
+#    `fused_score` in the no-answer-confidence work
+#    (hars_longterm_memory_mcp.py's `NO_ANSWER_DENSE_SCORE_THRESHOLD`
+#    comment). A convex weight makes that stretched, potentially-noisy 1.0
+#    compete on equal footing with a dense/sparse channel's honestly-earned
+#    1.0 from a pool of dozens of real candidates.
+# 3. The actual reason ripgrep exists (staleness immunity, not "another
+#    relevance signal") is best served by a PRESENCE guarantee for documents
+#    the index cannot see at all (never in dense_hits/sparse_hits — the file
+#    has no chunk_id there because it has never been chunked/embedded), not
+#    by magnitude blending against documents that ARE indexed. A convex
+#    weight cannot express "guarantee visibility"; an additive gate can.
+#
+# `apply_ripgrep_gate` therefore does two independent things, both bounded
+# and neither using per-query min-max on the ripgrep scores themselves:
+#   (a) BOOST: a chunk already present in `fused` (found by dense and/or
+#       sparse) whose FILE also matches a ripgrep hit gets a small, capped
+#       additive bump to `fused_score` — nudges rank among already-visible
+#       candidates, cannot invert a strong dense/sparse win into a loss
+#       (`RIPGREP_BOOST_CAP` is far below the ~1.0 ceiling a dominant
+#       dense/sparse hit's `fused_score` can reach).
+#   (b) GATE: a ripgrep hit whose file has NO chunk anywhere in the fused
+#       pool at all (the actual staleness case — index has zero chunks for
+#       it) is APPENDED (never inserted by evicting an existing candidate)
+#       up to `RIPGREP_MAX_INJECTED` times. This can only ever ADD documents
+#       beyond what dense+sparse already return, so it cannot regress
+#       recall@k/ndcg@k/mrr on a labeled set scored by exactly those metrics
+#       — the worst case is a wasted, ignored extra slot.
+#
+# Matching key: FILE BASENAME (`Path(file_path).name`), not chunk_id and not
+# `file_stable_id()`. Empirically the only join key that actually holds
+# across this corpus's channels: `kv_store_full_docs.json` /
+# `kv_store_text_chunks.json` both store `file_path` as a bare basename for
+# every curated-note/experiment/hypothesis document (2047/2289 entries,
+# verified 2026-07-30), never a directory-qualified path, and the 242
+# remaining entries (staged notes under `/mnt/datasets/graphrag/staging/`)
+# carry a full absolute path whose OWN basename still agrees with what
+# `ripgrep_channel.search()` reports for the same file (ripgrep's
+# `file_path` is whatever absolute/relative form its search `roots` were
+# given — see ripgrep_channel.py's module docstring "Search roots and
+# filters" — but `.name` is invariant to that).
+HARS_MEMORY_RIPGREP_CHANNEL_ENV = "HARS_MEMORY_RIPGREP_CHANNEL"
+
+# Default ON, in INJECTION-ONLY mode (`apply_ripgrep_gate`'s own
+# `enable_boost` defaults False — see that function's docstring). Measured
+# 2026-07-30, two independent pieces of evidence:
+#
+# 1. No-regression on the 46-query tools/memory/eval/retrieval_queries.yaml
+#    labeled set (hybrid_bm25 channel, top_k=10, pool_multiplier=3):
+#    recall@1/recall@10/ndcg@10/mrr/supersession_error_rate/no_answer_hit_
+#    rate, AND the full per-query-type breakdown, are IDENTICAL to the
+#    no-ripgrep baseline in every run (reproduced across 2 separate runs
+#    with slightly different absolute baseline numbers from Qdrant ANN
+#    floating-point jitter — see .session/2026-07-30_qdrant-migration-
+#    execution.md's own documented sub-1e-6-ULP variance — injection
+#    tracked the baseline exactly both times). This is not a coincidence of
+#    this particular label set's queries: injection only ever APPENDS past
+#    `top_k` (never evicts — see `apply_ripgrep_gate`'s docstring), so it is
+#    structurally incapable of moving a recall@10/ndcg@10/mrr score
+#    computed over the first `top_k` ranks, for ANY query.
+# 2. The freshness demonstration this label set cannot express (see the
+#    report): 3 real files that post-date the last consolidation and are
+#    confirmed absent from `kv_store_full_docs.json` (checked directly, not
+#    assumed) — the shipped no-ripgrep pipeline returns 0/3 of them
+#    anywhere in top-10 (structurally impossible: they have no chunk_id in
+#    the index at all), the ripgrep-gated pipeline surfaces 3/3 via
+#    injection.
+#
+# Added latency (ripgrep_channel.search() call itself, the only added
+# cost — dense/sparse/fuse() are unchanged): mean 13.1ms across all 46
+# queries (most have no identifier-shaped term and skip invoking `rg`
+# entirely — near-zero cost), mean ~18-26ms across the ~22 queries that DO
+# fire, one observed outlier at 70ms (a broad single-token co-occurrence
+# query). No case exceeded `ripgrep_channel.py`'s own 2s subprocess
+# timeout.
+#
+# Boost (see `apply_ripgrep_gate`'s docstring) is NOT part of this default:
+# it measured a small ndcg@10/mrr regression with no offsetting labeled-set
+# benefit, so it stays available but opt-in via
+# `apply_ripgrep_gate(..., enable_boost=True)`, not reachable through this
+# top-level channel flag.
+#
+# Escape hatch: HARS_MEMORY_RIPGREP_CHANNEL=0 disables the channel entirely
+# (identical to pre-this-change behaviour) — e.g. if `rg` is unavailable in
+# a deployment (fails soft either way, but this avoids paying the
+# check-availability cost on every query) or an operator wants to isolate
+# whether a retrieval regression traces back to this channel.
+_RIPGREP_CHANNEL_DEFAULT = "1"
+
+
+def ripgrep_channel_enabled() -> bool:
+    """Public: same env-derived truth `_compute_hybrid_block` consults to
+    decide whether to run `ripgrep_channel.search()` at all — read fresh on
+    every call (not cached at import time), matching
+    `supersession_scoring_enabled()`'s convention above."""
+    return os.environ.get(HARS_MEMORY_RIPGREP_CHANNEL_ENV, _RIPGREP_CHANNEL_DEFAULT).strip().lower() in _TRUTHY
+
+
+# Bounded additive-boost constants — NOT per-query min-max normalized (see
+# design note above for why). `_ripgrep_boost` saturates: a ripgrep score at
+# or above RIPGREP_BOOST_SCORE_SCALE gets the full RIPGREP_BOOST_CAP; below
+# that it scales linearly. 0.15 (this single value, not a swept optimum — no
+# cap sweep was run, since boost measured net-negative at this value and
+# ships OFF by default regardless — see `apply_ripgrep_gate`'s docstring for
+# the exact numbers) is a deliberately conservative choice: well under a
+# dominant dense/sparse chunk's ~1.0 `fused_score` ceiling, roughly a
+# whole-token double-identifier-match ripgrep hit's worth of confidence. A
+# future re-enable of boost should re-sweep this against a label set that
+# isn't structurally blind to ripgrep's purpose (see the report) rather than
+# trusting this value.
+RIPGREP_BOOST_CAP: Final[float] = 0.15
+RIPGREP_BOOST_SCORE_SCALE: Final[float] = 8.0
+# Cap on ripgrep-EXCLUSIVE (not already in the fused pool) documents
+# appended per query — small and fixed so a broad literal match (e.g. a
+# common short identifier appearing in many files) cannot flood the response
+# with low-quality freshness candidates. Measured 2026-07-30 against a
+# 3-case real freshness demonstration (3 real, off-index files, see the
+# report): cap=2 silently dropped the actual gold document in 1/3 cases (a
+# generic filename term matched 3 same-day reports almost-tied in score,
+# and the gold doc landed 3rd); cap=3 fixed that case with zero labeled-set
+# cost (raising this cap can only ever affect ranks beyond `top_k` — see
+# `apply_ripgrep_gate`'s docstring "never evicts" — so it is safe to raise
+# without re-measuring the labeled-set no-regression result, as long as
+# nothing downstream scores/consumes ranks beyond `top_k`).
+RIPGREP_MAX_INJECTED: Final[int] = 3
+
+
+def _ripgrep_boost(raw_score: float) -> float:
+    """Bounded, saturating, NOT stretched by this query's own ripgrep
+    candidate pool — see the design note above ("min-max normalization
+    trap"). `raw_score` is `RipgrepSearchHit.score` (see
+    ripgrep_channel.py's "Scoring" docstring): an unbounded positive float
+    whose typical single-identifier-whole-token-match magnitude is ~2.0-4.0
+    and whose multi-term-co-occurrence magnitude is higher — RIPGREP_
+    BOOST_SCORE_SCALE=8.0 was picked so a solid multi-term hit saturates the
+    boost while a single weak substring hit (~1.0) gets a small fraction of
+    it.
+    """
+    if raw_score <= 0.0:
+        return 0.0
+    return min(raw_score / RIPGREP_BOOST_SCORE_SCALE, 1.0) * RIPGREP_BOOST_CAP
+
+
+def apply_ripgrep_gate(
+    fused: list[FusedChunk],
+    ripgrep_hits_by_basename: dict[str, ChannelHit],
+    *,
+    top_k: int,
+    max_injected: int = RIPGREP_MAX_INJECTED,
+    enable_boost: bool = False,
+    enable_injection: bool = True,
+) -> list[FusedChunk]:
+    """Additively boost + presence-gate `fused` (the FULL pre-truncation
+    dense+sparse fusion pool — callers must NOT have already sliced this to
+    `[:top_k]`, or an off-index file could never be appended) with ripgrep
+    hits, keyed by FILE BASENAME (see design note above for why basename,
+    not chunk_id).
+
+    Returns up to `top_k + max_injected` chunks: the top `top_k` of the
+    (possibly boosted) fused pool, followed by up to `max_injected`
+    ripgrep-exclusive documents the fused pool never contained at all. Never
+    evicts an existing top-`top_k` candidate — see design note point (b).
+    A caller that must return exactly `top_k` chunks should slice the
+    result again; this function does not do that itself, since the whole
+    point of the appended tail is to be additional to `top_k`, not a
+    replacement slice of it.
+
+    `enable_boost` / `enable_injection` independently toggle the two
+    sub-behaviours (mirrors `apply_supersession_scoring`'s
+    `enable_marker_penalty`/`enable_recency_discount` two-flag convention) —
+    `enable_boost` defaults OFF because the two were measured (2026-07-30,
+    46-query retrieval_queries.yaml labeled set, hybrid_bm25 channel,
+    top_k=10) to have DIFFERENT regression profiles:
+      - injection alone: recall@1/recall@10/ndcg@10/mrr/supersession_error_
+        rate all IDENTICAL to the no-ripgrep baseline (0.5324/0.8102/0.7075/
+        0.6948/0.1667), including the full per-query-type breakdown — the
+        only component structurally incapable of regressing a top-k-scored
+        metric (it only ever appends past `top_k`, see the "never evicts"
+        note above).
+      - boost alone (same run, `enable_boost=True, enable_injection=False`):
+        recall@1/recall@10/supersession_error_rate held (0.5324/0.8102/
+        0.1667 — presence is unaffected), but ndcg@10 0.7075->0.7012 and
+        mrr 0.6948->0.6867 (both down), driven mostly by the supersession
+        query type's ndcg@10 (0.6769->0.6478) — a ripgrep coincidence
+        nudging a non-gold-but-textually-matching chunk above the gold
+        chunk WITHIN the same top_k window (reordering cost, not a
+        presence/recall loss). No labeled-set benefit was measured to
+        offset this cost (the label set cannot reward ripgrep at all here —
+        see the report), so boost ships off by default; the capability
+        stays available (and unit-tested) for a future re-evaluation
+        against a label set that isn't structurally blind to this
+        channel's purpose.
+
+    No-op passthrough (returns `fused[:top_k]`, unmodified) when
+    `ripgrep_hits_by_basename` is empty — the common case (channel disabled,
+    unavailable, or the question had no identifier-shaped term).
+    """
+    if not ripgrep_hits_by_basename:
+        return fused[:top_k]
+
+    boosted: list[FusedChunk] = []
+    matched_basenames: set[str] = set()
+    for chunk in fused:
+        hit = ripgrep_hits_by_basename.get(Path(chunk.file_path).name)
+        if hit is None:
+            boosted.append(chunk)
+            continue
+        matched_basenames.add(Path(chunk.file_path).name)
+        if not enable_boost:
+            boosted.append(replace(chunk, ripgrep_score=hit.score))
+            continue
+        boosted.append(
+            replace(
+                chunk,
+                fused_score=chunk.fused_score + _ripgrep_boost(hit.score),
+                ripgrep_score=hit.score,
+            )
+        )
+    if enable_boost:
+        boosted.sort(key=lambda c: c.fused_score, reverse=True)
+    top = boosted[:top_k]
+
+    if not enable_injection:
+        return top
+
+    exclusive = [
+        (basename, hit)
+        for basename, hit in ripgrep_hits_by_basename.items()
+        if basename not in matched_basenames
+    ]
+    exclusive.sort(key=lambda item: item[1].score, reverse=True)
+    injected = [
+        FusedChunk(
+            chunk_id=f"ripgrep:{basename}",
+            fused_score=_ripgrep_boost(hit.score),
+            dense_score=None,
+            sparse_score=None,
+            dense_norm=0.0,
+            sparse_norm=0.0,
+            content=hit.content,
+            file_path=hit.file_path,
+            ripgrep_score=hit.score,
+        )
+        for basename, hit in exclusive[:max_injected]
+    ]
+    return top + injected
+
+
+def fuse_ripgrep_as_third_weight(
+    dense_hits: dict[str, ChannelHit],
+    sparse_hits: dict[str, ChannelHit],
+    ripgrep_hits: dict[str, ChannelHit],
+    alpha_dense: float,
+    alpha_sparse: float,
+    alpha_ripgrep: float,
+) -> list[FusedChunk]:
+    """REJECTED alternative design — kept importable (not deleted) so the
+    rejection is a measured, falsifiable A/B result, not an assertion. See
+    the design note above `apply_ripgrep_gate` for why. This is the literal
+    reading of "ripgrep as a third convex weight alongside dense and
+    sparse": a straightforward 3-way generalization of `fuse()`'s own
+    id-keyed union + per-channel independent min-max normalization,
+    reusing `ripgrep_hits` keyed the SAME way `dense_hits`/`sparse_hits`
+    already are (by `chunk_id` — for ripgrep that means
+    `RipgrepSearchHit.chunk_id`, i.e. `file_stable_id()`), NOT by basename.
+    That id-space mismatch (see design note) is deliberately preserved here,
+    not fixed, because "just key it the same way the other two channels
+    are keyed" is exactly what a naive third-weight implementation would do.
+
+    `alpha_dense + alpha_sparse + alpha_ripgrep` must sum to 1.0 (within
+    floating-point tolerance) — unlike `fuse()`'s single `alpha` (which
+    implies the second weight), three independent weights need an explicit
+    check since nothing else forces them to a valid convex combination.
+
+    MEASURED 2026-07-30 (same labeled set/config as `apply_ripgrep_gate`'s
+    docstring), sweeping `alpha_ripgrep` in {0.1, 0.2, 0.3} (remaining
+    weight split `alpha_dense`/`alpha_sparse` in the same 0.5/0.5 ratio as
+    `HARS_MEMORY_HYBRID_ALPHA`'s shipped default): recall@1 held at 0.5324
+    throughout, but EVERY other metric degraded monotonically with
+    `alpha_ripgrep` — ndcg@10 0.7075(baseline)->0.7051->0.7048->0.6877,
+    mrr 0.6948->0.692->0.692->0.6833, and most strikingly
+    supersession_error_rate DOUBLED at every tested weight (0.1667->0.3333,
+    unchanged across 0.1/0.2/0.3) — a superseded-but-textually-matching old
+    document, found only via ripgrep's id-space-mismatched "new entry"
+    path, outranked its replacement in an extra supersession query at even
+    the smallest tested weight. At alpha_ripgrep=0.3, recall@10 itself
+    drops 0.8102->0.7685 — real presence loss, not just reordering. This
+    confirms the "why additive gate, not a third convex weight" design note
+    above with real numbers, not just the id-space-mismatch argument.
+    """
+    weights = (alpha_dense, alpha_sparse, alpha_ripgrep)
+    if any(w < 0.0 for w in weights):
+        raise ValueError(f"alpha_dense/alpha_sparse/alpha_ripgrep must be >= 0.0, got {weights}")
+    if abs(sum(weights) - 1.0) > 1e-9:
+        raise ValueError(f"alpha_dense + alpha_sparse + alpha_ripgrep must sum to 1.0, got {sum(weights)}")
+
+    dense_norm = _min_max_normalize({cid: hit.score for cid, hit in dense_hits.items()})
+    sparse_norm = _min_max_normalize({cid: hit.score for cid, hit in sparse_hits.items()})
+    ripgrep_norm = _min_max_normalize({cid: hit.score for cid, hit in ripgrep_hits.items()})
+
+    all_chunk_ids = set(dense_hits) | set(sparse_hits) | set(ripgrep_hits)
+    fused: list[FusedChunk] = []
+    for chunk_id in all_chunk_ids:
+        dense_hit = dense_hits.get(chunk_id)
+        sparse_hit = sparse_hits.get(chunk_id)
+        ripgrep_hit = ripgrep_hits.get(chunk_id)
+        d_norm = dense_norm.get(chunk_id, 0.0)
+        s_norm = sparse_norm.get(chunk_id, 0.0)
+        r_norm = ripgrep_norm.get(chunk_id, 0.0)
+        source_hit = dense_hit or sparse_hit or ripgrep_hit
+        assert source_hit is not None  # chunk_id came from one of the three dicts
+        fused.append(
+            FusedChunk(
+                chunk_id=chunk_id,
+                fused_score=alpha_dense * d_norm + alpha_sparse * s_norm + alpha_ripgrep * r_norm,
+                dense_score=dense_hit.score if dense_hit else None,
+                sparse_score=sparse_hit.score if sparse_hit else None,
+                dense_norm=d_norm,
+                sparse_norm=s_norm,
+                content=source_hit.content,
+                file_path=source_hit.file_path,
+                ripgrep_score=ripgrep_hit.score if ripgrep_hit else None,
+            )
+        )
+    fused.sort(key=lambda c: c.fused_score, reverse=True)
+    return fused
+
+
 __all__ = [
     "DEFAULT_HYBRID_ALPHA",
     "HARS_MEMORY_SUPERSESSION_SCORING_ENV",
@@ -242,4 +619,11 @@ __all__ = [
     "ChannelHit",
     "FusedChunk",
     "fuse",
+    "HARS_MEMORY_RIPGREP_CHANNEL_ENV",
+    "ripgrep_channel_enabled",
+    "RIPGREP_BOOST_CAP",
+    "RIPGREP_BOOST_SCORE_SCALE",
+    "RIPGREP_MAX_INJECTED",
+    "apply_ripgrep_gate",
+    "fuse_ripgrep_as_third_weight",
 ]

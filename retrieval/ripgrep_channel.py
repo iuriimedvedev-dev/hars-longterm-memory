@@ -240,6 +240,10 @@ SUBSTRING_WEIGHT: Final[float] = 1.0
 MAX_COUNTED_MATCHES_PER_TERM: Final[int] = 5
 CO_OCCURRENCE_BONUS: Final[float] = 0.5
 _WORD_CHARS: Final[str] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+# Byte-value form of _WORD_CHARS, used by _is_whole_token_match — see that
+# function's docstring for why boundary checks must operate on UTF-8 BYTE
+# offsets, not Python string (codepoint) indices.
+_WORD_BYTE_VALUES: Final[frozenset[int]] = frozenset(_WORD_CHARS.encode("ascii"))
 
 # Path-type weighting: mild prior toward the curated narrative sections
 # (mirrors walker.py's _SECTION_BY_ROOT_NAME grouping, but as a soft score
@@ -455,12 +459,27 @@ def _build_rg_command(
 
 
 def _is_whole_token_match(line_text: str, start: int, end: int) -> bool:
-    """True if the submatch at `line_text[start:end]` is bounded by
+    """True if the submatch at byte offsets `[start:end)` is bounded by
     non-word characters on both sides (or string edges) — i.e. the term
     stands alone rather than being a substring of a longer token.
+
+    `start`/`end` are `rg --json`'s submatch offsets, which are always BYTE
+    offsets into the line's UTF-8 encoding, never Python string (codepoint)
+    indices — confirmed directly against a live `rg --json` run: a line
+    with one multi-byte UTF-8 character (e.g. an emoji) before an ASCII
+    match shifts the reported `start`/`end` past where naive `str`
+    indexing would land, which silently sliced the wrong substring for
+    lines with such a prefix and raised `IndexError` outright once real
+    corpus files (not this module's ASCII-only test fixtures) pushed an
+    offset at or past `len(line_text)`. Fixed by boundary-checking against
+    the line's UTF-8-encoded bytes, matching the offsets' actual unit.
+    `_WORD_CHARS`/`_WORD_BYTE_VALUES` are ASCII-only (identifiers are
+    ASCII-only by `tokenizer.py`'s own contract), so a single-byte
+    comparison is exact, not an approximation.
     """
-    before_ok = start == 0 or line_text[start - 1] not in _WORD_CHARS
-    after_ok = end >= len(line_text) or line_text[end] not in _WORD_CHARS
+    raw = line_text.encode("utf-8")
+    before_ok = start <= 0 or start > len(raw) or raw[start - 1] not in _WORD_BYTE_VALUES
+    after_ok = end >= len(raw) or raw[end] not in _WORD_BYTE_VALUES
     return before_ok and after_ok
 
 

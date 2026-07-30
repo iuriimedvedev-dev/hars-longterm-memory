@@ -56,10 +56,61 @@ WHY persisted (`.npy` vectors + JSON sidecar) + mtime-invalidated: mirrors
 `retrieval/bm25_index.py`'s cache exactly (see that module's docstring for
 the rationale) — the expensive part here is N CPU embedding calls, worth
 paying once per source-file version, not once per process.
+
+WHY incremental update (`update_index`), on top of the mtime-cache above: a
+plain mtime-invalidated cache only answers "is anything stale", not "what
+changed" — any source-file touch (even a single new document appended)
+forces `get_or_build_index` to re-embed all 7,184+ chunks at ~570ms/chunk
+(measured; the ~89ms/text figure in `server/embedder.py`'s docstring is for
+short query-length text, not ~2,000-byte document chunks), i.e. the full
+68-minute cost, every time. That is the wrong cost model for this channel's
+actual job: making a handful of freshly-consolidated documents (a few
+hundred chunks) searchable promptly after `memory_remember`/KB-update runs,
+without waiting for the LightRAG graph's next ~3h47m GPU cycle. Incremental
+update changes the per-update cost from O(corpus size) to O(chunks changed
+since last cache write) by reusing every unchanged row's vector as-is and
+only calling `embed_func` for chunk ids that are new or whose content
+changed. `get_or_build_index` picks incremental over full rebuild whenever
+a structurally-usable, same-embed_model cache exists; see its docstring for
+the exact fallback-to-full-rebuild conditions.
+
+WHY hash-based change detection, not id-based: chunk ids
+(`file:<hash>-chunk-NNN`) are stable across LightRAG re-ingests of the SAME
+underlying document, but the CONTENT under a given id is not — LightRAG
+re-chunks whenever a document is re-ingested (e.g. `memory_remember`
+updating an existing note), so `file:<hash>-chunk-003`'s text after a
+re-ingest can differ from what it was when this module last embedded it,
+while the id string stays identical. Detecting "already indexed" by id
+membership alone would treat that chunk as unchanged and skip re-embedding
+it — i.e. silently keep serving the OLD vector under the id that now points
+at different text, forever, since nothing would ever invalidate it again.
+That is the same failure shape as the path-based dedup bug already hit
+elsewhere in this project (matching by a supposedly-stable key while the
+content underneath it changes). `update_index` therefore hashes each
+chunk's content (sha256) at build and at every update, and re-embeds
+whenever the CURRENT content's hash disagrees with the hash recorded in the
+cache for that same id — id match is necessary but never sufficient for
+"unchanged".
+
+WHY cache_dir is NOT defaulted to `/tmp` here (unlike
+`bm25_index.py`'s caller-side `HARS_MEMORY_BM25_CACHE_DIR` default of
+`/tmp/hars_memory_bm25`): that default is fine for BM25 because losing it
+costs a few seconds. Losing this index's cache costs up to 68 minutes (a
+full rebuild) — `/tmp` can be cleared on reboot or by system tmp-cleaning
+policies with no relationship to this project's lifecycle, which would
+convert a routine reboot into an unplanned hour-plus rebuild the next time
+anything queries this channel. This module itself takes `cache_dir` as a
+plain parameter (no default, no env var) and does not prescribe a location;
+whatever wires it into the running server should point it at
+persistent storage that survives reboots (e.g. a subdirectory next to
+`/home/user/.local/share/hars-graphrag/index_gemma_v4` itself, which is
+exactly the kind of location the source `kv_store_text_chunks.json` already
+lives in) — not `/tmp`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -93,6 +144,21 @@ class FlatIndexUnavailableError(RuntimeError):
     """
 
 
+class FlatIndexDimensionMismatchError(RuntimeError):
+    """Raised mid-incremental-update when freshly embedded vectors disagree
+    in width with the cached matrix `update_index` is extending, despite an
+    `embed_model` label match (e.g. the label was left unchanged by hand
+    while the underlying model/config actually changed underneath it).
+
+    Never silently concatenate mismatched-width rows: `FlatDenseIndex.search`
+    does `self.vectors @ query_vec`, a single matmul over the whole matrix,
+    so a width mismatch is not a localized bug — it is a hard shape error
+    (or worse, a shape that happens to still multiply but scores garbage)
+    for every future query, not just the newly-updated rows. Callers
+    (`get_or_build_index`) catch this and fall back to a full rebuild.
+    """
+
+
 @dataclass(frozen=True)
 class FlatSearchHit:
     chunk_id: str
@@ -109,6 +175,16 @@ class FlatBuildStats:
     cache_hit: bool
     cache_dir: str
     embed_model: str
+    # Populated for both the incremental and full-rebuild paths (zero/"" on
+    # a pure cache hit, where nothing was compared or embedded); see
+    # `get_or_build_index` — kept as trailing defaulted fields so existing
+    # positional/keyword call sites that predate incremental update keep
+    # working unchanged.
+    update_path: str = "cache_hit"  # "cache_hit" | "incremental" | "full_rebuild"
+    new_count: int = 0
+    modified_count: int = 0
+    deleted_count: int = 0
+    reused_count: int = 0
 
 
 @dataclass
@@ -120,6 +196,11 @@ class FlatDenseIndex:
     chunk_ids: list[str]
     vectors: np.ndarray  # (chunk_count, dim), float32, L2-normalized rows
     chunk_meta: dict[str, dict[str, str]]
+    # sha256 hex digest of each chunk's content, keyed by chunk_id — the
+    # change-detection signal `update_index` compares against on every
+    # incremental update. See module docstring ("WHY hash-based change
+    # detection, not id-based") for why id membership alone is not enough.
+    chunk_hashes: dict[str, str]
     source_mtime: float
     embed_model: str
 
@@ -186,10 +267,21 @@ def _vectors_path(cache_dir: Path) -> Path:
     return cache_dir / _CACHE_VECTORS_FILENAME
 
 
+def _content_hash(content: str) -> str:
+    """sha256 hex digest of a chunk's content — the change-detection unit
+    for `update_index`. See module docstring ("WHY hash-based change
+    detection, not id-based"): chunk ids are stable across re-ingests, chunk
+    CONTENT under a given id is not, so id equality alone is never
+    sufficient to call a chunk "unchanged".
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 async def build_index(
     working_dir: str, embed_func: EmbedFunc, *, embed_model: str = ""
 ) -> tuple[FlatDenseIndex, float]:
-    """Build a fresh `FlatDenseIndex` from `working_dir/kv_store_text_chunks.json`.
+    """Build a fresh `FlatDenseIndex` from `working_dir/kv_store_text_chunks.json`,
+    embedding every chunk unconditionally.
 
     Returns `(index, build_seconds)`. Raises `FlatIndexUnavailableError` if
     the source file does not exist. `embed_model` is stored alongside the
@@ -199,6 +291,12 @@ async def build_index(
     label; that is the caller's responsibility (same division of
     responsibility as `server/embedder.py::validate_embedder_against_index`
     uses for the production LightRAG index).
+
+    This is the expensive, O(corpus size) path (measured: ~570ms/chunk,
+    4,094s / 68.2min for 7,184 chunks) — `get_or_build_index` prefers
+    `update_index` (O(chunks changed)) whenever a usable cache exists; this
+    function is the fallback for "no cache", "cache unusable", and
+    "different embed_model" (see `get_or_build_index`).
     """
     chunks_file = _chunks_file_path(working_dir)
     if not chunks_file.is_file():
@@ -214,6 +312,7 @@ async def build_index(
     chunk_ids = sorted(raw_chunks.keys())  # deterministic positional order, matches bm25_index.py
     contents: list[str] = []
     chunk_meta: dict[str, dict[str, str]] = {}
+    chunk_hashes: dict[str, str] = {}
     for chunk_id in chunk_ids:
         entry = raw_chunks[chunk_id]
         content = str(entry.get("content", ""))
@@ -222,6 +321,7 @@ async def build_index(
             "content": content,
             "file_path": str(entry.get("file_path", "")),
         }
+        chunk_hashes[chunk_id] = _content_hash(content)
 
     if contents:
         raw_vectors = await embed_func(contents, context="document")
@@ -247,21 +347,195 @@ async def build_index(
         chunk_ids=chunk_ids,
         vectors=vectors,
         chunk_meta=chunk_meta,
+        chunk_hashes=chunk_hashes,
         source_mtime=source_mtime,
         embed_model=embed_model,
     )
     logger.info(
-        "Built flat dense index: %d chunks in %.3fs (source=%s, embed_model=%s)",
+        "Built flat dense index (full rebuild): %d chunks in %.3fs (source=%s, embed_model=%s)",
         len(chunk_ids), build_seconds, chunks_file, embed_model or "<unspecified>",
     )
     return index, build_seconds
 
 
+@dataclass(frozen=True)
+class FlatUpdateStats:
+    """Stats for one `update_index` call — the observability this module's
+    incremental path is built for: which chunks actually needed the
+    ~570ms/chunk embedding cost, versus which rows were reused untouched.
+    """
+
+    chunk_count: int
+    new_count: int
+    modified_count: int
+    deleted_count: int
+    reused_count: int
+    update_seconds: float
+    source_mtime: float
+    embed_model: str
+
+    @property
+    def embedded_count(self) -> int:
+        return self.new_count + self.modified_count
+
+
+async def update_index(
+    working_dir: str,
+    embed_func: EmbedFunc,
+    cached: FlatDenseIndex,
+    *,
+    embed_model: str = "",
+) -> tuple[FlatDenseIndex, FlatUpdateStats]:
+    """Bring `cached` up to date with the current
+    `working_dir/kv_store_text_chunks.json`, embedding only chunks that are
+    new or whose content changed, reusing every unchanged row's vector
+    as-is, and dropping rows for chunks no longer present in the source.
+
+    Change detection, precisely (see module docstring for the "why"):
+    for each chunk id currently in the source, compare `_content_hash` of
+    its CURRENT content against `cached.chunk_hashes.get(chunk_id)`:
+      - id absent from `cached.chunk_ids`            -> NEW,  must embed.
+      - id present, hash differs                     -> MODIFIED, must embed.
+      - id present, hash matches                     -> UNCHANGED, reuse row.
+    Any id in `cached.chunk_ids` no longer present in the current source
+    (removed by `memory_forget` / `cleanup_kb.py`, or a re-chunk that
+    dropped it) is a DELETION: its row is simply not carried into the
+    output matrix — an index with orphan rows would let deleted content
+    keep being returned by `search()`, which is exactly the case this
+    function exists to prevent.
+
+    Output row order is `sorted(current_chunk_ids)` — identical to what
+    `build_index` would produce for the same source file — so an
+    incrementally-updated index and a freshly full-rebuilt one are
+    order-for-order identical, not just set-equal.
+
+    Raises `FlatIndexUnavailableError` if the source chunk store does not
+    exist. Raises `FlatIndexDimensionMismatchError` if newly embedded
+    vectors disagree in width with `cached.vectors` (see that error's
+    docstring) — callers should treat this as "cache unusable, fall back to
+    `build_index`", not retry.
+    """
+    chunks_file = _chunks_file_path(working_dir)
+    if not chunks_file.is_file():
+        raise FlatIndexUnavailableError(
+            f"No text-chunk store at {chunks_file} — build the LightRAG index first "
+            "(python tools/memory/server/index.py)."
+        )
+
+    start = time.monotonic()
+    with chunks_file.open("r", encoding="utf-8") as fh:
+        raw_chunks: dict[str, dict[str, Any]] = json.load(fh)
+
+    current_ids = sorted(raw_chunks.keys())
+    current_id_set = set(current_ids)
+    cached_id_set = set(cached.chunk_ids)
+    cached_row_by_id = {chunk_id: i for i, chunk_id in enumerate(cached.chunk_ids)}
+
+    new_ids: list[str] = []
+    modified_ids: list[str] = []
+    reused_ids: list[str] = []
+    current_hashes: dict[str, str] = {}
+    current_meta: dict[str, dict[str, str]] = {}
+
+    for chunk_id in current_ids:
+        entry = raw_chunks[chunk_id]
+        content = str(entry.get("content", ""))
+        content_hash = _content_hash(content)
+        current_hashes[chunk_id] = content_hash
+        current_meta[chunk_id] = {
+            "content": content,
+            "file_path": str(entry.get("file_path", "")),
+        }
+        if chunk_id not in cached_id_set:
+            new_ids.append(chunk_id)
+        elif cached.chunk_hashes.get(chunk_id) != content_hash:
+            # Stable id, changed content — e.g. LightRAG re-chunked this
+            # document on re-ingest. Comparing by id alone here would treat
+            # this chunk as already-indexed and skip it, silently keeping
+            # the OLD vector under an id that now points at different text
+            # forever (nothing else would ever re-trigger embedding for it).
+            # The hash comparison above is the only thing standing between
+            # this and that stale-vector-under-stable-id trap.
+            modified_ids.append(chunk_id)
+        else:
+            reused_ids.append(chunk_id)
+
+    deleted_ids = cached_id_set - current_id_set
+    to_embed_ids = new_ids + modified_ids
+
+    embedded_by_id: dict[str, np.ndarray] = {}
+    embedded_dim: int | None = None
+    if to_embed_ids:
+        contents_to_embed = [current_meta[cid]["content"] for cid in to_embed_ids]
+        raw_vectors = await embed_func(contents_to_embed, context="document")
+        new_vectors = np.asarray(raw_vectors, dtype=np.float32)
+        if new_vectors.ndim != 2 or new_vectors.shape[0] != len(to_embed_ids):
+            raise RuntimeError(
+                f"embed_func returned shape {new_vectors.shape}, "
+                f"expected ({len(to_embed_ids)}, dim)"
+            )
+        # Same defensive re-normalization as build_index — cosine similarity
+        # via plain dot product is only correct on unit-norm rows.
+        norms = np.linalg.norm(new_vectors, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        new_vectors = (new_vectors / norms).astype(np.float32)
+        embedded_dim = new_vectors.shape[1]
+        if cached.vectors.ndim == 2 and cached.vectors.shape[0] > 0 and cached.vectors.shape[1] != embedded_dim:
+            raise FlatIndexDimensionMismatchError(
+                f"Freshly embedded vectors are {embedded_dim}-dim but the cached "
+                f"matrix being updated is {cached.vectors.shape[1]}-dim "
+                f"(embed_model label={cached.embed_model!r}). Cache is unusable "
+                "for incremental update; caller should fall back to build_index."
+            )
+        embedded_by_id = {cid: new_vectors[i] for i, cid in enumerate(to_embed_ids)}
+
+    dim = embedded_dim
+    if dim is None:
+        dim = cached.vectors.shape[1] if cached.vectors.ndim == 2 else 0
+    out_vectors = np.zeros((len(current_ids), dim), dtype=np.float32)
+    for row, chunk_id in enumerate(current_ids):
+        if chunk_id in embedded_by_id:
+            out_vectors[row] = embedded_by_id[chunk_id]
+        else:
+            out_vectors[row] = cached.vectors[cached_row_by_id[chunk_id]]
+
+    update_seconds = time.monotonic() - start
+    source_mtime = chunks_file.stat().st_mtime
+    resolved_embed_model = embed_model or cached.embed_model
+
+    index = FlatDenseIndex(
+        chunk_ids=current_ids,
+        vectors=out_vectors,
+        chunk_meta=current_meta,
+        chunk_hashes=current_hashes,
+        source_mtime=source_mtime,
+        embed_model=resolved_embed_model,
+    )
+    stats = FlatUpdateStats(
+        chunk_count=len(current_ids),
+        new_count=len(new_ids),
+        modified_count=len(modified_ids),
+        deleted_count=len(deleted_ids),
+        reused_count=len(reused_ids),
+        update_seconds=update_seconds,
+        source_mtime=source_mtime,
+        embed_model=resolved_embed_model,
+    )
+    logger.info(
+        "Incrementally updated flat dense index: %d chunks total "
+        "(%d new, %d modified, %d deleted, %d reused, %.3fs, source=%s, embed_model=%s)",
+        stats.chunk_count, stats.new_count, stats.modified_count,
+        stats.deleted_count, stats.reused_count, update_seconds, chunks_file,
+        resolved_embed_model or "<unspecified>",
+    )
+    return index, stats
+
+
 def save_index(index: FlatDenseIndex, cache_dir: str) -> None:
     """Persist `index` to `cache_dir`: vectors as `.npy`, everything else
-    (chunk_ids/chunk_meta/source_mtime/embed_model) as a JSON sidecar —
-    mirrors `retrieval/bm25_index.py::save_index`'s split between a
-    library-native binary format and a hand-written metadata file.
+    (chunk_ids/chunk_meta/chunk_hashes/source_mtime/embed_model) as a JSON
+    sidecar — mirrors `retrieval/bm25_index.py::save_index`'s split between
+    a library-native binary format and a hand-written metadata file.
     """
     out_dir = Path(cache_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -269,6 +543,7 @@ def save_index(index: FlatDenseIndex, cache_dir: str) -> None:
     meta = {
         "chunk_ids": index.chunk_ids,
         "chunk_meta": index.chunk_meta,
+        "chunk_hashes": index.chunk_hashes,
         "source_mtime": index.source_mtime,
         "embed_model": index.embed_model,
     }
@@ -276,31 +551,90 @@ def save_index(index: FlatDenseIndex, cache_dir: str) -> None:
 
 
 def load_index(cache_dir: str) -> FlatDenseIndex | None:
-    """Load a previously persisted index from `cache_dir`, or `None` if absent.
+    """Load a previously persisted index from `cache_dir`, or `None` if
+    absent OR unreadable.
 
     `None` (not an exception) on a missing cache mirrors
     `retrieval/bm25_index.py::load_index` — "no cache yet" is expected
     first-run state, not an error; `get_or_build_index` decides what to do.
 
+    A cache that exists but fails to parse (truncated write, disk
+    corruption, a JSON sidecar that isn't valid JSON, an `.npy` file that
+    isn't a valid numpy array) is treated the same way — logged and
+    returned as `None` — rather than propagating the raw parse exception:
+    per this module's contract, a broken on-disk cache must fall back to a
+    full rebuild (via `get_or_build_index`), never crash the caller or get
+    silently trusted. Structural-but-parseable inconsistency (e.g. row
+    counts that don't line up) is a separate, stricter check —
+    `get_or_build_index` runs it on the returned index before deciding
+    whether to trust this cache for an *incremental* update; a load that
+    succeeds here can still be judged "too inconsistent to increment,
+    rebuild instead" there.
+
+    `chunk_hashes` defaults to `{}` for a sidecar written before this field
+    existed (pre-incremental-update cache format) — deliberately, not
+    treated as corruption: `get_or_build_index`'s usability check then finds
+    every current chunk id missing from an empty `chunk_hashes`, so the
+    first read of such a legacy cache is naturally treated as "not usable
+    for incremental update" (one full rebuild to adopt the new format), not
+    as license to silently skip hashing chunks it has no hash for.
+
     Vectors are loaded with `mmap_mode="r"` — cheap process startup (mirrors
     bm25s' own `mmap=True` used by `retrieval/bm25_index.py::load_index`);
     the returned array is read-only, which is correct here since nothing
-    mutates `FlatDenseIndex.vectors` after a build.
+    mutates `FlatDenseIndex.vectors` in place after a build/update (both
+    always produce a fresh array).
     """
     out_dir = Path(cache_dir)
     meta_file = _meta_path(out_dir)
     vectors_file = _vectors_path(out_dir)
     if not meta_file.is_file() or not vectors_file.is_file():
         return None
-    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    vectors = np.load(vectors_file, mmap_mode="r")
-    return FlatDenseIndex(
-        chunk_ids=list(meta["chunk_ids"]),
-        vectors=vectors,
-        chunk_meta=dict(meta["chunk_meta"]),
-        source_mtime=float(meta["source_mtime"]),
-        embed_model=str(meta.get("embed_model", "")),
-    )
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        vectors = np.load(vectors_file, mmap_mode="r")
+        return FlatDenseIndex(
+            chunk_ids=list(meta["chunk_ids"]),
+            vectors=vectors,
+            chunk_meta=dict(meta["chunk_meta"]),
+            chunk_hashes=dict(meta.get("chunk_hashes", {})),
+            source_mtime=float(meta["source_mtime"]),
+            embed_model=str(meta.get("embed_model", "")),
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Flat dense cache at %s is unreadable/corrupt (%s: %s) — treating as absent; "
+            "get_or_build_index will fall back to a full rebuild.",
+            cache_dir, type(exc).__name__, exc,
+        )
+        return None
+
+
+def _cache_is_usable_for_update(cached: FlatDenseIndex) -> bool:
+    """Structural sanity check run on a *successfully loaded* cache before
+    `get_or_build_index` trusts it as the base for an incremental
+    `update_index` call.
+
+    `load_index` already turns unparseable files into `None`; this catches
+    the narrower case of a cache that parses fine but is internally
+    inconsistent — row count / id list / metadata / hash dict out of
+    lockstep (e.g. a partial write that landed a stale `.npy` next to a
+    fresher sidecar, or a hand-edited/legacy file). Incrementing such a
+    cache would silently propagate the inconsistency (an off-by-one here is
+    exactly the "wrong document's content for a correct-looking id" bug
+    this module's tests are required to guard against) — so any failure
+    here routes to a full rebuild instead of an increment.
+    """
+    n = len(cached.chunk_ids)
+    if len(set(cached.chunk_ids)) != n:
+        return False  # duplicate ids — position-based lookups below would be ambiguous
+    if cached.vectors.ndim != 2 or cached.vectors.shape[0] != n:
+        return False
+    if set(cached.chunk_meta.keys()) != set(cached.chunk_ids):
+        return False
+    if set(cached.chunk_hashes.keys()) != set(cached.chunk_ids):
+        return False
+    return True
 
 
 async def get_or_build_index(
@@ -310,15 +644,30 @@ async def get_or_build_index(
     *,
     embed_model: str = "",
 ) -> tuple[FlatDenseIndex, FlatBuildStats]:
-    """Return a ready-to-query `FlatDenseIndex`, rebuilding only when the
-    source `kv_store_text_chunks.json` mtime has changed since the on-disk
-    cache was written, no cache exists yet, or the cached `embed_model`
-    label disagrees with the one requested now (guards against silently
-    querying stale vectors from a different embedding space after an
-    embedder swap — same failure class
-    `server/embedder.py::EmbeddingDimensionMismatchError` exists to catch
-    for the production LightRAG index, applied here as a cache-miss instead
-    of a hard error since rebuilding is cheap and always safe).
+    """Return a ready-to-query `FlatDenseIndex`, choosing between three paths
+    — cheapest safe option first:
+
+    1. **Cache hit** (`update_path="cache_hit"`, cost O(1)): a usable cache
+       exists, its `source_mtime` matches the current source file exactly,
+       and its `embed_model` label matches. Nothing changed; return as-is.
+    2. **Incremental update** (`update_path="incremental"`, cost O(chunks
+       changed) — see `update_index`): a cache exists, passes
+       `_cache_is_usable_for_update`, and its `embed_model` label matches
+       (or none was requested). Only new/modified chunks (by content hash,
+       not id — see `update_index`) are embedded; unchanged rows are reused
+       and deleted chunks are dropped.
+    3. **Full rebuild** (`update_path="full_rebuild"`, cost O(corpus size)
+       — see `build_index`): no cache, a corrupt/structurally-inconsistent
+       cache, a cache built under a different `embed_model` label (its
+       vectors live in a different embedding space entirely — none of them
+       are reusable, so there is nothing to increment), or an incremental
+       update that hit `FlatIndexDimensionMismatchError` mid-way.
+
+    Every path is logged (see `build_index` / `update_index` / this
+    function) with which one ran and how many chunks were
+    embedded/reused/dropped — this choice, and its cost, is the entire
+    reason this module supports two update strategies instead of one; see
+    the module docstring.
 
     Raises `FlatIndexUnavailableError` if the source chunk store itself does
     not exist (LightRAG index not built yet).
@@ -331,9 +680,15 @@ async def get_or_build_index(
         )
     current_mtime = chunks_file.stat().st_mtime
 
-    cached = load_index(cache_dir)
-    embed_model_matches = not embed_model or not cached or cached.embed_model in ("", embed_model)
+    cached = load_index(cache_dir)  # None on missing OR corrupt (see load_index)
+
+    embed_model_matches = not embed_model or cached is None or cached.embed_model in ("", embed_model)
+
     if cached is not None and cached.source_mtime == current_mtime and embed_model_matches:
+        logger.info(
+            "Flat dense index cache hit: %d chunks, source unchanged (cache=%s).",
+            cached.chunk_count, cache_dir,
+        )
         return cached, FlatBuildStats(
             chunk_count=cached.chunk_count,
             build_seconds=0.0,
@@ -341,7 +696,50 @@ async def get_or_build_index(
             cache_hit=True,
             cache_dir=cache_dir,
             embed_model=cached.embed_model,
+            update_path="cache_hit",
+            reused_count=cached.chunk_count,
         )
+
+    if cached is not None and not embed_model_matches:
+        logger.info(
+            "Flat dense cache embed_model mismatch (cached=%r, requested=%r) — vectors are "
+            "in a different embedding space, nothing to reuse; full rebuild (cache=%s).",
+            cached.embed_model, embed_model, cache_dir,
+        )
+        cached = None
+    elif cached is not None and not _cache_is_usable_for_update(cached):
+        logger.warning(
+            "Flat dense cache at %s failed structural consistency checks — "
+            "full rebuild rather than trusting it for an incremental update.",
+            cache_dir,
+        )
+        cached = None
+
+    if cached is not None:
+        try:
+            index, update_stats = await update_index(
+                working_dir, embed_func, cached, embed_model=embed_model or cached.embed_model
+            )
+        except FlatIndexDimensionMismatchError as exc:
+            logger.warning(
+                "Flat dense cache at %s unusable for incremental update (%s) — full rebuild.",
+                cache_dir, exc,
+            )
+        else:
+            save_index(index, cache_dir)
+            return index, FlatBuildStats(
+                chunk_count=index.chunk_count,
+                build_seconds=update_stats.update_seconds,
+                source_mtime=current_mtime,
+                cache_hit=False,
+                cache_dir=cache_dir,
+                embed_model=index.embed_model,
+                update_path="incremental",
+                new_count=update_stats.new_count,
+                modified_count=update_stats.modified_count,
+                deleted_count=update_stats.deleted_count,
+                reused_count=update_stats.reused_count,
+            )
 
     index, build_seconds = await build_index(working_dir, embed_func, embed_model=embed_model)
     save_index(index, cache_dir)
@@ -352,6 +750,8 @@ async def get_or_build_index(
         cache_hit=False,
         cache_dir=cache_dir,
         embed_model=embed_model,
+        update_path="full_rebuild",
+        new_count=index.chunk_count,
     )
 
 
@@ -359,10 +759,13 @@ __all__ = [
     "CHUNKS_FILENAME",
     "EmbedFunc",
     "FlatIndexUnavailableError",
+    "FlatIndexDimensionMismatchError",
     "FlatSearchHit",
     "FlatBuildStats",
+    "FlatUpdateStats",
     "FlatDenseIndex",
     "build_index",
+    "update_index",
     "save_index",
     "load_index",
     "get_or_build_index",
