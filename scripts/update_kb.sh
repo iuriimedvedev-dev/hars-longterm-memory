@@ -26,6 +26,28 @@ if [[ $note_count -eq 0 && $# -eq 0 ]]; then
 fi
 echo "staged notes: $note_count | extra paths: $*"
 
+# --- exclude the archive directory from the walk (defense-in-depth) -------
+# The archival step below (see "archiving ingested notes...") moves every
+# successfully-indexed note into "$STAGING/ingested/" after each run.
+# ingest/document.py's file_stable_id() now normalises the "ingested" path
+# segment out before hashing, so an archived file's doc_id is unaffected by
+# the move either way — but walking into a directory that only ever grows
+# (every note ever indexed, forever) is still pure waste: per-file git-log
+# subprocess calls, binary/size checks, content reads, none of which can
+# ever produce anything but an already-known id. ingest/walker.py's
+# .memoryignore convention (root-level, gitignore-style patterns) is the
+# existing, tested mechanism for exactly this per-root exclusion — added
+# here (generated, not hand-maintained) rather than in walker.py's shared
+# _DEFAULT_EXCLUDE_GLOBS, which is mirrored 1:1 by
+# retrieval/ripgrep_channel.py's _EXCLUDE_GLOBS_RG under a drift-guard test;
+# "ingested/" is a staging-pipeline-specific archive convention, not a
+# repo-wide junk pattern, so it does not belong in that shared contract.
+mkdir -p "$STAGING"
+if [[ ! -f "$STAGING/.memoryignore" ]] || ! grep -qxF 'ingested/' "$STAGING/.memoryignore"; then
+    echo 'ingested/' >> "$STAGING/.memoryignore"
+    echo "ensured $STAGING/.memoryignore excludes ingested/"
+fi
+
 cleanup() { pkill -9 -f "llama-server.*$PORT" 2>/dev/null || true; }
 trap cleanup EXIT
 

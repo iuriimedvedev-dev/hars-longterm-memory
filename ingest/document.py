@@ -54,18 +54,63 @@ class Document:
     metadata: dict[str, object] = field(default_factory=dict)
 
 
+_INGEST_ARCHIVE_DIR_NAME: Final[str] = "ingested"
+
+
+def _strip_archive_dir(resolved: Path) -> Path:
+    """Drop any path component literally named ``ingested`` before hashing.
+
+    ``scripts/update_kb.sh`` archives every successfully-indexed staging note
+    by moving it from ``staging/<name>.md`` to ``staging/ingested/<name>.md``
+    after a run (see that script's ``mkdir -p "$STAGING/ingested"`` /
+    ``mv ... "$STAGING/ingested/"`` step). That move inserts exactly one path
+    segment named ``ingested`` directly ahead of the filename, and nothing
+    else about the path changes.
+
+    Without this normalisation, ``file_stable_id`` (hashing the absolute
+    path) would mint a brand-new ID for the identical file the moment it is
+    archived, so the walker recursing into ``staging/ingested/`` on the next
+    run (nothing currently excludes it — see ``scripts/update_kb.sh``'s
+    generated ``.memoryignore``, which is the belt to this braces) would
+    look like ~all-new documents to LightRAG and trigger a full re-extraction
+    of content already in the index. See
+    ``.session/2026-07-30_longterm-memory-overhaul.md`` for the incident this
+    fixes: 248 of 249 staged files were about to be re-extracted after a
+    single archival round-trip.
+
+    Stripping the segment makes ``staging/x.md`` and ``staging/ingested/x.md``
+    hash identically — which is correct, since the archived file IS the
+    document that was ingested from the staging path — and reproduces every
+    ID already recorded in the live ``kv_store_doc_status.json`` for files
+    that predate this fix. Only an exact ``ingested`` component is dropped
+    (case-sensitive, no prefix/suffix match), keeping collision risk with an
+    unrelated directory that happens to be named ``ingested`` elsewhere in a
+    walked root minimal and easy to reason about.
+    """
+    parts = tuple(part for part in resolved.parts if part != _INGEST_ARCHIVE_DIR_NAME)
+    return Path(*parts) if parts else resolved
+
+
 def file_stable_id(path: Path) -> str:
     """Derive a stable document ID from a file path.
 
     Uses a short SHA-256 prefix of the absolute path string so the ID
     survives directory renames while staying reproducible for the same file.
+    A path component literally named ``ingested`` (the staging-archive
+    directory created by ``scripts/update_kb.sh``) is normalised out first —
+    see ``_strip_archive_dir`` — so archiving a file never changes its ID.
 
     >>> import re
     >>> doc_id = file_stable_id(Path("/some/path/report.md"))
     >>> bool(re.match(r"^file:[0-9a-f]{12}$", doc_id))
     True
+    >>> staged = file_stable_id(Path("/staging/report.md"))
+    >>> archived = file_stable_id(Path("/staging/ingested/report.md"))
+    >>> staged == archived
+    True
     """
-    digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:12]
+    normalized = _strip_archive_dir(path.resolve())
+    digest = hashlib.sha256(str(normalized).encode()).hexdigest()[:12]
     return f"file:{digest}"
 
 
