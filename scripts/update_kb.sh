@@ -121,7 +121,17 @@ PATHS=("$STAGING")
 
 echo "indexing into $INDEX ..."
 cd "$ROOT"
-HARS_MEMORY_VECTOR_STORAGE=NanoVectorDBStorage \
+# Config-driven, not hardcoded: default matches the deployed backend
+# (QdrantVectorDBStorage since the 2026-07-30 migration) but MUST always
+# match whatever backend the deployed index actually uses (see
+# tools/memory/config/.env.example) — export HARS_MEMORY_VECTOR_STORAGE
+# (and, for Qdrant, HARS_MEMORY_QDRANT_URL/HARS_MEMORY_QDRANT_COLLECTION) in the
+# calling shell before running this script to override. A mismatch here
+# writes vectors to the wrong backend while graph/KV updates land correctly,
+# silently diverging the two.
+HARS_MEMORY_VECTOR_STORAGE="${HARS_MEMORY_VECTOR_STORAGE:-QdrantVectorDBStorage}" \
+HARS_MEMORY_QDRANT_URL="${HARS_MEMORY_QDRANT_URL:-http://localhost:6335}" \
+HARS_MEMORY_QDRANT_COLLECTION="${HARS_MEMORY_QDRANT_COLLECTION:-hars_longterm_memory}" \
 HARS_MEMORY_INDEX_DIR="$INDEX" \
 HARS_MEMORY_EXTRACTOR_BASE_URL="http://localhost:$PORT/v1" \
 HARS_MEMORY_EXTRACTOR_MODEL=gemma-4-12b \

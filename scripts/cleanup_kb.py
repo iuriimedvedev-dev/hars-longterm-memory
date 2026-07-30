@@ -132,7 +132,28 @@ async def purge_documents(
     guardrail decisions (apply gate, protect-pattern requirement) — this
     function performs the delete unconditionally once called.
     """
-    os.environ.setdefault("HARS_MEMORY_VECTOR_STORAGE", "NanoVectorDBStorage")
+    # Deliberately NOT a setdefault("HARS_MEMORY_VECTOR_STORAGE", "NanoVectorDBStorage")
+    # here: this function mutates the live graph/KV stores via
+    # rag.adelete_by_doc_id(), which MUST run against the SAME vector backend
+    # as the deployed index or vector/graph state silently diverges (e.g.
+    # after a Qdrant cutover, a hardcoded Nano default would attach to a
+    # fresh, empty vdb_*.json, prune entities/relations out of the graph, and
+    # leave the real Qdrant vectors untouched — a permanent, silent split).
+    # Fail loudly instead: the caller (this CLI, or update_kb.sh which sources
+    # the same .env) must set it explicitly to match the deployed config (see
+    # tools/memory/config/.env.example). The memory_forget MCP tool is
+    # unaffected: it runs in-process inside the MCP server, which always has
+    # this var set from .mcp.json/.codex/config.toml.
+    if "HARS_MEMORY_VECTOR_STORAGE" not in os.environ:
+        raise RuntimeError(
+            "HARS_MEMORY_VECTOR_STORAGE is not set. cleanup_kb.py mutates the live "
+            "graph/KV stores via adelete_by_doc_id() and must run against the exact "
+            "vector backend the deployed index uses (NanoVectorDBStorage, or a Qdrant "
+            "backend with matching HARS_MEMORY_QDRANT_URL/HARS_MEMORY_QDRANT_COLLECTION), "
+            "or vector and graph state will silently diverge. Export it to match the "
+            "deployed config (see tools/memory/config/.env.example) before running this "
+            "script."
+        )
     os.environ.setdefault("HARS_MEMORY_EMBED_MODEL", "unsloth/embeddinggemma-300m")
     os.environ.setdefault("HARS_MEMORY_EMBED_LOCAL_FILES_ONLY", "1")
     os.environ.setdefault("HARS_MEMORY_EMBED_DEVICE", "cpu")

@@ -7,7 +7,7 @@ Serves the `hars-longterm-memory` MCP server (`memory_recall`, `memory_remember`
 retrieval channel among several (see `retrieval/` for BM25 fusion) — the public
 tool surface never names the underlying mechanism.
 
-**Stack**: LightRAG (lightrag-hku 1.4.16) · e5-large-v2 on CPU · NanoVectorDB (file-backed PoC) · NetworkX · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
+**Stack**: LightRAG (lightrag-hku 1.4.16) · unsloth/embeddinggemma-300m (768-dim) on CPU · NanoVectorDB (file-backed, migrating to Qdrant — see `.plans/2026-07-29_graphrag-qdrant-migration.md`) · NetworkX · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
 
 **Package manager**: [UV](https://docs.astral.sh/uv/) — standalone project at `tools/memory/` with its own `pyproject.toml` + `uv.lock`. Fully isolated from the main workspace and the ROCm training venv.
 
@@ -30,9 +30,13 @@ docker compose -f docker-compose.dev.yml up hars-memory-qdrant -d
 curl http://localhost:6335/readyz
 ```
 
-The current pinned LightRAG package uses `NanoVectorDBStorage` by default because
-this installed build does not include a Qdrant storage implementation. The
-dedicated Qdrant service is kept ready for the next backend swap.
+The installed LightRAG build (lightrag-hku 1.4.16) provides
+`QdrantVectorDBStorage`, the default backend since the 2026-07-30 vector
+transplant migration (zero re-embedding; see
+`.plans/2026-07-29_graphrag-qdrant-migration.md`). Gotcha:
+`HARS_MEMORY_QDRANT_COLLECTION` is not a Qdrant collection name — LightRAG uses
+it as the tenant id (`workspace_id`) written into every payload; the actual
+collections are always `lightrag_vdb_{chunks,entities,relationships}`.
 
 ### 3. Configure
 
@@ -88,8 +92,9 @@ All model bindings are in `config/.env` (or environment variables). No code chan
 | Extraction LLM | `HARS_MEMORY_EXTRACTOR_BASE_URL` + `HARS_MEMORY_EXTRACTOR_MODEL` | GPU-exclusive; update llama-server launch cmd |
 | Query LLM | `HARS_MEMORY_QUERY_BASE_URL` + `HARS_MEMORY_QUERY_MODEL` | Can be CPU if small |
 | Embedder | `HARS_MEMORY_EMBED_MODEL` | Changing the model changes the vector dimension — rebuild the index with `index.py --full` |
-| Vector backend | `HARS_MEMORY_VECTOR_STORAGE` | Current default: `NanoVectorDBStorage`; switch only to an installed LightRAG backend |
-| Qdrant URL | `HARS_MEMORY_QDRANT_URL` | Dedicated compose service is `http://localhost:6335` |
+| Vector backend | `HARS_MEMORY_VECTOR_STORAGE` | Current default: `QdrantVectorDBStorage` (since 2026-07-30); `NanoVectorDBStorage` for rollback |
+| Qdrant URL | `HARS_MEMORY_QDRANT_URL` | Dedicated `hars-memory-qdrant` compose service is `http://localhost:6335` |
+| Qdrant tenant | `HARS_MEMORY_QDRANT_COLLECTION` | NOT a collection name — the `workspace_id` tenant id in every payload/query filter |
 | Postgres DSN | `HARS_MEMORY_POSTGRES_DSN` | hars-postgres; read-only |
 
 After swapping embedder: run `index.py --full` to rebuild all vectors.
@@ -137,12 +142,13 @@ ingest/postgres_export.py — stable-ID docs from hars-postgres
     │
     ▼
 server/gpu_guard.py       — refuses indexing while training runs
-server/lightrag_init.py   — LightRAG wired to e5-large (CPU) + NanoVectorDB/NetworkX + llama.cpp
+server/lightrag_init.py   — LightRAG wired to embeddinggemma-300m (CPU) + vector/NetworkX + llama.cpp
 server/index.py           — CLI entrypoint (GPU-guarded)
     │
     ▼
-LightRAG working dir      — /tmp/hars_memory_lightrag/ (NetworkX .graphml + NanoVectorDB JSON)
-Qdrant                    — http://localhost:6335 (prepared optional backend)
+LightRAG working dir      — HARS_MEMORY_INDEX_DIR (NetworkX .graphml + KV JSON; vectors here only
+                              while HARS_MEMORY_VECTOR_STORAGE=NanoVectorDBStorage)
+Qdrant                    — http://localhost:6335 (hars-memory-qdrant; vector backend once migrated)
     │
     ▼
 plugins/hars-longterm-memory/scripts/hars_longterm_memory_mcp.py

@@ -337,7 +337,9 @@ def create_lightrag(
     # dimension baked into vdb_*.json. If HARS_MEMORY_EMBED_MODEL now disagrees,
     # queries would silently embed into the wrong vector space and retrieval
     # would return garbage with no error. No-ops for a brand-new working dir.
-    validate_embedder_against_index(_wdir, _emb_model, emb_dim)
+    validate_embedder_against_index(
+        _wdir, _emb_model, emb_dim, vector_storage=_vector_storage, qdrant_url=_qdrant_url
+    )
 
     embed_func = make_embedding_func(
         model_name=_emb_model,
