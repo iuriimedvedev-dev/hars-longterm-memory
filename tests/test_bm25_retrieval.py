@@ -202,6 +202,193 @@ class TestFusionMath:
         assert fuse({}, {}, alpha=0.5) == []
 
 
+class TestFusionDeterministicTieBreak:
+    """Item: `fuse()`'s ranking must be reproducible run-to-run.
+
+    Regression coverage for the bug fixed 2026-07-30 — see the design note
+    above `HARS_MEMORY_FUSION_TIE_EPSILON_ENV` in retrieval/fusion.py for the
+    full root-cause writeup (`set(dense_hits) | set(sparse_hits)` iteration
+    order + Python's per-process `str` hash randomization + a stable sort on
+    `fused_score` alone -> exact ties broke differently across process runs,
+    even against byte-identical upstream scores). Measured on the live
+    46-query labeled set: recall@1 flip-flopped 0.5602<->0.5324 depending
+    purely on `PYTHONHASHSEED`, with `recall@10`/`supersession_error_rate`
+    unaffected.
+    """
+
+    def test_exact_tie_breaks_by_descending_chunk_id(self) -> None:
+        """The structural tie this bug was found via: a chunk that tops ONE
+        channel and is entirely absent from the other gets `fused_score ==
+        alpha` from BOTH such chunks (0.5 == 0.5 exactly at alpha=0.5) — see
+        id04 in the labeled set. Must resolve to the SAME winner every call,
+        by descending chunk_id (matching ir_measures' own docstring-cited
+        tie-break convention, tools/memory/eval/metrics.py).
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        dense_hits = {
+            "chunk-zzz": ChannelHit(score=0.9, content="dense-only top", file_path="z.md"),
+        }
+        sparse_hits = {
+            "chunk-aaa": ChannelHit(score=27.0, content="sparse-only top", file_path="a.md"),
+        }
+        for _ in range(20):  # repeated calls, same process — must never flip
+            fused = fuse(dense_hits, sparse_hits, alpha=0.5)
+            assert fused[0].fused_score == fused[1].fused_score  # confirms this IS the tie case
+            assert [c.chunk_id for c in fused] == ["chunk-zzz", "chunk-aaa"]  # descending chunk_id
+
+    def test_tie_break_is_insensitive_to_caller_dict_insertion_order(self) -> None:
+        """The original bug's root cause was iteration-order-dependence of a
+        Python `set`. A correct fix must not merely accept the CURRENT
+        internal iteration order — it must produce the identical ranking
+        regardless of the order candidates arrive in `dense_hits`/
+        `sparse_hits` (dicts, which — unlike sets — preserve insertion
+        order, so this is directly controllable from a test, unlike the
+        real `PYTHONHASHSEED`-driven `set` nondeterminism itself).
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        dense_hits = {
+            f"chunk-{i:03d}": ChannelHit(score=float(i), content="x", file_path=f"{i}.md")
+            for i in range(12)
+        }
+        sparse_hits = {
+            f"chunk-{i:03d}": ChannelHit(score=float(30 - i), content="y", file_path=f"{i}.md")
+            for i in range(6, 18)
+        }
+        forward = fuse(dense_hits, sparse_hits, alpha=0.5)
+        reversed_dense = dict(reversed(dense_hits.items()))
+        reversed_sparse = dict(reversed(sparse_hits.items()))
+        backward = fuse(reversed_dense, reversed_sparse, alpha=0.5)
+        assert [c.chunk_id for c in forward] == [c.chunk_id for c in backward]
+
+    def test_near_tie_within_epsilon_also_breaks_deterministically(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scores that differ only in noise bits (smaller than the derived
+        epsilon) must not be left to float comparison — quantization must
+        fold them into the same tie-break bucket.
+
+        `chunk-hi`/`chunk-lo` are deliberately NOT the pool's min/max (those
+        are `ceiling`/`floor`) — a 2-item pool would let min-max
+        normalization itself STRETCH a tiny raw gap to the full [0, 1]
+        range (exactly the amplification mechanism the task's root-cause
+        writeup describes), which would defeat the point of this test. With
+        4 items, `chunk-hi`/`chunk-lo` normalize to two values close to the
+        pool's midpoint, `noise/(hi-lo of the whole pool)` apart — far below
+        `_DEFAULT_FUSION_TIE_EPSILON` (3.8e-7) — simulating cross-backend
+        sub-ULP jitter on an otherwise real, non-boundary candidate (see the
+        Nano-vs-Qdrant migration note this module cites).
+
+        Supersession scoring disabled (env override) to isolate `fuse()`'s
+        OWN quantized tie-break: `apply_supersession_scoring`'s downstream
+        re-sort (on by default, `retrieval/supersession.py`, out of this
+        change's scope) compares RAW `fused_score`, not the quantized
+        bucket, so with it enabled a genuinely-unequal (if noise-level)
+        pair reverts to raw-magnitude order after that second pass — this
+        does not affect the actual bug this change fixes (id04's tie is
+        EXACT, 0.5==0.5 bit-for-bit, which survives that raw-score resort
+        unchanged — see `test_exact_tie_breaks_by_descending_chunk_id`,
+        run with the default supersession-on setting), but it does mean
+        epsilon-quantized near-tie handling for NON-exact ties is a
+        property of `fuse()`'s own ranking, not (yet) guaranteed to survive
+        supersession post-processing — flagged, not silently masked.
+        """
+        from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_SUPERSESSION_SCORING_ENV,
+            ChannelHit,
+            fuse,
+        )
+
+        monkeypatch.setenv(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "0")
+        noise = 1e-9  # normalizes to ~2e-10 apart over this pool's 10.0 span
+        dense_hits = {
+            "ceiling": ChannelHit(score=10.0, content="c", file_path="ceiling.md"),
+            "chunk-hi": ChannelHit(score=5.0 + noise, content="x", file_path="hi.md"),
+            "chunk-lo": ChannelHit(score=5.0 - noise, content="y", file_path="lo.md"),
+            "floor": ChannelHit(score=0.0, content="f", file_path="floor.md"),
+        }
+        fused = fuse(dense_hits, {}, alpha=1.0)
+        by_id = {c.chunk_id: c for c in fused}
+        assert abs(by_id["chunk-hi"].fused_score - by_id["chunk-lo"].fused_score) < 1e-6
+        # Without quantization these would sort strictly by the noise-level
+        # float difference (chunk-hi always "wins" on raw magnitude); with
+        # quantization they are tied and must fall back to the SAME
+        # descending-chunk_id rule as an exact tie ('chunk-lo' > 'chunk-hi'
+        # lexicographically), sandwiched correctly between the pool's
+        # genuine ceiling/floor.
+        ranked = [c.chunk_id for c in fused]
+        assert ranked == ["ceiling", "chunk-lo", "chunk-hi", "floor"]
+
+    def test_real_gap_larger_than_epsilon_is_not_swallowed(self) -> None:
+        """Guards against a future epsilon regression: quantization must
+        never fold together two candidates whose score gap is a real,
+        above-noise signal — only near-exact-tie noise should be affected.
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        dense_hits = {
+            "chunk-strong": ChannelHit(score=0.9, content="x", file_path="strong.md"),
+            "chunk-weak": ChannelHit(score=0.1, content="y", file_path="weak.md"),
+        }
+        fused = fuse(dense_hits, {}, alpha=1.0)
+        assert [c.chunk_id for c in fused] == ["chunk-strong", "chunk-weak"]
+
+    def test_epsilon_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
+            HARS_MEMORY_SUPERSESSION_SCORING_ENV,
+            ChannelHit,
+            fuse,
+        )
+
+        # Isolates fuse()'s own quantized tie-break from the downstream
+        # raw-score re-sort — see the near-tie test above for why.
+        monkeypatch.setenv(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "0")
+
+        # A real (non-noise) gap of 0.01 must still resolve to the
+        # HIGHER-scored chunk when epsilon is small...
+        dense_hits = {
+            "chunk-a": ChannelHit(score=0.51, content="x", file_path="a.md"),
+            "chunk-b": ChannelHit(score=0.50, content="y", file_path="b.md"),
+        }
+        monkeypatch.setenv(HARS_MEMORY_FUSION_TIE_EPSILON_ENV, "1e-9")
+        fused_tight = fuse(dense_hits, {}, alpha=1.0)
+        assert [c.chunk_id for c in fused_tight] == ["chunk-a", "chunk-b"]
+
+        # ...but a caller-widened epsilon that exceeds the gap between the
+        # two normalized scores (min-max normalizes chunk-a/chunk-b to
+        # exactly 1.0/0.0 here — only a 2-item pool, see the near-tie test
+        # above for why that stretch happens) must fold them into the same
+        # bucket, at which point the descending-chunk_id rule decides
+        # (chunk-b > chunk-a).
+        monkeypatch.setenv(HARS_MEMORY_FUSION_TIE_EPSILON_ENV, "10.0")
+        fused_wide = fuse(dense_hits, {}, alpha=1.0)
+        assert [c.chunk_id for c in fused_wide] == ["chunk-b", "chunk-a"]
+
+    def test_invalid_epsilon_env_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
+            ChannelHit,
+            fuse,
+        )
+
+        monkeypatch.setenv(HARS_MEMORY_FUSION_TIE_EPSILON_ENV, "-1.0")
+        with pytest.raises(ValueError, match="FUSION_TIE_EPSILON"):
+            fuse({"chunk-a": ChannelHit(score=1.0, content="x", file_path="a.md")}, {}, alpha=1.0)
+
+    def test_default_epsilon_is_a_small_positive_float(self) -> None:
+        """Sanity bound on the shipped constant itself — not a re-derivation
+        of the empirical scan (that lives in the module docstring/session
+        note), just a guard against an accidental order-of-magnitude typo
+        regressing this back toward "no effective tie-break" (too large,
+        swallows real signal) or "no effective quantization" (zero/negative).
+        """
+        from tools.memory.retrieval.fusion import _DEFAULT_FUSION_TIE_EPSILON
+
+        assert 0.0 < _DEFAULT_FUSION_TIE_EPSILON < 1e-4
+
+
 class TestRipgrepFusion:
     """Item: ripgrep-channel fusion wiring (retrieval/fusion.py's
     `apply_ripgrep_gate` / `fuse_ripgrep_as_third_weight` /
