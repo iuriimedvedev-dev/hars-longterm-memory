@@ -15,6 +15,7 @@ allows.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -24,11 +25,14 @@ import numpy as np
 import pytest
 
 from tools.memory.retrieval.flat_index import (
+    FlatDenseIndex,
+    FlatIndexDimensionMismatchError,
     FlatIndexUnavailableError,
     build_index,
     get_or_build_index,
     load_index,
     save_index,
+    update_index,
 )
 
 # ---------------------------------------------------------------------------
@@ -73,6 +77,25 @@ class _RecordingEmbed:
 
 def _write_chunks(working_dir: Path, chunks: dict[str, dict]) -> None:
     (working_dir / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
+
+
+def _bump_mtime(path: Path) -> None:
+    """Force a source-file mtime change so `get_or_build_index` re-evaluates
+    the cache instead of taking the cache-hit path — mirrors the
+    `future = time.time() + 5; os.utime(...)` pattern used throughout this
+    file's existing cache-invalidation tests.
+    """
+    future = time.time() + 5
+    os.utime(path, (future, future))
+
+
+def _sha256(content: str) -> str:
+    """Locally-recomputed hash, independent of flat_index.py's private
+    `_content_hash` — used to assert the sidecar's recorded hashes actually
+    match the content stored alongside them, not just that some string is
+    present.
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _sample_chunks() -> dict[str, dict]:
@@ -289,3 +312,352 @@ class TestPersistenceAndCacheInvalidation:
 
     def test_load_index_returns_none_when_absent(self, tmp_path: Path) -> None:
         assert load_index(str(tmp_path / "no-such-cache")) is None
+
+
+class _CallRecordingEmbed:
+    """Wraps `_fake_embed`, recording every call's `texts` (not just
+    `context`, unlike `_RecordingEmbed` above) — used to assert exactly
+    which chunk contents were actually sent for embedding on an incremental
+    update, so "unchanged chunks are not re-embedded" is an assertion on
+    the embed function's inputs, not an inference from the result.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], str | None]] = []
+
+    async def __call__(self, texts: list[str], context: str | None = None, **kwargs: object) -> np.ndarray:
+        self.calls.append((list(texts), context))
+        return await _fake_embed(texts, context=context, **kwargs)
+
+    @property
+    def all_embedded_texts(self) -> list[str]:
+        return [text for texts, _ctx in self.calls for text in texts]
+
+
+class TestIncrementalUpdate:
+    """Verifies `get_or_build_index` prefers `update_index` over a full
+    `build_index` once a usable cache exists, and that `update_index`
+    embeds exactly the chunks that changed — new + modified, never
+    unchanged — per the module's core "incremental, not a cheaper full
+    rebuild" claim.
+    """
+
+    def test_new_chunk_is_embedded_and_appended(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        _write_chunks(working_dir, _sample_chunks())
+
+        _index1, stats1 = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats1.update_path == "full_rebuild"
+
+        richer = _sample_chunks()
+        richer["chunk-4"] = {"content": "alpha newly added chunk after re-ingest.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        index2, stats2 = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats2.update_path == "incremental"
+        assert stats2.new_count == 1
+        assert stats2.modified_count == 0
+        assert stats2.deleted_count == 0
+        assert stats2.reused_count == 3
+        assert index2.chunk_count == 4
+        assert set(index2.chunk_ids) == {"chunk-1", "chunk-2", "chunk-3", "chunk-4"}
+        assert index2.vectors.shape == (4, 2)
+
+    def test_unchanged_chunks_are_not_re_embedded(self, tmp_path: Path) -> None:
+        """The core claim of this module: incremental cost is O(chunks
+        changed), not O(corpus size). Proven here by asserting the embed
+        function is never called with an unchanged chunk's content — not by
+        inferring it from timing or from the result alone.
+        """
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        sample = _sample_chunks()
+        _write_chunks(working_dir, sample)
+
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+
+        richer = dict(sample)
+        richer["chunk-4"] = {"content": "alpha brand new chunk, never seen before.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        recorder = _CallRecordingEmbed()
+        index2, stats2 = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), recorder))
+
+        assert stats2.update_path == "incremental"
+        assert index2.chunk_count == 4
+        unchanged_contents = {sample[cid]["content"] for cid in ("chunk-1", "chunk-2", "chunk-3")}
+        embedded_texts = set(recorder.all_embedded_texts)
+        assert not (unchanged_contents & embedded_texts), (
+            "an unchanged chunk's content was sent to embed_func — incremental "
+            "update must reuse its cached vector, not re-embed it"
+        )
+        assert embedded_texts == {richer["chunk-4"]["content"]}
+        # Every recorded call during a build/update is document-side.
+        assert all(ctx == "document" for _texts, ctx in recorder.calls)
+
+    def test_modified_content_under_stable_id_triggers_re_embedding(self, tmp_path: Path) -> None:
+        """Content changing under a STABLE id (LightRAG re-chunk on
+        re-ingest) must be detected by hash, not skipped because the id was
+        already present — the stale-vector-under-stable-id trap called out
+        in flat_index.py's module and update_index docstrings.
+        """
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        sample = _sample_chunks()
+        _write_chunks(working_dir, sample)
+
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+
+        mutated = dict(sample)
+        new_content = "gamma document about a completely different topic now."
+        mutated["chunk-2"] = {"content": new_content, "file_path": "b.md"}  # SAME id, new content
+        _write_chunks(working_dir, mutated)
+        _bump_mtime(chunks_file)
+
+        recorder = _CallRecordingEmbed()
+        index2, stats2 = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), recorder))
+
+        assert stats2.update_path == "incremental"
+        assert stats2.new_count == 0
+        assert stats2.modified_count == 1
+        assert stats2.reused_count == 2
+        assert recorder.all_embedded_texts == [new_content]
+        assert index2.chunk_meta["chunk-2"]["content"] == new_content
+        assert index2.chunk_hashes["chunk-2"] == _sha256(new_content)
+
+        # The vector actually changed to reflect the new (gamma-shaped)
+        # content, not the stale beta-shaped one — proves the row was
+        # really re-embedded, not just re-labeled.
+        hits = asyncio.run(index2.search("gamma query", _fake_embed, top_k=1))
+        assert hits[0].chunk_id == "chunk-2"
+        assert hits[0].score == pytest.approx(1.0)
+
+    def test_deleted_chunk_is_removed_from_matrix(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        sample = _sample_chunks()
+        _write_chunks(working_dir, sample)
+
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+
+        reduced = {cid: entry for cid, entry in sample.items() if cid != "chunk-2"}
+        _write_chunks(working_dir, reduced)
+        _bump_mtime(chunks_file)
+
+        index2, stats2 = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+
+        assert stats2.update_path == "incremental"
+        assert stats2.deleted_count == 1
+        assert stats2.new_count == 0
+        assert stats2.modified_count == 0
+        assert index2.chunk_count == 2
+        assert "chunk-2" not in index2.chunk_ids
+        assert "chunk-2" not in index2.chunk_meta
+        assert "chunk-2" not in index2.chunk_hashes
+        assert index2.vectors.shape == (2, 2)
+
+        # A deleted chunk must never be returned as an orphan vector.
+        hits = asyncio.run(index2.search("beta query", _fake_embed, top_k=5))
+        assert all(hit.chunk_id != "chunk-2" for hit in hits)
+
+    def test_matrix_id_sidecar_alignment_across_several_updates(self, tmp_path: Path) -> None:
+        """An off-by-one between chunk_ids/vectors/chunk_meta/chunk_hashes
+        would silently return the wrong document's content for a
+        correct-looking id — check alignment explicitly after every step of
+        a new -> modify -> delete -> new-again sequence, not just once.
+        """
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+
+        def _assert_aligned(index: FlatDenseIndex, source: dict[str, dict]) -> None:
+            assert len(index.chunk_ids) == index.vectors.shape[0]
+            assert len(index.chunk_ids) == len(index.chunk_meta)
+            assert len(index.chunk_ids) == len(index.chunk_hashes)
+            assert set(index.chunk_ids) == set(source.keys())
+            for chunk_id, entry in source.items():
+                expected_content = str(entry["content"])
+                assert index.chunk_meta[chunk_id]["content"] == expected_content
+                assert index.chunk_hashes[chunk_id] == _sha256(expected_content)
+            # Position-based cross-check: a search hit's content must match
+            # the source content for that exact chunk_id — the concrete
+            # "wrong document returned" failure mode.
+            for chunk_id in index.chunk_ids:
+                idx = index.chunk_ids.index(chunk_id)
+                row_vector = np.asarray(index.vectors[idx])
+                np.testing.assert_allclose(np.linalg.norm(row_vector), 1.0, atol=1e-5)
+
+        state = _sample_chunks()
+        _write_chunks(working_dir, state)
+        index, _stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        _assert_aligned(index, state)
+
+        # Step 1: add a chunk.
+        state = dict(state)
+        state["chunk-4"] = {"content": "alpha step one new chunk.", "file_path": "d.md"}
+        _write_chunks(working_dir, state)
+        _bump_mtime(chunks_file)
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "incremental"
+        _assert_aligned(index, state)
+
+        # Step 2: modify a chunk (same id, new content).
+        state = dict(state)
+        state["chunk-1"] = {"content": "beta step two mutated chunk.", "file_path": "a.md"}
+        _write_chunks(working_dir, state)
+        _bump_mtime(chunks_file)
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "incremental"
+        assert stats.modified_count == 1
+        _assert_aligned(index, state)
+
+        # Step 3: delete a chunk.
+        state = {cid: entry for cid, entry in state.items() if cid != "chunk-3"}
+        _write_chunks(working_dir, state)
+        _bump_mtime(chunks_file)
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "incremental"
+        assert stats.deleted_count == 1
+        _assert_aligned(index, state)
+
+        # Step 4: add + modify + delete in the same update.
+        state = dict(state)
+        del state["chunk-2"]
+        state["chunk-4"] = {"content": "gamma step four mutated again.", "file_path": "d.md"}
+        state["chunk-5"] = {"content": "beta step four brand new.", "file_path": "e.md"}
+        _write_chunks(working_dir, state)
+        _bump_mtime(chunks_file)
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "incremental"
+        assert stats.new_count == 1
+        assert stats.modified_count == 1
+        assert stats.deleted_count == 1
+        _assert_aligned(index, state)
+
+    def test_corrupt_cache_meta_falls_back_to_full_rebuild(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        _write_chunks(working_dir, _sample_chunks())
+
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        (cache_dir / "flat_dense_cache_meta.json").write_text("{not valid json", encoding="utf-8")
+
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "full_rebuild"
+        assert index.chunk_count == 3
+        assert load_index(str(cache_dir)) is not None  # rebuild re-wrote a valid cache
+
+    def test_legacy_cache_without_chunk_hashes_falls_back_to_full_rebuild(self, tmp_path: Path) -> None:
+        """A sidecar written before `chunk_hashes` existed must not be
+        silently trusted for an incremental update once the source changes
+        — see `load_index`'s docstring: this is deliberately NOT treated as
+        corruption (the file parses fine), but as "not usable for
+        incremental update", forcing exactly one full rebuild to adopt the
+        new cache format.
+        """
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        _write_chunks(working_dir, _sample_chunks())
+
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        meta_path = cache_dir / "flat_dense_cache_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        del meta["chunk_hashes"]
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        richer = _sample_chunks()
+        richer["chunk-4"] = {"content": "alpha chunk added after legacy cache upgrade.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        index, stats = asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+        assert stats.update_path == "full_rebuild"
+        assert index.chunk_count == 4
+        assert all(chunk_id in index.chunk_hashes for chunk_id in index.chunk_ids)
+
+    def test_dimension_mismatch_mid_update_falls_back_to_full_rebuild(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        _write_chunks(working_dir, _sample_chunks())
+
+        _index1, stats1 = asyncio.run(
+            get_or_build_index(str(working_dir), str(cache_dir), _fake_embed, embed_model="fake-2d")
+        )
+        assert stats1.embed_model == "fake-2d"
+        assert _index1.vectors.shape[1] == 2
+
+        async def _three_dim_embed(texts: list[str], context: str | None = None, **_: object) -> np.ndarray:
+            return np.array([[*_vector_for(t), 0.0] for t in texts], dtype=np.float32)
+
+        richer = _sample_chunks()
+        richer["chunk-4"] = {"content": "alpha chunk needing a wider embedding now.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        # Same embed_model label as before (so the cache is not rejected on
+        # the label check alone) but a genuinely wider embedding function —
+        # exercises the runtime dimension check inside update_index.
+        index2, stats2 = asyncio.run(
+            get_or_build_index(str(working_dir), str(cache_dir), _three_dim_embed, embed_model="fake-2d")
+        )
+        assert stats2.update_path == "full_rebuild"
+        assert index2.vectors.shape == (4, 3)
+        assert index2.chunk_count == 4
+
+    def test_update_index_directly_reuses_cached_vector_bit_for_bit(self, tmp_path: Path) -> None:
+        """Direct `update_index` unit test (bypassing `get_or_build_index`'s
+        path selection): an unchanged row's vector in the output must be
+        exactly the cached row, not a recomputation that merely happens to
+        agree.
+        """
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        _write_chunks(working_dir, _sample_chunks())
+        cached, _build_seconds = asyncio.run(build_index(str(working_dir), _fake_embed, embed_model="fake-2d"))
+
+        richer = _sample_chunks()
+        richer["chunk-4"] = {"content": "alpha directly-updated new chunk.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+
+        updated, stats = asyncio.run(update_index(str(working_dir), _fake_embed, cached, embed_model="fake-2d"))
+        assert stats.new_count == 1
+        assert stats.reused_count == 3
+        assert stats.embedded_count == 1
+
+        for chunk_id in ("chunk-1", "chunk-2", "chunk-3"):
+            old_row = cached.vectors[cached.chunk_ids.index(chunk_id)]
+            new_row = updated.vectors[updated.chunk_ids.index(chunk_id)]
+            np.testing.assert_array_equal(np.asarray(old_row), np.asarray(new_row))
+
+    def test_update_index_raises_dimension_mismatch_directly(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        _write_chunks(working_dir, _sample_chunks())
+        cached, _ = asyncio.run(build_index(str(working_dir), _fake_embed, embed_model="fake-2d"))
+
+        richer = _sample_chunks()
+        richer["chunk-4"] = {"content": "alpha needs three dims.", "file_path": "d.md"}
+        _write_chunks(working_dir, richer)
+
+        async def _three_dim_embed(texts: list[str], context: str | None = None, **_: object) -> np.ndarray:
+            return np.array([[*_vector_for(t), 0.0] for t in texts], dtype=np.float32)
+
+        with pytest.raises(FlatIndexDimensionMismatchError):
+            asyncio.run(update_index(str(working_dir), _three_dim_embed, cached, embed_model="fake-2d"))
