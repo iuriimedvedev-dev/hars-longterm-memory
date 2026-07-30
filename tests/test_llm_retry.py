@@ -1,20 +1,21 @@
 """Tests for the bounded retry/backoff wrapping ``make_llm_func``'s LLM call
 in ``server/lightrag_init.py``.
 
-Context: neither of LightRAG 1.4.16's own decorators retries this call path.
-``lightrag.llm.openai.openai_complete_if_cache`` has a tenacity ``@retry`` on
-``RateLimitError | APIConnectionError | APITimeoutError | InvalidResponseError``,
-but this module never calls that function — it hand-rolls its own httpx-based
-``llm_func`` instead. The only decorator that actually wraps our call
-(``lightrag.utils.priority_limit_async_func_call``, source of the "Error in
-decorated function" log line) is a concurrency limiter with multi-layer
-*timeout* protection, not a retry mechanism — on any exception it just logs
-and propagates. So a single transient failure (e.g. llama-server briefly
-refusing connections during a prompt-cache reorganisation pass) used to fail
-the whole document's merge stage with no retry at all.
+Context: ``make_llm_func`` is a thin adapter over the official OpenAI SDK's
+``AsyncOpenAI`` client (built via
+``lightrag.llm.openai.create_openai_async_client``). It deliberately does
+NOT call ``lightrag.llm.openai.openai_complete_if_cache`` — see
+``make_llm_func``'s docstring for why (that function's ``reasoning_content``
+handling and built-in tenacity retry both have a different contract than
+this deployment needs). The SDK client's own built-in retry
+(``AsyncOpenAI(max_retries=...)``) is explicitly disabled
+(``client_configs={"max_retries": 0}``) so this module's own tenacity-based
+retry/backoff — env-configurable, structured-logged — is the only retry
+layer exercised here.
 
-These tests substitute ``httpx.AsyncClient`` with one bound to an
-``httpx.MockTransport`` so no real network/process is involved.
+These tests substitute the ``AsyncOpenAI`` client's transport with one bound
+to an ``httpx.MockTransport`` (via a fake ``create_openai_async_client``) so
+no real network/process is involved.
 """
 
 from __future__ import annotations
@@ -25,28 +26,42 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
+import openai
 import pytest
 
 from tools.memory.server.lightrag_init import make_llm_func
 
-# Captured before any test monkeypatches ``httpx.AsyncClient`` — the fake
-# client factory below constructs real ``httpx.AsyncClient`` instances (just
-# pinned to a mock transport), so it must not call back into itself.
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
-
 
 def _client_factory_using_transport(
     transport: httpx.MockTransport,
-) -> Callable[..., httpx.AsyncClient]:
-    """Build an ``httpx.AsyncClient`` factory pinned to a mock transport.
+) -> Callable[..., openai.AsyncOpenAI]:
+    """Build a ``create_openai_async_client``-compatible factory pinned to a
+    mock transport.
 
-    Mirrors ``make_llm_func``'s call shape (``httpx.AsyncClient(timeout=...)``)
-    but routes all requests through ``transport`` instead of the network.
+    Mirrors ``make_llm_func``'s call shape
+    (``create_openai_async_client(api_key=..., base_url=..., timeout=...,
+    client_configs={"max_retries": 0})``) but routes all requests through
+    ``transport`` instead of the network, and honours the caller's
+    ``client_configs["max_retries"]`` so tests exercising the (disabled) SDK
+    retry path stay meaningful if that default ever changes.
     """
 
-    def _factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        kwargs["transport"] = transport
-        return _REAL_ASYNC_CLIENT(*args, **kwargs)
+    def _factory(
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        client_configs: dict[str, Any] | None = None,
+        **_ignored: Any,
+    ) -> openai.AsyncOpenAI:
+        max_retries = (client_configs or {}).get("max_retries", 0)
+        return openai.AsyncOpenAI(
+            api_key=api_key or "test",
+            base_url=base_url,
+            timeout=timeout,
+            http_client=httpx.AsyncClient(transport=transport),
+            max_retries=max_retries,
+        )
 
     return _factory
 
@@ -61,6 +76,13 @@ def _make_llm_func_for_test() -> object:
         model="gemma-4-12b",
         max_tokens=64,
         temperature=0.1,
+    )
+
+
+def _patch_client_factory(monkeypatch: pytest.MonkeyPatch, transport: httpx.MockTransport) -> None:
+    monkeypatch.setattr(
+        "lightrag.llm.openai.create_openai_async_client",
+        _client_factory_using_transport(transport),
     )
 
 
@@ -87,9 +109,7 @@ class TestMakeLlmFuncRetriesTransientFailures:
                 raise httpx.ConnectError("connection refused", request=request)
             return _chat_response("recovered")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
         result = asyncio.run(llm_func("hello"))  # type: ignore[operator]
@@ -106,9 +126,7 @@ class TestMakeLlmFuncRetriesTransientFailures:
                 return httpx.Response(503, text="server busy")
             return _chat_response("ok-after-503")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
         result = asyncio.run(llm_func("hello"))  # type: ignore[operator]
@@ -125,9 +143,7 @@ class TestMakeLlmFuncRetriesTransientFailures:
                 return httpx.Response(429, text="rate limited")
             return _chat_response("ok-after-429")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
         result = asyncio.run(llm_func("hello"))  # type: ignore[operator]
@@ -146,9 +162,7 @@ class TestMakeLlmFuncRetriesTransientFailures:
                 raise httpx.ConnectError("connection refused", request=request)
             return _chat_response("recovered")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
         with caplog.at_level(logging.WARNING, logger="tools.memory.server.lightrag_init"):
@@ -171,9 +185,7 @@ class TestMakeLlmFuncDoesNotRetryFatalErrors:
             calls["n"] += 1
             return httpx.Response(status_code, text="fatal client error")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
 
@@ -182,23 +194,29 @@ class TestMakeLlmFuncDoesNotRetryFatalErrors:
 
         assert calls["n"] == 1  # no retry attempted — this can never succeed
 
-    def test_runtime_error_chains_the_original_httpx_error(
+    def test_runtime_error_chains_the_original_openai_status_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Chained cause is now an ``openai.APIStatusError`` (subclass
+        ``AuthenticationError`` for 401) carrying ``.status_code`` directly,
+        rather than the pre-SDK ``httpx.HTTPStatusError`` with a nested
+        ``.response.status_code`` — the OpenAI SDK's typed error taxonomy
+        exposes the status code as a first-class attribute on the exception
+        itself.
+        """
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(401, text="unauthorized")
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
 
         with pytest.raises(RuntimeError) as exc_info:
             asyncio.run(llm_func("hello"))  # type: ignore[operator]
 
-        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
-        assert exc_info.value.__cause__.response.status_code == 401
+        assert isinstance(exc_info.value.__cause__, openai.APIStatusError)
+        assert exc_info.value.__cause__.status_code == 401
 
 
 class TestMakeLlmFuncGivesUpAfterBoundedAttempts:
@@ -213,9 +231,7 @@ class TestMakeLlmFuncGivesUpAfterBoundedAttempts:
             # indefinitely.
             raise httpx.ConnectError("connection refused", request=request)
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
         monkeypatch.setenv("HARS_MEMORY_LLM_RETRY_ATTEMPTS", "3")
 
         llm_func = _make_llm_func_for_test()
@@ -234,9 +250,7 @@ class TestMakeLlmFuncGivesUpAfterBoundedAttempts:
             calls["n"] += 1
             raise httpx.ConnectError("connection refused", request=request)
 
-        monkeypatch.setattr(
-            httpx, "AsyncClient", _client_factory_using_transport(httpx.MockTransport(handler))
-        )
+        _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
         monkeypatch.setenv("HARS_MEMORY_LLM_RETRY_ATTEMPTS", "1")
 
         llm_func = _make_llm_func_for_test()

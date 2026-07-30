@@ -21,11 +21,78 @@ A bug in this module invalidates every future retrieval decision made from
 ab_bench.py's output silently — see
 tools/memory/tests/test_eval_metrics.py for hand-computed regression cases
 covering every function here.
+
+RECALL@K / NDCG@K / RR BACKEND — `ir_measures` (trec_eval convention)
+-----------------------------------------------------------------------
+These three metrics used to be hand-rolled. They are now computed by
+`ir_measures` (backed by `pytrec_eval_terrier`, an actively maintained fork
+of the actual trec_eval C binary used throughout the IR literature this
+suite is meant to be comparable against) — chosen over vanilla PyPI
+`pytrec_eval` because the latter is sdist-only (compiles trec_eval's C
+source at install time) while `pytrec_eval_terrier` ships prebuilt wheels
+for this project's Python (cp313), and `ir_measures` gives a typed
+`Recall@k` / `nDCG@k` / `RR` API instead of trec_eval's fragile
+string-keyed measure names (`"ndcg_cut_10"`, `"recip_rank"`, ...).
+
+CONVENTION DIFFERENCES FROM THE OLD HAND-ROLLED CODE (probed empirically
+against `ir_measures.iter_calc` directly; see git history of this file for
+the hand-rolled implementations these replaced):
+
+1. Ties. trec_eval consumes a doc_id -> score dict and derives rank order
+   itself, breaking exact-score ties by DESCENDING docid — a convention
+   uncorrelated with retrieval quality and NOT something our upstream
+   channels (channels.py / LightRAG) ever intended, since they already hand
+   us a definitive rank ORDER (via `RankedHit.rank`), not raw scores tied
+   at the metrics layer. `_synthetic_run()` below assigns strictly
+   decreasing synthetic scores by list position specifically to make this
+   trec_eval tie-break moot and force the library to reproduce the
+   caller-supplied order exactly, byte-for-byte, regardless of docid
+   strings. Verified empirically: same list, tie-break-disagreeing docids,
+   library reproduces list order in all cases.
+2. Duplicate doc ids in `ranked_docs`. trec_eval's run is a dict keyed by
+   doc id, so it cannot represent the same document at two different rank
+   positions the way the OLD hand-rolled code's raw list-walk could
+   (silently, positions after the first were reachable if k was large
+   enough). `_synthetic_run()` calls `dedupe_preserve_order()` first (the
+   same first-occurrence rule this module already applies everywhere else,
+   see its docstring) so a duplicate collapses to its FIRST (best) rank —
+   strictly more correct than the old positional double-count, and a no-op
+   for every real caller in ab_bench.py, which already dedupes before
+   scoring.
+3. A gold document absent from the returned run. Both conventions agree:
+   `recall_at_k`'s denominator is always `len(gold_docs)` regardless of
+   whether every gold doc was retrieved (verified: matches hand-computed
+   NDCG@k too, since IDCG uses `min(len(gold_docs), k)` ideal positions in
+   both).
+4. A run shorter than k, or an empty run. Both conventions agree: scored
+   over whatever was retrieved; an empty run scores 0.0 everywhere. No
+   special-casing needed in this module for either case.
+5. A query with NO gold documents at all. trec_eval/`ir_measures` treats
+   this as simply "0 relevant retrieved" and silently returns 0.0 for every
+   measure — or, if the query id is entirely absent from qrels, silently
+   DROPS it from results with no error at all. This repo's fail-fast
+   convention disagrees: a judged query (anything except `type: no_answer`
+   in retrieval_queries.yaml) with an empty gold set is a data-authoring
+   bug, not a legitimate zero score, and burying it as a silent 0.0 (or
+   worse, a silently-vanishing row) is exactly the failure mode this
+   module's own docstring warns against. `recall_at_k` / `ndcg_at_k` /
+   `reciprocal_rank` therefore keep the explicit `raise ValueError` guard
+   from the old hand-rolled code rather than delegate this case to the
+   library.
+
+RR (Reciprocal Rank) is NOT truncated to any cutoff by trec_eval — verified
+against a gold document at rank 50 in a 60-document run, matching this
+module's own "computed over the full returned list" contract.
 """
 
 from __future__ import annotations
 
-import math
+import ir_measures
+from ir_measures import RR as _RR_MEASURE
+from ir_measures import Recall as _RECALL_MEASURE
+from ir_measures import nDCG as _NDCG_MEASURE
+
+_QUERY_ID = "q"  # fixed placeholder id: every call below scores exactly one query
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -48,6 +115,25 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
+def _synthetic_run(ranked_docs: list[str]) -> dict[str, float]:
+    """Turn a rank-order list into the doc_id -> score dict `ir_measures`
+    (trec_eval convention) expects, WITHOUT letting trec_eval's own
+    tie-break (descending docid on exact score ties — see module docstring,
+    "conventions differences" item 1) have any influence: every position
+    gets a strictly decreasing synthetic score, so no two docs are ever
+    tied and the library is forced to reproduce `ranked_docs`'s order
+    exactly, regardless of the docid strings involved.
+
+    Duplicates collapse to their first (best) occurrence via
+    `dedupe_preserve_order` — see module docstring, item 2 — matching a
+    dict's inability to hold two scores for the same key, and matching what
+    every real caller (ab_bench.py) already guarantees before scoring.
+    """
+    deduped = dedupe_preserve_order(ranked_docs)
+    n = len(deduped)
+    return {doc_id: float(n - i) for i, doc_id in enumerate(deduped)}
+
+
 def recall_at_k(ranked_docs: list[str], gold_docs: set[str], k: int) -> float:
     """Fraction of `gold_docs` present anywhere in the top-`k` of `ranked_docs`.
 
@@ -55,13 +141,18 @@ def recall_at_k(ranked_docs: list[str], gold_docs: set[str], k: int) -> float:
     or 1.0). For a multi-gold query (e.g. a multihop question needing 2
     documents) it is the fraction found, generalizing hit@k correctly rather
     than silently only checking the first gold doc.
+
+    Computed via `ir_measures`' `Recall@k` (trec_eval convention) — see
+    module docstring for what that backend does and does not change here.
     """
     if not gold_docs:
         raise ValueError("recall_at_k requires a non-empty gold_docs set")
     if k < 1:
         raise ValueError("k must be >= 1")
-    top_k = set(ranked_docs[:k])
-    return len(top_k & gold_docs) / len(gold_docs)
+    qrels = {_QUERY_ID: {doc_id: 1 for doc_id in gold_docs}}
+    run = {_QUERY_ID: _synthetic_run(ranked_docs)}
+    (metric,) = ir_measures.iter_calc([_RECALL_MEASURE @ k], qrels, run)
+    return metric.value
 
 
 def ndcg_at_k(ranked_docs: list[str], gold_docs: set[str], k: int) -> float:
@@ -71,20 +162,19 @@ def ndcg_at_k(ranked_docs: list[str], gold_docs: set[str], k: int) -> float:
     IDCG is computed against the ideal ranking of exactly `min(len(gold_docs), k)`
     relevant documents at the top — the correct ideal for a query with more
     than one gold document, not the single-relevant-document formula.
+
+    Computed via `ir_measures`' `nDCG@k` (trec_eval's `ndcg_cut`, binary
+    relevance, log2 discount) — see module docstring for what that backend
+    does and does not change here.
     """
     if not gold_docs:
         raise ValueError("ndcg_at_k requires a non-empty gold_docs set")
     if k < 1:
         raise ValueError("k must be >= 1")
-    dcg = 0.0
-    for i, doc_id in enumerate(ranked_docs[:k], start=1):
-        if doc_id in gold_docs:
-            dcg += 1.0 / math.log2(i + 1)
-    ideal_hits = min(len(gold_docs), k)
-    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_hits + 1))
-    if idcg == 0.0:
-        return 0.0
-    return dcg / idcg
+    qrels = {_QUERY_ID: {doc_id: 1 for doc_id in gold_docs}}
+    run = {_QUERY_ID: _synthetic_run(ranked_docs)}
+    (metric,) = ir_measures.iter_calc([_NDCG_MEASURE @ k], qrels, run)
+    return metric.value
 
 
 def first_rank(ranked_docs: list[str], targets: set[str]) -> int | None:
@@ -101,11 +191,17 @@ def reciprocal_rank(ranked_docs: list[str], gold_docs: set[str]) -> float:
     """1/rank of the first gold document found anywhere in `ranked_docs`
     (unbounded by any k — MRR is conventionally computed over the full
     returned list), or 0.0 if none of `gold_docs` appear at all.
+
+    Computed via `ir_measures`' `RR` (trec_eval's `recip_rank`, verified
+    NOT truncated to any implicit cutoff — see module docstring) — see
+    module docstring for what that backend does and does not change here.
     """
     if not gold_docs:
         raise ValueError("reciprocal_rank requires a non-empty gold_docs set")
-    rank = first_rank(ranked_docs, gold_docs)
-    return 0.0 if rank is None else 1.0 / rank
+    qrels = {_QUERY_ID: {doc_id: 1 for doc_id in gold_docs}}
+    run = {_QUERY_ID: _synthetic_run(ranked_docs)}
+    (metric,) = ir_measures.iter_calc([_RR_MEASURE], qrels, run)
+    return metric.value
 
 
 def mean_reciprocal_rank(per_query_reciprocal_ranks: list[float]) -> float:
