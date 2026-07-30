@@ -148,6 +148,118 @@ def marker_penalty_enabled() -> bool:
 DEFAULT_HYBRID_ALPHA = 0.5
 
 
+# ---------------------------------------------------------------------------
+# Deterministic tie-break (added 2026-07-30, fixing a measured non-
+# reproducibility bug in `fuse()`'s ranking — before/after measurement
+# below).
+#
+# ROOT CAUSE, confirmed empirically (not guessed): `fuse()`'s old sort key
+# was `fused_score` alone. Whenever two chunks tied EXACTLY on that key —
+# structurally common, not rare: a chunk that is chunk_id-topped
+# (norm=1.0) in exactly ONE channel and entirely ABSENT from the other
+# (norm=0.0 via `.get(chunk_id, 0.0)`) gets `fused_score == alpha` from
+# BOTH the dense-channel-topper and the sparse-channel-topper — an EXACT
+# float tie between two structurally different candidates, measured to
+# occur in 42/2233 (1.9%) of adjacent-rank score pairs across this corpus's
+# 46-query labeled set (`retrieval_queries.yaml`, pool=30, alpha=0.5) —
+# Python's `sort()` is stable, so the tie was broken by `fused`'s
+# PRE-sort insertion order, which came from iterating `all_chunk_ids =
+# set(dense_hits) | set(sparse_hits)`. Python randomizes `str` hashing
+# per-process by default (`PYTHONHASHSEED`), so that `set`'s iteration
+# order — and therefore which of two exactly-tied chunks appeared first —
+# varied ACROSS PROCESSES (i.e. across repeated `ab_bench.py` invocations
+# against the SAME index, SAME backend, SAME query), even though every
+# upstream score was byte-identical every time. Confirmed directly: running
+# `ab_bench.py ab --configs hybrid_bm25` under `PYTHONHASHSEED=0/1/2/5/6/
+# 8/9/11/12/42` all reproduced recall@1=0.5602/ndcg@10=0.7178/mrr=0.7086,
+# while `PYTHONHASHSEED=3/4/7/10` all reproduced recall@1=0.5324/
+# ndcg@10=0.7075/mrr=0.6948 — a clean bimodal split entirely explained by
+# query id04's rank-1 tie (`hyp_l1-1-assessment-fact-targeted-
+# contradiction.md`, dense_norm=0/sparse_norm=1.0/fused=0.5 EXACTLY, vs
+# `hyp_b1-a2-5-fact-answer-deeplayers-l16-24-light.md`,
+# dense_norm=1.0/sparse_norm=0/fused=0.5 EXACTLY) flipping which document
+# lands at rank 1 depending on `PYTHONHASHSEED`. `recall@10` and
+# `supersession_error_rate` never moved across any seed (both metrics are
+# order-invariant for this corpus's ties — the flipping documents were
+# always in the same top-10 SET, only reordered within it), matching what
+# was reported as "trustworthy" before this fix.
+#
+# FIX: sort on `(quantized_score, chunk_id)` instead of `fused_score`
+# alone. `chunk_id` (already the union join-key across dense/sparse) is
+# unique per `fuse()` call by construction (`all_chunk_ids` is a set
+# union), so it is a total order with NO remaining ties — the final order
+# is therefore fully determined by score + chunk_id alone, independent of
+# whatever order `all_chunk_ids` happened to iterate in. This is the same
+# shape of fix `ir_measures`/trec_eval already uses for exact-score ties
+# in the metrics layer this fusion output feeds (see tools/memory/eval/
+# metrics.py's module docstring, "Ties" item) — DESCENDING docid, which is
+# arbitrary in content but stable. This module copies that exact
+# convention (`reverse=True` applied to the whole `(bucket, chunk_id)` key,
+# so ties break by descending `chunk_id` too) for consistency with the
+# precedent already trusted for measurement, not because descending is
+# privileged over ascending.
+#
+# EPSILON: a pure secondary-key sort does not help scores that are
+# UNEQUAL but differ only in noise bits (e.g. two backends' float32 cosine
+# kernels disagreeing at the sub-ULP level after min-max normalization
+# amplifies a tiny raw-score gap — the mechanism documented for the
+# Nano-vs-Qdrant migration, see fusion.py's own module docstring history
+# and .session/2026-07-30_qdrant-migration-execution.md). Those need
+# QUANTIZATION (binning `fused_score` before comparing), not a fuzzy
+# epsilon-tolerant comparator: pairwise "is A within epsilon of B" is not
+# transitive (A~B and B~C does not imply A~C), which breaks the strict
+# total order `sort()` requires and can itself become a fresh source of
+# order-dependent nondeterminism; bucketing IS transitive (it maps each
+# score to a discrete integer bucket index, a true total order) so it
+# cannot introduce that failure mode.
+#
+# Magnitude derived from the observed score distribution, not a round
+# number: a scratch scan of `fuse()`'s own real output (production
+# `_min_max_normalize` + `fuse`, called directly, no reimplementation)
+# across every one of the 46 labeled queries' full candidate pools
+# (pool=30, alpha=0.5, same config as the reproducibility measurement
+# above) found the SMALLEST non-exact-zero gap between any two
+# adjacent-ranked `fused_score` values anywhere in the corpus to be
+# 3.844e-06 (1st percentile of all 2191 non-zero gaps: 6.01e-05; median:
+# 4.27e-03) — i.e. every genuine (non-tied) distinction this corpus's
+# labeled set actually exercises today is at least ~3.8e-6 apart.
+# `_DEFAULT_FUSION_TIE_EPSILON` is set to 1/10th of that smallest observed
+# real gap (3.8e-7), giving a >=10x safety margin so quantization cannot
+# merge any distinction this corpus has been measured to rely on, while
+# still sitting comfortably above float32 machine epsilon (~1.19e-7 near
+# 1.0) to absorb realistic cross-backend accumulation noise of the kind
+# documented above. Overridable via `HARS_MEMORY_FUSION_TIE_EPSILON` if a
+# future corpus/backend combination is measured to need a different
+# margin — re-run the scan (not guess a new round number) before changing
+# it.
+HARS_MEMORY_FUSION_TIE_EPSILON_ENV = "HARS_MEMORY_FUSION_TIE_EPSILON"
+_DEFAULT_FUSION_TIE_EPSILON: Final[float] = 3.8e-7
+
+
+def _fusion_tie_epsilon() -> float:
+    raw = os.environ.get(HARS_MEMORY_FUSION_TIE_EPSILON_ENV)
+    if raw is None:
+        return _DEFAULT_FUSION_TIE_EPSILON
+    value = float(raw)
+    if value < 0.0:
+        raise ValueError(
+            f"{HARS_MEMORY_FUSION_TIE_EPSILON_ENV} must be >= 0.0, got {value}"
+        )
+    return value
+
+
+def _deterministic_sort_key(chunk: "FusedChunk", epsilon: float) -> tuple[float, str]:
+    """`(quantized_score, chunk_id)` — a true total order (see design note
+    above): `chunk_id` is unique within one `fuse()` call, so this key has
+    NO remaining ties regardless of `fused`'s pre-sort insertion order.
+    Used with `reverse=True` by every caller below, which also reverses the
+    `chunk_id` component (descending) — intentional, matching
+    `ir_measures`' own tie-break convention (see design note above).
+    """
+    bucket = round(chunk.fused_score / epsilon) if epsilon > 0.0 else chunk.fused_score
+    return (bucket, chunk.chunk_id)
+
+
 @dataclass(frozen=True)
 class ChannelHit:
     """One channel's raw hit for a chunk (dense OR sparse)."""
@@ -226,7 +338,8 @@ def fuse(
                 file_path=source_hit.file_path,
             )
         )
-    fused.sort(key=lambda c: c.fused_score, reverse=True)
+    epsilon = _fusion_tie_epsilon()
+    fused.sort(key=lambda c: _deterministic_sort_key(c, epsilon), reverse=True)
 
     if _supersession_scoring_enabled():
         fused = apply_supersession_scoring(
@@ -611,6 +724,7 @@ def fuse_ripgrep_as_third_weight(
 
 __all__ = [
     "DEFAULT_HYBRID_ALPHA",
+    "HARS_MEMORY_FUSION_TIE_EPSILON_ENV",
     "HARS_MEMORY_SUPERSESSION_SCORING_ENV",
     "HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV",
     "HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV",
