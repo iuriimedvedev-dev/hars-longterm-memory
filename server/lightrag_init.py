@@ -44,9 +44,54 @@ class _ByteTokenizer:
         )
 
 
+#: Response status codes worth retrying: 429 (rate limit / server-side
+#: throttling) and 5xx (server overloaded or transiently unavailable — e.g.
+#: llama-server mid-stall from a prompt-cache reorganisation pass). Any other
+#: 4xx (400 malformed request, 401/403 auth, 404 wrong path/model route, 422
+#: unprocessable) reflects a request the server will never accept no matter
+#: how many times it is retried, so it is deliberately excluded here.
+_RETRYABLE_HTTP_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a transient LLM-endpoint failure worth retrying.
+
+    Retryable:
+      * ``httpx.HTTPStatusError`` with a 429/5xx status — server-side
+        throttling or transient unavailability.
+      * Any other ``httpx.HTTPError`` (``httpx.ConnectError``,
+        ``httpx.ReadTimeout``, ``httpx.RemoteProtocolError``,
+        ``httpx.PoolTimeout``, etc.) — transport-level hiccups, e.g. a
+        connection refused/reset during llama-server's prompt-cache
+        reorganisation pass (``srv get_availabl: prompt cache update took
+        N ms``), where the server is not actually down.
+
+    NOT retryable:
+      * ``httpx.HTTPStatusError`` with any other 4xx status (400/401/403/404/
+        422) — a malformed request, bad auth, or a genuinely wrong model
+        name/route. Retrying these wastes the backoff budget on an error
+        that cannot succeed.
+      * Anything that is not an ``httpx.HTTPError`` at all (e.g. a bug in
+        the response-parsing code below) — that is a programming error, not
+        a transient endpoint failure, and must fail immediately/loudly.
+    """
+    import httpx
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_HTTP_STATUS_CODES
+    return isinstance(exc, httpx.HTTPError)
+
+
 def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float) -> object:
     """Return an async LLM function compatible with LightRAG (OpenAI-compatible)."""
     import httpx
+    from tenacity import (
+        AsyncRetrying,
+        RetryCallState,
+        retry_if_exception,
+        stop_after_attempt,
+        wait_exponential_jitter,
+    )
 
     endpoint = base_url.rstrip("/")
     # Default 300 s: a 27B model at 8192-ctx context under 2-slot contention can
@@ -55,6 +100,47 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
     # the library's public API.  If chunks are still timing out under very heavy
     # load, lower HARS_MEMORY_MAX_PARALLEL_INSERT (default 2) to reduce contention.
     timeout_seconds = float(os.environ.get("HARS_MEMORY_LLM_TIMEOUT_SECONDS", "300"))
+
+    # Bounded retry/backoff for transient endpoint failures (see
+    # _is_retryable_llm_error). This is deliberately NOT wired through
+    # LightRAG's own decorators: LightRAG's tenacity-based retry
+    # (lightrag.llm.openai.openai_complete_if_cache) is never invoked because
+    # this module hand-rolls its own httpx call instead of using that
+    # function, and LightRAG's priority_limit_async_func_call concurrency
+    # decorator (the "Error in decorated function" log line) has no retry
+    # logic at all — it only logs and propagates. Without a retry here, a
+    # single multi-second stall (e.g. llama-server's prompt-cache
+    # reorganisation pass) fails the whole document's merge stage.
+    #
+    # HARS_MEMORY_LLM_RETRY_ATTEMPTS total attempts (1 disables retrying).
+    # Worst-case added latency is bounded by (attempts - 1) *
+    # HARS_MEMORY_LLM_RETRY_BACKOFF_MAX_SECONDS, independent of
+    # timeout_seconds, so this cannot turn one slow call into an unbounded
+    # stall — see also LightRAG's own max_execution_timeout (~2x
+    # HARS_MEMORY_LLM_TIMEOUT_SECONDS) which bounds the total per-call budget
+    # from the outside regardless of what happens here.
+    retry_attempts = int(os.environ.get("HARS_MEMORY_LLM_RETRY_ATTEMPTS", "3"))
+    retry_backoff_initial_seconds = float(
+        os.environ.get("HARS_MEMORY_LLM_RETRY_BACKOFF_INITIAL_SECONDS", "1.0")
+    )
+    retry_backoff_max_seconds = float(
+        os.environ.get("HARS_MEMORY_LLM_RETRY_BACKOFF_MAX_SECONDS", "8.0")
+    )
+
+    def _log_retry(retry_state: RetryCallState) -> None:
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        next_action = retry_state.next_action
+        delay = next_action.sleep if next_action is not None else 0.0
+        logger.warning(
+            "LLM endpoint transient failure for model '%s' at %s "
+            "(attempt %d/%d): %s — retrying in %.1fs",
+            model,
+            endpoint,
+            retry_state.attempt_number,
+            retry_attempts,
+            exc,
+            delay,
+        )
 
     async def llm_func(
         prompt: str,
@@ -80,7 +166,7 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
         # JSON-serializable primitives to avoid TypeError in httpx serialization.
         payload.update({k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)})
 
-        try:
+        async def _post_once() -> str:
             async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 resp = await client.post(
                     f"{endpoint}/chat/completions",
@@ -99,6 +185,18 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
                     import re as _re
                     content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
                 return content
+
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(retry_attempts),
+            wait=wait_exponential_jitter(
+                initial=retry_backoff_initial_seconds, max=retry_backoff_max_seconds
+            ),
+            retry=retry_if_exception(_is_retryable_llm_error),
+            before_sleep=_log_retry,
+            reraise=True,
+        )
+        try:
+            return await retrying(_post_once)
         except httpx.HTTPError as exc:
             raise RuntimeError(
                 f"LLM endpoint unavailable for model '{model}' at {endpoint}: {exc}"
@@ -154,6 +252,17 @@ def create_lightrag(
     from lightrag import LightRAG  # type: ignore[import-not-found]
     from lightrag.prompt import PROMPTS  # type: ignore[import-not-found]
     from lightrag.utils import EmbeddingFunc, Tokenizer  # type: ignore[import-not-found]
+
+    # LightRAG's own `lightrag.utils` module runs `logging.getLogger("lightrag")
+    # .setLevel(logging.INFO)` unconditionally at import time, which can clobber
+    # a non-INFO HARS_MEMORY_LOG_LEVEL set by an earlier setup_logging() call
+    # (this factory is invoked lazily, on the first query, well after MCP
+    # server / index.py startup). Re-running setup_logging() here — idempotent,
+    # cheap — re-applies our level/handlers to the "lightrag" logger every
+    # time. See logging_setup._capture_lightrag_logger's docstring.
+    from tools.memory.server.logging_setup import setup_logging
+
+    setup_logging()
 
     from tools.memory.server.embedder import (
         embedding_dimension,

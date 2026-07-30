@@ -267,35 +267,15 @@ class TestApplySupersessionScoringReordersAndIsPure:
 
 
 class TestFusionEnvGating:
-    """Item: fuse() only applies supersession scoring when explicitly enabled."""
+    """Item (updated 2026-07-30): fuse() applies supersession scoring by
+    default; HARS_MEMORY_SUPERSESSION_SCORING=0 is the escape hatch back to
+    raw fused ranking. See fusion.py's HARS_MEMORY_SUPERSESSION_SCORING_ENV
+    comment for the measurement that justified this flip."""
 
-    def test_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_enabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from tools.memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
-        dense = {
-            "dep": ChannelHit(
-                score=0.9,
-                content=(
-                    "[Document: dep.md | Section: memory | Date: unknown]\n\n---\n"
-                    "name: DEPRECATED — old claim\n---\n**THIS MEMORY IS DEPRECATED.**"
-                ),
-                file_path="dep.md",
-            ),
-            "cur": ChannelHit(
-                score=0.5,
-                content="[Document: cur.md | Section: memory | Date: unknown]\n\nCurrent.",
-                file_path="cur.md",
-            ),
-        }
-        fused = fuse(dense, {}, alpha=1.0)
-        # Without the flag, raw dense ranking wins: "dep" (0.9) stays on top.
-        assert fused[0].chunk_id == "dep"
-
-    def test_enabled_via_env_reorders(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
-
-        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "1")
         # THREE dense hits (not two): with min-max normalization a two-item
         # channel's weaker hit always normalizes to exactly 0.0 (same as "no
         # hit"), which would make this assertion pass/fail for the wrong
@@ -319,4 +299,188 @@ class TestFusionEnvGating:
             "floor": ChannelHit(score=0.1, content="floor", file_path="floor.md"),
         }
         fused = fuse(dense, {}, alpha=1.0)
+        # No env var set at all -> default is ON: the deprecated doc is
+        # demoted even though it has the raw-highest dense score (0.9).
         assert fused[0].chunk_id == "cur"
+
+    def test_explicitly_disabled_via_env_restores_raw_ranking(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Escape hatch: HARS_MEMORY_SUPERSESSION_SCORING=0 must restore the
+        pre-flip behaviour (raw dense/sparse fused ranking, no rescoring)."""
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "0")
+        dense = {
+            "dep": ChannelHit(
+                score=0.9,
+                content=(
+                    "[Document: dep.md | Section: memory | Date: unknown]\n\n---\n"
+                    "name: DEPRECATED — old claim\n---\n**THIS MEMORY IS DEPRECATED.**"
+                ),
+                file_path="dep.md",
+            ),
+            "cur": ChannelHit(
+                score=0.5,
+                content="[Document: cur.md | Section: memory | Date: unknown]\n\nCurrent.",
+                file_path="cur.md",
+            ),
+        }
+        fused = fuse(dense, {}, alpha=1.0)
+        # Explicitly disabled: raw dense ranking wins, "dep" (0.9) stays on top.
+        assert fused[0].chunk_id == "dep"
+
+    def test_enabled_via_explicit_env_reorders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit HARS_MEMORY_SUPERSESSION_SCORING=1 must behave identically
+        to the (now identical) default — kept as its own test so an explicit
+        opt-in is pinned independently of the default value ever changing
+        again."""
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "1")
+        dense = {
+            "dep": ChannelHit(
+                score=0.9,
+                content=(
+                    "[Document: dep.md | Section: memory | Date: unknown]\n\n---\n"
+                    "name: DEPRECATED — old claim\n---\n**THIS MEMORY IS DEPRECATED.**"
+                ),
+                file_path="dep.md",
+            ),
+            "cur": ChannelHit(
+                score=0.5,
+                content="[Document: cur.md | Section: memory | Date: unknown]\n\nCurrent.",
+                file_path="cur.md",
+            ),
+            "floor": ChannelHit(score=0.1, content="floor", file_path="floor.md"),
+        }
+        fused = fuse(dense, {}, alpha=1.0)
+        assert fused[0].chunk_id == "cur"
+
+
+# ---------------------------------------------------------------------------
+# apply_marker_penalty_to_ranked_list — the rank-only (no numeric score)
+# extraction used by hars_longterm_memory_mcp.py's `_merge_context_with_fusion`
+# to make supersession-aware scoring apply to the FINAL MERGED context, not
+# just fuse()'s own fusion-channel input.
+# ---------------------------------------------------------------------------
+
+_DEPRECATED_CONTENT = (
+    "[Document: dep.md | Section: memory | Date: unknown]\n\n---\n"
+    "name: DEPRECATED — old claim\ndescription: x\n---\n"
+    "**THIS MEMORY IS DEPRECATED.**"
+)
+_CURRENT_CONTENT = "[Document: cur.md | Section: memory | Date: unknown]\n\nCurrent finding."
+_OTHER_CONTENT = "[Document: other.md | Section: session | Date: 2026-05-01]\n\nUnrelated body text."
+
+
+class TestIsSelfDeclaredDeprecatedPublicWrapper:
+    def test_matches_private_predicate_on_flagged_content(self) -> None:
+        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+
+        assert is_self_declared_deprecated(_DEPRECATED_CONTENT) is True
+
+    def test_matches_private_predicate_on_plain_content(self) -> None:
+        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+
+        assert is_self_declared_deprecated(_CURRENT_CONTENT) is False
+
+    def test_empty_content_is_false(self) -> None:
+        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+
+        assert is_self_declared_deprecated("") is False
+
+
+class TestApplyMarkerPenaltyToRankedList:
+    def test_demotes_flagged_candidate_below_unflagged_ones(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        # "dep" ranks FIRST going in (e.g. LightRAG's own graph/vector order,
+        # which carries no score at all and is never touched by fuse()'s own
+        # marker penalty) — must be demoted below both non-flagged candidates
+        # while their relative order is preserved.
+        ranked = [("dep.md", _DEPRECATED_CONTENT), ("cur.md", _CURRENT_CONTENT), ("other.md", _OTHER_CONTENT)]
+        assert apply_marker_penalty_to_ranked_list(ranked) == ["cur.md", "other.md", "dep.md"]
+
+    def test_no_flagged_candidates_preserves_original_order(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        ranked = [("a.md", _CURRENT_CONTENT), ("b.md", _OTHER_CONTENT)]
+        assert apply_marker_penalty_to_ranked_list(ranked) == ["a.md", "b.md"]
+
+    def test_all_flagged_candidates_preserves_original_order(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        ranked = [("dep1.md", _DEPRECATED_CONTENT), ("dep2.md", _DEPRECATED_CONTENT)]
+        assert apply_marker_penalty_to_ranked_list(ranked) == ["dep1.md", "dep2.md"]
+
+    def test_empty_list_returns_empty_list(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        assert apply_marker_penalty_to_ranked_list([]) == []
+
+    def test_multiple_unflagged_candidates_keep_relative_order_around_a_flagged_one(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        ranked = [
+            ("first.md", _CURRENT_CONTENT),
+            ("dep.md", _DEPRECATED_CONTENT),
+            ("second.md", _OTHER_CONTENT),
+        ]
+        assert apply_marker_penalty_to_ranked_list(ranked) == ["first.md", "second.md", "dep.md"]
+
+    def test_double_penalization_is_avoided_by_idempotency(self) -> None:
+        """The core "beware double-penalisation" requirement: composing this
+        pass on top of an UPSTREAM channel that may have already demoted the
+        SAME flagged candidate (e.g. fuse()'s own multiplicative attenuation,
+        applied inside hars_longterm_memory_mcp.py's fusion channel before
+        the merge stage ever runs) must not collapse its rank further than a
+        single pass would. Applying the function a second time to its own
+        output must be a no-op: f(f(x)) == f(x).
+        """
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        content_by_key = {"dep.md": _DEPRECATED_CONTENT, "cur.md": _CURRENT_CONTENT, "other.md": _OTHER_CONTENT}
+        ranked = [("dep.md", _DEPRECATED_CONTENT), ("cur.md", _CURRENT_CONTENT), ("other.md", _OTHER_CONTENT)]
+
+        once = apply_marker_penalty_to_ranked_list(ranked)
+        twice = apply_marker_penalty_to_ranked_list([(key, content_by_key[key]) for key in once])
+
+        assert once == twice == ["cur.md", "other.md", "dep.md"]
+
+    def test_returns_new_list_does_not_mutate_input(self) -> None:
+        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+
+        ranked = [("dep.md", _DEPRECATED_CONTENT), ("cur.md", _CURRENT_CONTENT)]
+        original = list(ranked)
+        apply_marker_penalty_to_ranked_list(ranked)
+        assert ranked == original
+
+
+class TestFusionPublicFlagHelpers:
+    """Public wrappers added to fusion.py so hars_longterm_memory_mcp.py's
+    merge-stage rescoring can read the SAME env-derived gate `fuse()` itself
+    uses, without duplicating (and risking drifting from) the two-flag logic.
+    """
+
+    def test_supersession_scoring_enabled_reads_master_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import supersession_scoring_enabled
+
+        monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
+        assert supersession_scoring_enabled() is True, "unset env -> default ON (flipped 2026-07-30)"
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "0")
+        assert supersession_scoring_enabled() is False, "explicit 0 is the escape hatch back to OFF"
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "1")
+        assert supersession_scoring_enabled() is True
+
+    def test_marker_penalty_enabled_requires_both_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import marker_penalty_enabled
+
+        monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
+        monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_MARKER_PENALTY", raising=False)
+        assert marker_penalty_enabled() is True, "both flags default on (master flipped 2026-07-30)"
+
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "0")
+        assert marker_penalty_enabled() is False, "master flag explicitly off -> disabled regardless of sub-flag"
+
+        monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
+        monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_MARKER_PENALTY", "0")
+        assert marker_penalty_enabled() is False, "master on (default) but sub-flag explicitly off -> disabled"

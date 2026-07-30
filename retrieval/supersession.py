@@ -153,6 +153,18 @@ def _is_self_declared_deprecated(content: str) -> bool:
     return name_says_deprecated or body_says_deprecated
 
 
+def is_self_declared_deprecated(content: str) -> bool:
+    """Public wrapper around the marker-penalty predicate above — the SAME
+    detector `apply_supersession_scoring`'s marker signal uses internally
+    (see module docstring, signal 1). Exposed for callers that need the raw
+    boolean rather than a score-attenuated `FusedChunk` — see
+    `apply_marker_penalty_to_ranked_list` below, and
+    `hars_longterm_memory_mcp.py`'s `_merge_context_with_fusion`, which is
+    the caller this was extracted for (item: supersession-aware scoring on
+    the FINAL MERGED context, not just the fusion channel's own input)."""
+    return _is_self_declared_deprecated(content)
+
+
 # --- signal 2: bounded, date-known-only recency discount -------------------
 
 # Linear ramp, not exponential: simple, monotonic, and its cap
@@ -246,10 +258,88 @@ def apply_supersession_scoring(
     return adjusted
 
 
+# --- rank-only entry point (no numeric score available) --------------------
+#
+# WHY this exists as a SEPARATE function from `apply_supersession_scoring`
+# above, rather than reusing it: `apply_supersession_scoring` is defined on
+# `fusion.FusedChunk`, which always carries a `fused_score` to multiplicatively
+# attenuate. The caller this function was extracted for
+# (`hars_longterm_memory_mcp.py`'s `_merge_context_with_fusion`, item:
+# supersession-aware scoring on the FINAL MERGED context) has no such score:
+# LightRAG's own mode-based context assembly (naive/local/global/hybrid) never
+# exposes a per-chunk score in its rendered `only_need_context=True` output —
+# only rank order (see `tools/memory/eval/channels.py`'s `lightrag_mode`,
+# which documents and relies on the identical constraint: `score=None` is
+# correct there, not a missing value). The merged list interleaves that
+# scoreless LightRAG order with the fusion channel's scored order via a plain
+# round-robin (`_round_robin_merge`), which itself only ever reasons about
+# POSITION, never magnitude — so by the time a candidate reaches this
+# function, there is no single numeric score left to multiply that would mean
+# the same thing for every candidate regardless of which channel it came
+# from. A rank-only setting has exactly one meaningful notion of "attenuate a
+# flagged candidate": rank it below every candidate that was NOT flagged.
+# That is a stable partition, not a multiplicative rescale.
+#
+# WHY a stable partition also SOLVES double-penalization for free (see the
+# task's explicit "beware double-penalisation" callout): the fusion channel,
+# when `HARS_MEMORY_SUPERSESSION_SCORING` is on, ALREADY applies
+# `apply_supersession_scoring`'s multiplicative attenuation to its OWN
+# ranking before this function ever runs — so a flagged candidate's position
+# in the merged list may already reflect that upstream demotion. Composing
+# two MULTIPLICATIVE passes on the same content would compound
+# (0.3 * 0.3 = 0.09, collapsing the rank further than either pass alone
+# intends — the exact failure mode the task warns about). A stable partition
+# does not have this problem: applying it a second time to its own output
+# (or to an input where the same logical demotion already happened via a
+# different mechanism upstream) is a NO-OP — every flagged candidate is
+# already in the trailing group, in the same relative order, so re-applying
+# the partition changes nothing further. This is IDEMPOTENT BY CONSTRUCTION:
+# f(f(x)) == f(x). No bookkeeping (e.g. threading a "was this candidate
+# already penalized upstream" flag between `fusion.fuse()` and this call) is
+# needed to prevent double-penalization — idempotency makes that bookkeeping
+# unnecessary. The only observable effect of composing with an upstream pass
+# is that a flagged candidate can end up demoted by (at most) one extra
+# position relative to other *already-flagged* candidates it is tied with in
+# the trailing group — never by an extra multiplicative factor.
+#
+# This is a STRONGER demotion than `apply_supersession_scoring`'s 0.3x (which
+# can still let a flagged candidate beat a much-weaker unflagged one): a
+# flagged candidate here always ranks last among survivors. That tradeoff is
+# deliberately accepted for THIS caller only: the merged list is the final,
+# user-visible top-k the calling agent reads as ground truth, not an
+# intermediate ranking meant to preserve graded relevance for a downstream
+# reranker — "below everything genuine" is the correct terminal answer for a
+# self-declared-stale document at that point, not a graded discount.
+def apply_marker_penalty_to_ranked_list(ranked: list[tuple[str, str]]) -> list[str]:
+    """Stably partition a RANK-ORDERED `(candidate_key, content)` list so
+    every self-declared-deprecated candidate sorts after every candidate that
+    is not, preserving each group's relative order otherwise. Returns just
+    the reordered `candidate_key`s (the merged list's file paths).
+
+    Recency-discount has NO analogue here (deliberately): it is a continuous
+    magnitude ("older but still valid" is only ever a MINOR tiebreaker — see
+    `_recency_factor`'s cap), which does not translate into a binary
+    fits-in-a-partition decision the way marker-penalty's already-boolean
+    signal does. It also defaults OFF in `fuse()` with zero measured benefit
+    on this corpus (see `fusion.py`'s own default-selection comment) — there
+    is nothing to compose here even in principle. Only the marker signal is
+    wired into this rank-only path.
+    """
+    if not ranked:
+        return []
+    kept: list[str] = []
+    flagged: list[str] = []
+    for key, content in ranked:
+        (flagged if _is_self_declared_deprecated(content) else kept).append(key)
+    return kept + flagged
+
+
 __all__ = [
     "MARKER_ATTENUATION",
     "MAX_RECENCY_DISCOUNT",
     "RECENCY_SATURATION_DAYS",
     "extract_chunk_date",
     "apply_supersession_scoring",
+    "is_self_declared_deprecated",
+    "apply_marker_penalty_to_ranked_list",
 ]
