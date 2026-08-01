@@ -293,14 +293,24 @@ class TestFusionDeterministicTieBreak:
         epsilon-quantized near-tie handling for NON-exact ties is a
         property of `fuse()`'s own ranking, not (yet) guaranteed to survive
         supersession post-processing — flagged, not silently masked.
+
+        `HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL` forced to `off` too: this
+        test uses `sparse_hits={}`, making every dense candidate
+        single-channel-exclusive, which (at the 2026-08-01 default,
+        `zscore_tiebreak`) would insert a z-score secondary key BEFORE
+        chunk_id — a real, separate signal, out of scope for what this test
+        exercises (the quantized-epsilon + chunk_id fallback mechanism
+        itself, independent of that later feature).
         """
         from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV,
             HARS_MEMORY_SUPERSESSION_SCORING_ENV,
             ChannelHit,
             fuse,
         )
 
         monkeypatch.setenv(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "0")
+        monkeypatch.setenv(HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV, "off")
         noise = 1e-9  # normalizes to ~2e-10 apart over this pool's 10.0 span
         dense_hits = {
             "ceiling": ChannelHit(score=10.0, content="c", file_path="ceiling.md"),
@@ -336,6 +346,7 @@ class TestFusionDeterministicTieBreak:
 
     def test_epsilon_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV,
             HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
             HARS_MEMORY_SUPERSESSION_SCORING_ENV,
             ChannelHit,
@@ -345,6 +356,11 @@ class TestFusionDeterministicTieBreak:
         # Isolates fuse()'s own quantized tie-break from the downstream
         # raw-score re-sort — see the near-tie test above for why.
         monkeypatch.setenv(HARS_MEMORY_SUPERSESSION_SCORING_ENV, "0")
+        # sparse_hits={} below makes every candidate single-channel-exclusive
+        # -- forced `off` to isolate the epsilon+chunk_id mechanism itself
+        # from the (2026-08-01 default) zscore_tiebreak secondary key. See
+        # the near-tie test above for the same reasoning.
+        monkeypatch.setenv(HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV, "off")
 
         # A real (non-noise) gap of 0.01 must still resolve to the
         # HIGHER-scored chunk when epsilon is small...

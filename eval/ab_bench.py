@@ -42,12 +42,13 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import statistics
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -74,6 +75,8 @@ from tools.memory.eval.metrics import (
     supersession_error_rate,
     supersession_violated,
 )
+from tools.memory.retrieval import fusion as fusion_config
+from tools.memory.server.lightrag_init import DEFAULT_WORKING_DIR as _DEFAULT_LIGHTRAG_WORKING_DIR
 
 logger = logging.getLogger("memory.eval.ab_bench")
 
@@ -82,6 +85,191 @@ DEFAULT_TOP_K = 10
 DEFAULT_K_VALUES: tuple[int, ...] = (1, 3, 5, 10)
 DEFAULT_RERANK_MODEL = "cross-encoder/ettin-reranker-68m-v1"
 ANSWERABLE_TYPES = frozenset({"identifier", "conceptual", "multihop", "supersession"})
+
+# ---------------------------------------------------------------------------
+# Config provenance & --strict-env (2026-08-01).
+#
+# BACKGROUND: a benchmark run reported recall@1=0.4815 and was believed to
+# be a same-config re-measurement showing cross-session drift. It was not:
+# `HARS_MEMORY_HYBRID_ALPHA=0.0` had been left exported in the shell
+# (almost certainly leftover from an `alpha-sweep` session, which legitimately
+# iterates that variable's conceptual value across many manual invocations),
+# and this module's own `main()` silently fell back to it whenever `--alpha`
+# was omitted. `_print_ab_table()` never showed the alpha actually used, so
+# nothing in the output could have caught it. This section exists to make
+# that failure mode structurally impossible to repeat, not just document it
+# after the fact:
+#
+#   1. Every HARS_MEMORY_* knob that can change `fuse()`'s scoring output is
+#      echoed — value AND provenance (cli/env/default) — in both the printed
+#      table header and the top level of the JSON report
+#      (`_build_config_snapshot` / `_print_config_snapshot`).
+#   2. `--strict-env` (default ON — see the class docstring below for why)
+#      refuses to run at all while any of those knobs is present in the
+#      ambient environment without an explicit CLI override, forcing the
+#      leak to be caught at invocation time instead of silently accepted
+#      and reported as a trustworthy number.
+#
+# SCOPE: `FUSION_SCORING_ENV_VARS` below is deliberately restricted to the
+# knobs `tools/memory/retrieval/fusion.py`'s `fuse()` itself reads (plus
+# this module's own `HARS_MEMORY_HYBRID_ALPHA` fallback) — i.e. vars that
+# can silently steer the SAME backend/index/model's scoring math without
+# any other visible symptom (no crash, no obviously-wrong output shape).
+# Backend/model-selection knobs consulted deep in the constrained
+# server/lightrag_init.py, server/embedder.py, server/reranker.py modules
+# (HARS_MEMORY_EMBED_MODEL, HARS_MEMORY_QDRANT_URL, HARS_MEMORY_RERANK_MODEL,
+# HARS_MEMORY_LLM_*, ...) are a different risk class: drifting them either
+# fails loudly (wrong Qdrant collection/model dimension mismatch) or is
+# already surfaced through this module's own explicit --rerank-model/
+# --hf-cache-dir CLI flags. Enumerating and gating all of them here would
+# dilute the signal this feature exists to give with noise unrelated to the
+# incident it fixes; `HARS_MEMORY_INDEX_DIR` is a middle case (this module's
+# OWN code reads it directly — see `_resolve_index_dir` — and it is always
+# echoed for reproducibility) but is deliberately EXCLUDED from the strict
+# pollution check: pointing at a specific corpus index is required, normal
+# usage for every real invocation, not a leaked leftover from an unrelated
+# subcommand, so blocking on its ambient presence would break the common
+# case instead of catching a hazard.
+HARS_MEMORY_HYBRID_ALPHA_ENV = "HARS_MEMORY_HYBRID_ALPHA"
+HARS_MEMORY_INDEX_DIR_ENV = "HARS_MEMORY_INDEX_DIR"
+
+FUSION_SCORING_ENV_VARS: tuple[str, ...] = (
+    HARS_MEMORY_HYBRID_ALPHA_ENV,
+    fusion_config.HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
+    fusion_config.HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV,
+    fusion_config.HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV,
+    fusion_config.HARS_MEMORY_SUPERSESSION_SCORING_ENV,
+    fusion_config.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV,
+    fusion_config.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_ENV,
+)
+
+# env_var -> zero-arg getter returning that knob's CURRENT effective value
+# (fusion.py's own public accessors, each reading os.environ fresh on every
+# call — see fusion.py's "config-provenance reporting" additions). Every
+# entry here except HARS_MEMORY_HYBRID_ALPHA_ENV (resolved separately by
+# `_resolve_alpha`, since it also accepts a CLI override this module owns).
+_FUSION_KNOB_GETTERS: dict[str, Callable[[], Any]] = {
+    fusion_config.HARS_MEMORY_FUSION_TIE_EPSILON_ENV: fusion_config.fusion_tie_epsilon,
+    fusion_config.HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV: fusion_config.single_channel_signal_mode,
+    fusion_config.HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV: fusion_config.agreement_bonus,
+    fusion_config.HARS_MEMORY_SUPERSESSION_SCORING_ENV: fusion_config.supersession_scoring_enabled,
+    fusion_config.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV: fusion_config.marker_penalty_sub_flag,
+    fusion_config.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV: fusion_config.recency_discount_sub_flag,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_ENV: fusion_config.ripgrep_channel_enabled,
+}
+
+
+@dataclass(frozen=True)
+class ConfigValue:
+    """One resolved HARS_MEMORY_* knob: its effective value and where it
+    came from — `"cli"` (an explicit flag beat everything else), `"env"`
+    (no flag; the ambient environment supplied it), or `"default"` (neither;
+    the built-in default applied). This is the provenance the 2026-07-30/31
+    incident's own printed table lacked."""
+
+    value: Any
+    source: str  # "cli" | "env" | "default"
+
+
+def _resolve_alpha(cli_alpha: float | None) -> ConfigValue:
+    """Pure precedence resolution (cli > env > default) for
+    `HARS_MEMORY_HYBRID_ALPHA` — reads `os.environ` but never writes it, so
+    resolving alpha for one subcommand cannot leak into another resolution
+    later in the same process (see TestNoCrossCommandAlphaLeakage in
+    tools/memory/tests/test_ab_bench.py, which calls this twice in one
+    process simulating an `alpha-sweep` session followed by an `ab` run)."""
+    if cli_alpha is not None:
+        return ConfigValue(value=cli_alpha, source="cli")
+    raw = os.environ.get(HARS_MEMORY_HYBRID_ALPHA_ENV)
+    if raw is not None:
+        return ConfigValue(value=float(raw), source="env")
+    return ConfigValue(value=fusion_config.DEFAULT_HYBRID_ALPHA, source="default")
+
+
+def _resolve_fusion_knobs() -> dict[str, ConfigValue]:
+    """Resolve every `FUSION_SCORING_ENV_VARS` entry except alpha (which
+    `_resolve_alpha` owns, since it alone has a CLI override) via
+    fusion.py's own fresh-read public accessors."""
+    return {
+        env_var: ConfigValue(
+            value=getter(), source="env" if env_var in os.environ else "default"
+        )
+        for env_var, getter in _FUSION_KNOB_GETTERS.items()
+    }
+
+
+def _resolve_index_dir() -> ConfigValue:
+    raw = os.environ.get(HARS_MEMORY_INDEX_DIR_ENV)
+    if raw is not None:
+        return ConfigValue(value=raw, source="env")
+    return ConfigValue(value=_DEFAULT_LIGHTRAG_WORKING_DIR, source="default")
+
+
+def _build_config_snapshot(alpha: ConfigValue, *, strict_env: bool) -> dict[str, Any]:
+    """The full effective-configuration snapshot for one invocation —
+    printed in the table header and written at the top level of the JSON
+    report (see module docstring section above)."""
+    snapshot: dict[str, Any] = {
+        "alpha": {"value": alpha.value, "source": alpha.source},
+    }
+    for env_var, cv in _resolve_fusion_knobs().items():
+        snapshot[env_var] = {"value": cv.value, "source": cv.source}
+    index_dir = _resolve_index_dir()
+    snapshot[HARS_MEMORY_INDEX_DIR_ENV] = {"value": index_dir.value, "source": index_dir.source}
+    snapshot["strict_env"] = strict_env
+    return snapshot
+
+
+def _print_config_snapshot(snapshot: dict[str, Any]) -> None:
+    print("\n" + "=" * 100)
+    print("EFFECTIVE CONFIGURATION  (value  [source: cli|env|default])")
+    print("=" * 100)
+    for key, info in snapshot.items():
+        if key == "strict_env":
+            print(f"{'strict_env':<48} = {info}")
+            continue
+        print(f"{key:<48} = {info['value']!r:<12} [{info['source']}]")
+    print()
+
+
+def _check_strict_env(*, alpha_cli_overridden: bool) -> None:
+    """`--strict-env` enforcement: refuse to run while any
+    `FUSION_SCORING_ENV_VARS` knob is set in the ambient environment without
+    an explicit CLI override (today, only `ab`'s `--alpha` provides one —
+    `alpha-sweep`/`token-budget-sweep` have no such flag, so
+    `alpha_cli_overridden` is always False for them: an ambient
+    `HARS_MEMORY_HYBRID_ALPHA` is flagged for THEM too, even though neither
+    subcommand reads it, on purpose — leaving it set is exactly the hygiene
+    lapse this guard exists to force a fix for before it can bite a later
+    `ab` run in the same shell). This is the guard the 2026-07-30/31
+    incident needed: `HARS_MEMORY_HYBRID_ALPHA` left exported from an
+    `alpha-sweep` session silently became "the" measured alpha for a later,
+    unrelated `ab` run, and nothing in that run's output could have shown
+    it."""
+    cli_overridden = {HARS_MEMORY_HYBRID_ALPHA_ENV} if alpha_cli_overridden else set()
+    polluted = sorted(
+        v for v in FUSION_SCORING_ENV_VARS if v in os.environ and v not in cli_overridden
+    )
+    if not polluted:
+        return
+    details = "\n".join(f"  {v}={os.environ[v]!r}" for v in polluted)
+    raise SystemExit(
+        "--strict-env refused to run: the following HARS_MEMORY_* scoring "
+        f"knob(s) are set in the ambient environment:\n{details}\n\n"
+        "This is the exact failure mode that produced a wrong 'official' "
+        "measurement on 2026-07-30/31 (HARS_MEMORY_HYBRID_ALPHA=0.0 leaked "
+        "from an alpha-sweep session into a later `ab` run with no CLI "
+        "override and no way to see it in the output).\n"
+        "Fix one of:\n"
+        f"  unset {' '.join(polluted)}\n"
+        "  pass --alpha explicitly (covers HARS_MEMORY_HYBRID_ALPHA only)\n"
+        "  run under `env -i <allowlist> uv run ...`\n"
+        "  pass --no-strict-env to bypass for an exploratory run (the "
+        "resulting number is not a trustworthy 'official' measurement)."
+    )
+
+
 ALL_CONFIGS = (
     "dense_only",
     "hybrid_bm25",
@@ -329,8 +517,6 @@ def _build_rerank_func(model_name: str, hf_cache_dir: str) -> Any:
 
 
 async def _run_ab(args: argparse.Namespace) -> int:
-    import os
-
     queries = load_queries(args.queries)
     logger.info("Loaded %d queries from %s", len(queries), args.queries)
 
@@ -340,7 +526,7 @@ async def _run_ab(args: argparse.Namespace) -> int:
     rerank_func = None
     try:
         if any(c in {"hybrid_bm25", "hybrid_bm25_rerank"} for c in configs):
-            working_dir = os.environ.get("HARS_MEMORY_INDEX_DIR", "")
+            working_dir = os.environ.get(HARS_MEMORY_INDEX_DIR_ENV, "")
             bm25_index = await _build_bm25(working_dir, args.bm25_cache_dir)
         if "hybrid_bm25_rerank" in configs:
             rerank_func = _build_rerank_func(args.rerank_model, args.hf_cache_dir)
@@ -391,12 +577,14 @@ async def _run_ab(args: argparse.Namespace) -> int:
     finally:
         await rag.finalize_storages()
 
+    config_snapshot = _build_config_snapshot(args.resolved_alpha, strict_env=args.strict_env)
     report = {
         "queries_file": str(args.queries),
         "n_queries": len(queries),
         "top_k": args.top_k,
         "k_values": list(args.k_values),
         "alpha": args.alpha,
+        "config_snapshot": config_snapshot,
         "configs": configs,
         "results": results,
         "embed_cache_stats": embed_stats_fn(),
@@ -409,6 +597,7 @@ async def _run_ab(args: argparse.Namespace) -> int:
         args.dump_hits.parent.mkdir(parents=True, exist_ok=True)
         args.dump_hits.write_text(json.dumps(per_query_raw, indent=2), encoding="utf-8")
 
+    _print_config_snapshot(config_snapshot)
     _print_ab_table(results, args.k_values)
     return 0
 
@@ -445,12 +634,10 @@ def _print_ab_table(results: dict[str, dict[str, Any]], k_values: tuple[int, ...
 
 
 async def _run_alpha_sweep(args: argparse.Namespace) -> int:
-    import os
-
     queries = load_queries(args.queries)
     rag, _ = await _build_rag()
     try:
-        working_dir = os.environ.get("HARS_MEMORY_INDEX_DIR", "")
+        working_dir = os.environ.get(HARS_MEMORY_INDEX_DIR_ENV, "")
         bm25_index = await _build_bm25(working_dir, args.bm25_cache_dir)
 
         sweep: dict[float, dict[str, Any]] = {}
@@ -483,6 +670,14 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
     values = [sweep[a].get(metric_key, float("nan")) for a in sweep]
     sensitivity = max(values) - min(values)
 
+    # `alpha` here is ALWAYS the CLI `--alphas` list (or its argparse
+    # default), never `HARS_MEMORY_HYBRID_ALPHA` — this subcommand does not
+    # read that env var anywhere in its loop above (see `_check_strict_env`'s
+    # docstring for why an ambient value is still flagged regardless).
+    config_snapshot = _build_config_snapshot(
+        ConfigValue(value=list(args.alphas), source="cli (--alphas; HARS_MEMORY_HYBRID_ALPHA not read)"),
+        strict_env=args.strict_env,
+    )
     report = {
         "queries_file": str(args.queries),
         "n_queries": len(queries),
@@ -490,6 +685,7 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
         "best_alpha": best_alpha,
         "best_value": sweep[best_alpha].get(metric_key),
         "sensitivity_spread": round(sensitivity, 4),
+        "config_snapshot": config_snapshot,
         "sweep": {str(a): sweep[a] for a in sweep},
     }
     if args.report:
@@ -497,6 +693,7 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
         args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
         logger.info("Wrote alpha-sweep report: %s", args.report)
 
+    _print_config_snapshot(config_snapshot)
     print("\n" + "=" * 72)
     print(f"ALPHA SWEEP (optimizing {metric_key}, hybrid_bm25 channel)")
     print("=" * 72)
@@ -508,7 +705,7 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
               f"{agg.get('recall@10', float('nan')):>9.4f} | {agg.get('mrr', float('nan')):>.4f}{marker}")
     print(f"\nOptimum alpha = {best_alpha} ({metric_key}={sweep[best_alpha].get(metric_key):.4f})")
     print(f"Sensitivity spread ({metric_key} max-min across sweep) = {sensitivity:.4f}")
-    print(f"Shipped default (fusion.DEFAULT_HYBRID_ALPHA) = 0.5")
+    print(f"Shipped default (fusion.DEFAULT_HYBRID_ALPHA) = {fusion_config.DEFAULT_HYBRID_ALPHA}")
     print()
     return 0
 
@@ -559,11 +756,19 @@ async def _run_token_budget_sweep(args: argparse.Namespace) -> int:
     finally:
         await rag.finalize_storages()
 
+    # This subcommand never calls `fuse()` (LightRAG-mode configs only —
+    # see LIGHTRAG_MODES dispatch in `run_config`), so `alpha` is unused
+    # dead weight in the calls above; echoed as such for honesty.
+    config_snapshot = _build_config_snapshot(
+        ConfigValue(value=0.5, source="unused (no fuse() call in this subcommand)"),
+        strict_env=args.strict_env,
+    )
     report = {
         "queries_file": str(args.queries),
         "n_queries": len(queries),
         "modes": modes,
         "budgets": [{"max_entity_tokens": e, "max_relation_tokens": r} for e, r in budgets],
+        "config_snapshot": config_snapshot,
         "sweep": sweep,
     }
     if args.report:
@@ -571,6 +776,7 @@ async def _run_token_budget_sweep(args: argparse.Namespace) -> int:
         args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
         logger.info("Wrote token-budget-sweep report: %s", args.report)
 
+    _print_config_snapshot(config_snapshot)
     print("\n" + "=" * 92)
     print("TOKEN-BUDGET SWEEP (QueryParam.max_entity_tokens / max_relation_tokens)")
     print("=" * 92)
@@ -601,6 +807,19 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         "--bm25-cache-dir", type=str,
         default="/tmp/hars_memory_bm25_eval",
     )
+    p.add_argument(
+        "--strict-env",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Refuse to run if any FUSION_SCORING_ENV_VARS knob "
+            f"({', '.join(FUSION_SCORING_ENV_VARS)}) is set in the ambient "
+            "environment without an explicit CLI override (default: True — "
+            "see this module's 'Config provenance & --strict-env' docstring "
+            "section for why this defaults ON. Pass --no-strict-env for an "
+            "exploratory run where a polluted shell is acceptable)."
+        ),
+    )
 
 
 def main() -> None:
@@ -610,7 +829,17 @@ def main() -> None:
     p_ab = sub.add_parser("ab", help="Compare configurations on the labeled query set")
     _add_common_args(p_ab)
     p_ab.add_argument("--configs", nargs="+", default=list(ALL_CONFIGS), choices=list(ALL_CONFIGS))
-    p_ab.add_argument("--alpha", type=float, default=None, help="Fusion alpha for hybrid_bm25* configs (default: HARS_MEMORY_HYBRID_ALPHA env or 0.5)")
+    p_ab.add_argument(
+        "--alpha", type=float, default=None,
+        help=(
+            "Fusion alpha for hybrid_bm25* configs. Precedence: this flag > "
+            f"{HARS_MEMORY_HYBRID_ALPHA_ENV} env var > built-in default "
+            f"({fusion_config.DEFAULT_HYBRID_ALPHA}). The resolved value and "
+            "which of the three supplied it are always echoed in the "
+            "printed table header and JSON report's config_snapshot — see "
+            "--strict-env to refuse ambiguous ambient-env runs entirely."
+        ),
+    )
     p_ab.add_argument("--rerank-model", type=str, default=DEFAULT_RERANK_MODEL)
     p_ab.add_argument("--hf-cache-dir", type=str, default="")
     p_ab.add_argument("--dump-hits", type=Path, default=None, help="Optional: dump raw per-query ranked file_paths per config")
@@ -650,14 +879,26 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     if args.command == "ab":
-        import os
-
-        if args.alpha is None:
-            args.alpha = float(os.environ.get("HARS_MEMORY_HYBRID_ALPHA", "0.5"))
+        # `_resolve_alpha` is pure (reads os.environ, never writes it) —
+        # resolving here, once, right after argparse and before
+        # `_check_strict_env`/dispatch, guarantees the printed/reported
+        # provenance matches exactly what `_run_ab` uses, and that nothing
+        # from a prior in-process command (e.g. `alpha-sweep`, if a future
+        # caller ever drives this module's commands back-to-back in one
+        # process — see TestNoCrossCommandAlphaLeakage) can influence it.
+        resolved_alpha = _resolve_alpha(args.alpha)
+        args.resolved_alpha = resolved_alpha
+        args.alpha = resolved_alpha.value
+        if args.strict_env:
+            _check_strict_env(alpha_cli_overridden=resolved_alpha.source == "cli")
         raise SystemExit(asyncio.run(_run_ab(args)))
     elif args.command == "alpha-sweep":
+        if args.strict_env:
+            _check_strict_env(alpha_cli_overridden=False)
         raise SystemExit(asyncio.run(_run_alpha_sweep(args)))
     elif args.command == "token-budget-sweep":
+        if args.strict_env:
+            _check_strict_env(alpha_cli_overridden=False)
         raise SystemExit(asyncio.run(_run_token_budget_sweep(args)))
     else:
         raise SystemExit(f"Unknown command: {args.command}")
