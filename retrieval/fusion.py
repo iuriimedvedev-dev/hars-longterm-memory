@@ -140,6 +140,26 @@ def marker_penalty_enabled() -> bool:
         HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV, default=True
     )
 
+
+def marker_penalty_sub_flag() -> bool:
+    """Public: the RAW `HARS_MEMORY_SUPERSESSION_MARKER_PENALTY` sub-flag
+    value on its own (default True), independent of the master
+    `HARS_MEMORY_SUPERSESSION_SCORING` gate — unlike `marker_penalty_enabled`
+    above (which ANDs both), this answers "what does this one env var
+    resolve to" in isolation. Added for config-provenance reporting
+    (tools/memory/eval/ab_bench.py's config echo), which needs each knob's
+    own resolved value, not a combined effective-behaviour boolean."""
+    return _sub_flag_enabled(HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV, default=True)
+
+
+def recency_discount_sub_flag() -> bool:
+    """Public: the RAW `HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT` sub-flag
+    value on its own (default False) — see `marker_penalty_sub_flag` above
+    for why this is a separate accessor from a combined "is it actually
+    firing right now" boolean."""
+    return _sub_flag_enabled(HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV, default=False)
+
+
 # UNTUNED DEFAULT. Bruch et al. 2022 (and the production writeup cited above)
 # tune alpha on a labeled query/relevance set; no such set exists yet for this
 # corpus. 0.5 is a neutral midpoint, not a measured optimum. Override via
@@ -248,6 +268,15 @@ def _fusion_tie_epsilon() -> float:
     return value
 
 
+def fusion_tie_epsilon() -> float:
+    """Public: current effective `HARS_MEMORY_FUSION_TIE_EPSILON` (default
+    `_DEFAULT_FUSION_TIE_EPSILON`), read fresh on every call — same
+    convention as `supersession_scoring_enabled()` above. Added for
+    config-provenance reporting (tools/memory/eval/ab_bench.py's config
+    echo)."""
+    return _fusion_tie_epsilon()
+
+
 def _deterministic_sort_key(chunk: "FusedChunk", epsilon: float) -> tuple[float, str]:
     """`(quantized_score, chunk_id)` — a true total order (see design note
     above): `chunk_id` is unique within one `fuse()` call, so this key has
@@ -258,6 +287,253 @@ def _deterministic_sort_key(chunk: "FusedChunk", epsilon: float) -> tuple[float,
     """
     bucket = round(chunk.fused_score / epsilon) if epsilon > 0.0 else chunk.fused_score
     return (bucket, chunk.chunk_id)
+
+
+# ---------------------------------------------------------------------------
+# Single-channel information-loss fix (2026-08-01).
+#
+# PROBLEM (distinct from the reproducibility bug the tie-break above fixed):
+# a chunk found by exactly ONE channel has its OTHER norm hard-defaulted to
+# 0.0 (`.get(chunk_id, 0.0)`), and per-query min-max maps that channel's own
+# BEST returned score to exactly 1.0 regardless of how decisively it beat
+# the rest of that channel's pool. So the top dense-only chunk always gets
+# `fused_score == alpha` and the top sparse-only chunk always gets
+# `fused_score == (1 - alpha)` — at the shipped alpha=0.5 these are the
+# SAME number, EVERY query that has both an exclusive-dense and an
+# exclusive-sparse top hit (confirmed empirically: 42/2233, 1.9%, of
+# adjacent-rank pairs across the 46-query labeled set — see id04). The
+# `chunk_id` tie-break above makes this reproducible, not correct: which of
+# the two wins carries zero relevance signal.
+#
+# This is the SAME degeneracy already documented and worked around for the
+# no-answer confidence marker (NO_ANSWER_DENSE_SCORE_THRESHOLD,
+# plugins/hars-longterm-memory/scripts/hars_longterm_memory_mcp.py) — that
+# marker deliberately reads the RAW (pre-normalization) dense score for
+# exactly this reason: min-max normalization is a range-flattening
+# transform a magnitude-sensitive judgment cannot survive.
+#
+# THREE variants were implemented and measured against the 46-query
+# tools/memory/eval/retrieval_queries.yaml labeled set (hybrid_bm25
+# channel, top_k=10, pool_multiplier=3, alpha=0.5 — `ab_bench.py ab`,
+# unmodified) — see the report this comment was written from for the full
+# table and per-type breakdown of all three:
+#
+#   zscore_tiebreak: secondary tie-break key (chunk_id stays tertiary) —
+#     a chunk found by exactly one channel gets a z-score confidence
+#     ((raw_score - channel_pool_mean) / channel_pool_std) computed from
+#     that channel's OWN candidate pool, used ONLY to break exact
+#     fused_score ties, never blended into fused_score itself. Deliberately
+#     NOT the same design min-max normalization already rejected z-score
+#     for (module docstring "WHY min-max, not z-score") — that rejection
+#     was about the PRIMARY alpha blend, where z-score's instability on
+#     small/degenerate pools and unbounded range are real problems; neither
+#     applies to a pure secondary ordering key restricted to the exact-tie
+#     case.
+#   agreement_bonus: chunks found by BOTH channels get a small bounded
+#     additive bonus to fused_score (HARS_MEMORY_FUSION_AGREEMENT_BONUS,
+#     default 0.05) — does not touch single-channel-only chunks at all, so
+#     it cannot by itself resolve an exclusive-dense-vs-exclusive-sparse
+#     tie (neither candidate is a both-channel hit); measured as an
+#     independent hypothesis, not a fix for the specific id04 shape.
+#   impute_floor: a chunk ABSENT from a channel entirely gets that
+#     channel's norm imputed at a value strictly BELOW the observed [0, 1]
+#     range (`-1 / (pool_size + 1)`, i.e. "one evenly-spaced rank below the
+#     worst candidate this channel actually returned") instead of the
+#     current 0.0, which conflates "this channel's genuine worst-ranked
+#     hit" with "this channel never even considered the document." At
+#     alpha=0.5 this does NOT break the flagship dense-top-exclusive vs
+#     sparse-top-exclusive tie by itself (both sides get an equal, opposite
+#     imputed penalty, symmetric at alpha=0.5) but changes relative order
+#     among non-top single-channel chunks and interacts with the
+#     supersession re-scoring pass.
+#
+# MEASUREMENT CORRECTION (2026-08-01, redo): an earlier pass at this
+# comparison was invalidated after the fact — it ran with
+# `HARS_MEMORY_HYBRID_ALPHA=0.0` left exported in the shell (leftover from
+# an `alpha-sweep` session), NOT the `alpha=0.5` this comment block above
+# claims. At alpha=0.0 the dense channel contributes nothing to
+# `fused_score` at all, so a dense-exclusive candidate's blended score is
+# `0*d_norm + 1*s_norm == s_norm`; every dense-exclusive chunk with NO
+# sparse hit collapses to exactly 0.0 regardless of how decisively dense
+# ranked it, and those zeros cluster at the BOTTOM of the ranking, never
+# adjacent to a decisive sparse-exclusive TOP hit. The flagship collision
+# this whole feature targets is therefore STRUCTURALLY IMPOSSIBLE to observe
+# at alpha=0.0 — the earlier "0.15% of adjacent pairs, zero
+# dense-exclusive-vs-sparse-exclusive collisions, all three variants make no
+# difference" conclusion was an artifact of that broken configuration, not a
+# property of this corpus.
+#
+# Redone under an explicitly-controlled environment (`env -i` with an
+# allowlist; `ab_bench.py ab --configs hybrid_bm25 --alpha 0.5`, this
+# module's own new `--strict-env`/config-echo confirming `alpha=0.5 [cli]`
+# in the printed header and JSON report — tools/memory/eval/ab_bench.py),
+# same 46-query labeled set, same index:
+#
+#   collision rate: 42/2233 (1.879%) adjacent-rank pairs are exact ties —
+#     MATCHES the tie-break section's own historical 42/2233 figure above
+#     exactly (that number WAS measured at alpha=0.5, unlike the single-
+#     channel-signal comparison). Of those 42 ties, 41 (97.6%) are
+#     specifically dense-exclusive-vs-sparse-exclusive — the flagship case,
+#     NOT the "zero" the alpha=0.0 measurement reported.
+#
+#   variant          recall@1  recall@10  ndcg@10  mrr     supersession_err
+#   off (baseline)    0.5324    0.8102     0.7075   0.6948   0.1667
+#   zscore_tiebreak    0.5602    0.8102     0.7178   0.7086   0.1667
+#   agreement_bonus    0.5324    0.8102     0.7075   0.6948   0.1667
+#   impute_floor       0.5324    0.8102     0.7075   0.6948   0.1667
+#
+#   zscore_tiebreak is a CLEAN WIN: recall@1 +0.0278, ndcg@10 +0.0103, mrr
+#   +0.0138, zero regression on any metric or query type. Per-type
+#   breakdown: the entire effect is on `identifier` queries (n=10) —
+#   recall@1 0.65->0.75, ndcg@10 0.7633->0.8002, mrr 0.7611->0.8111;
+#   conceptual/multihop/supersession/no_answer are BYTE-IDENTICAL to `off`
+#   in every field. This is exactly the deterministic, hash-seed-independent
+#   version of the "high" bucket from the tie-break section's own
+#   PYTHONHASHSEED bimodal-split discovery above (id04:
+#   recall@1=0.5602/ndcg@10=0.7178/mrr=0.7086 was already known to be
+#   reachable by chunk_id luck under some seeds — zscore_tiebreak makes it
+#   the reachable-by-DESIGN outcome, every time, confirmed bit-identical
+#   across PYTHONHASHSEED=0/1/7/42).
+#
+#   agreement_bonus and impute_floor remain BYTE-IDENTICAL to `off` even at
+#   the corrected alpha=0.5 — this part of the original conclusion was
+#   NOT an alpha=0.0 artifact and holds: agreement_bonus never touches a
+#   single-channel-exclusive chunk by construction (see its own docstring),
+#   and impute_floor's imputed penalty is exactly symmetric at alpha=0.5 (see
+#   its own docstring) — both structurally cannot resolve the flagship tie
+#   regardless of alpha.
+#
+# See HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV below for the resulting
+# default flip.
+HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV = "HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL"
+_SIGNAL_OFF = "off"
+_SIGNAL_ZSCORE_TIEBREAK = "zscore_tiebreak"
+_SIGNAL_AGREEMENT_BONUS = "agreement_bonus"
+_SIGNAL_IMPUTE_FLOOR = "impute_floor"
+_VALID_SINGLE_CHANNEL_SIGNALS: Final[frozenset[str]] = frozenset(
+    {_SIGNAL_OFF, _SIGNAL_ZSCORE_TIEBREAK, _SIGNAL_AGREEMENT_BONUS, _SIGNAL_IMPUTE_FLOOR}
+)
+# Default ON as of 2026-08-01 (flipped from "off"), per the corrected
+# alpha=0.5 measurement immediately above: a clean win (recall@1/ndcg@10/mrr
+# all up, zero regression on any metric or query type), matching the exact
+# bar this module's other env-flag flips (HARS_MEMORY_SUPERSESSION_SCORING,
+# HARS_MEMORY_RIPGREP_CHANNEL) were held to. Escape hatch:
+# HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL=off restores the pre-flip
+# chunk_id-only tie-break for any caller of `fuse()`.
+_DEFAULT_SINGLE_CHANNEL_SIGNAL = _SIGNAL_ZSCORE_TIEBREAK
+
+
+def _single_channel_signal_mode() -> str:
+    raw = os.environ.get(
+        HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV, _DEFAULT_SINGLE_CHANNEL_SIGNAL
+    ).strip().lower()
+    if raw not in _VALID_SINGLE_CHANNEL_SIGNALS:
+        raise ValueError(
+            f"{HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV} must be one of "
+            f"{sorted(_VALID_SINGLE_CHANNEL_SIGNALS)}, got {raw!r}"
+        )
+    return raw
+
+
+def single_channel_signal_mode() -> str:
+    """Public: current effective `HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL`
+    mode (default `_DEFAULT_SINGLE_CHANNEL_SIGNAL`, i.e. `"off"`), read
+    fresh on every call — same convention as `supersession_scoring_enabled()`
+    above. Added for config-provenance reporting
+    (tools/memory/eval/ab_bench.py's config echo)."""
+    return _single_channel_signal_mode()
+
+
+def _pool_mean_std(hits: dict[str, "ChannelHit"]) -> tuple[float, float]:
+    """(mean, population std) of one channel's own raw returned scores.
+    `n<=1` or a degenerate (all-tied) pool returns std=0.0 — callers must
+    treat that as "no basis to claim decisiveness," not divide by it."""
+    values = [hit.score for hit in hits.values()]
+    n = len(values)
+    if n == 0:
+        return 0.0, 0.0
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    return mean, variance**0.5
+
+
+def _channel_zscore(raw_score: float | None, mean: float, std: float) -> float:
+    """How many standard deviations `raw_score` sits above its own
+    channel's pool mean — unlike per-query min-max (which always maps a
+    channel's top score to exactly 1.0, discarding how decisively it beat
+    the rest of the pool), z-score is sensitive to the pool's spread: a
+    dominant top hit in a tightly-clustered pool scores far higher than a
+    top hit that barely edges out its nearest competitor, even though both
+    normalize to the identical 1.0 under min-max. 0.0 for a missing score
+    or a degenerate (std ~ 0) pool."""
+    if raw_score is None or std < 1e-12:
+        return 0.0
+    return (raw_score - mean) / std
+
+
+def _single_channel_tiebreak_component(
+    chunk: "FusedChunk",
+    dense_stats: tuple[float, float],
+    sparse_stats: tuple[float, float],
+) -> float:
+    """`zscore_tiebreak` mode's secondary sort-key component. Non-zero ONLY
+    for a chunk found by EXACTLY one channel — the case this whole signal
+    targets. A chunk found by both channels already has two independent
+    continuous norms distinguishing it from its neighbours (out of scope
+    for this task), so it gets 0.0 here and falls through to the
+    `chunk_id` tertiary tie-break exactly as it does in `off` mode.
+    """
+    dense_present = chunk.dense_score is not None
+    sparse_present = chunk.sparse_score is not None
+    if dense_present and not sparse_present:
+        return _channel_zscore(chunk.dense_score, *dense_stats)
+    if sparse_present and not dense_present:
+        return _channel_zscore(chunk.sparse_score, *sparse_stats)
+    return 0.0
+
+
+HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV = "HARS_MEMORY_FUSION_AGREEMENT_BONUS"
+# Deliberately well under a single channel's max ~1.0 blended contribution
+# (alpha or 1-alpha at the shipped 0.5/0.5 split) so agreement can nudge a
+# near-tied ranking but never invert a decisive single-channel win into a
+# loss — same bounded-nudge shape as RIPGREP_BOOST_CAP above. Not swept
+# (this variant did not win the measurement — see the report); a future
+# re-evaluation should sweep this rather than trust the round number.
+_DEFAULT_AGREEMENT_BONUS: Final[float] = 0.05
+
+
+def _agreement_bonus() -> float:
+    raw = os.environ.get(HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV)
+    if raw is None:
+        return _DEFAULT_AGREEMENT_BONUS
+    value = float(raw)
+    if value < 0.0:
+        raise ValueError(f"{HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV} must be >= 0.0, got {value}")
+    return value
+
+
+def agreement_bonus() -> float:
+    """Public: current effective `HARS_MEMORY_FUSION_AGREEMENT_BONUS`
+    (default `_DEFAULT_AGREEMENT_BONUS`), read fresh on every call — same
+    convention as `supersession_scoring_enabled()` above. Added for
+    config-provenance reporting (tools/memory/eval/ab_bench.py's config
+    echo)."""
+    return _agreement_bonus()
+
+
+def _impute_missing_channel_norm(pool_size: int) -> float:
+    """`impute_floor` mode's replacement for the current hard 0.0 default
+    used when a chunk is entirely absent from a channel. 0.0 conflates two
+    different things: "this channel's genuine worst-RETURNED candidate"
+    (which min-max already, correctly, maps to 0.0) and "this channel never
+    even considered the document" (structurally different — the document
+    may be well below wherever this channel's retrieval cut off). Imputes
+    one evenly-spaced rank below the observed minimum, i.e. `-1/(n+1)` for
+    an n-item pool, so "never returned" always sits strictly below "worst
+    returned" without an arbitrary fixed constant."""
+    if pool_size <= 0:
+        return 0.0
+    return -1.0 / (pool_size + 1)
 
 
 @dataclass(frozen=True)
@@ -317,19 +593,35 @@ def fuse(
     dense_norm = _min_max_normalize({cid: hit.score for cid, hit in dense_hits.items()})
     sparse_norm = _min_max_normalize({cid: hit.score for cid, hit in sparse_hits.items()})
 
+    # See "Single-channel information-loss fix" design note above
+    # `HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV`. Defaults to exactly
+    # today's behaviour (dense_floor=sparse_floor=0.0, no bonus, chunk_id
+    # tie-break) unless explicitly overridden.
+    signal_mode = _single_channel_signal_mode()
+    if signal_mode == _SIGNAL_IMPUTE_FLOOR:
+        dense_floor = _impute_missing_channel_norm(len(dense_hits))
+        sparse_floor = _impute_missing_channel_norm(len(sparse_hits))
+    else:
+        dense_floor = 0.0
+        sparse_floor = 0.0
+    agreement_bonus = _agreement_bonus() if signal_mode == _SIGNAL_AGREEMENT_BONUS else 0.0
+
     all_chunk_ids = set(dense_hits) | set(sparse_hits)
     fused: list[FusedChunk] = []
     for chunk_id in all_chunk_ids:
         dense_hit = dense_hits.get(chunk_id)
         sparse_hit = sparse_hits.get(chunk_id)
-        d_norm = dense_norm.get(chunk_id, 0.0)
-        s_norm = sparse_norm.get(chunk_id, 0.0)
+        d_norm = dense_norm.get(chunk_id, dense_floor)
+        s_norm = sparse_norm.get(chunk_id, sparse_floor)
         source_hit = dense_hit or sparse_hit
         assert source_hit is not None  # chunk_id came from one of the two dicts
+        blended = alpha * d_norm + (1.0 - alpha) * s_norm
+        if agreement_bonus and dense_hit is not None and sparse_hit is not None:
+            blended += agreement_bonus
         fused.append(
             FusedChunk(
                 chunk_id=chunk_id,
-                fused_score=alpha * d_norm + (1.0 - alpha) * s_norm,
+                fused_score=blended,
                 dense_score=dense_hit.score if dense_hit else None,
                 sparse_score=sparse_hit.score if sparse_hit else None,
                 dense_norm=d_norm,
@@ -339,7 +631,19 @@ def fuse(
             )
         )
     epsilon = _fusion_tie_epsilon()
-    fused.sort(key=lambda c: _deterministic_sort_key(c, epsilon), reverse=True)
+    if signal_mode == _SIGNAL_ZSCORE_TIEBREAK:
+        dense_stats = _pool_mean_std(dense_hits)
+        sparse_stats = _pool_mean_std(sparse_hits)
+        fused.sort(
+            key=lambda c: (
+                round(c.fused_score / epsilon) if epsilon > 0.0 else c.fused_score,
+                _single_channel_tiebreak_component(c, dense_stats, sparse_stats),
+                c.chunk_id,
+            ),
+            reverse=True,
+        )
+    else:
+        fused.sort(key=lambda c: _deterministic_sort_key(c, epsilon), reverse=True)
 
     if _supersession_scoring_enabled():
         fused = apply_supersession_scoring(
@@ -725,11 +1029,18 @@ def fuse_ripgrep_as_third_weight(
 __all__ = [
     "DEFAULT_HYBRID_ALPHA",
     "HARS_MEMORY_FUSION_TIE_EPSILON_ENV",
+    "HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV",
+    "HARS_MEMORY_FUSION_AGREEMENT_BONUS_ENV",
     "HARS_MEMORY_SUPERSESSION_SCORING_ENV",
     "HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV",
     "HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV",
     "supersession_scoring_enabled",
     "marker_penalty_enabled",
+    "marker_penalty_sub_flag",
+    "recency_discount_sub_flag",
+    "fusion_tie_epsilon",
+    "single_channel_signal_mode",
+    "agreement_bonus",
     "ChannelHit",
     "FusedChunk",
     "fuse",
