@@ -579,6 +579,114 @@ class TestRipgrepThirdWeightRejectedVariant:
         assert by_id["file:deadbeef0000"].fused_score > 0.0  # contributes via alpha_ripgrep alone
 
 
+class TestFlatDenseFusion:
+    """Item: flat dense channel fusion wiring (retrieval/fusion.py's
+    `apply_flat_dense_gate` / `flat_channel_enabled`). See
+    `apply_flat_dense_gate`'s own module-level design note in fusion.py for
+    the measured rationale these tests pin -- gate-only (no boost variant),
+    keyed by the SHARED chunk_id space (unlike ripgrep's basename bridge).
+    """
+
+    def _sample_fused(self):
+        from tools.memory.retrieval.fusion import ChannelHit, fuse
+
+        dense_hits = {
+            "chunk-a": ChannelHit(score=0.9, content="dense top", file_path="a.md"),
+            "chunk-b": ChannelHit(score=0.5, content="dense mid", file_path="b.md"),
+        }
+        sparse_hits = {
+            "chunk-b": ChannelHit(score=10.0, content="sparse top", file_path="b.md"),
+            "chunk-c": ChannelHit(score=5.0, content="sparse mid", file_path="c.md"),
+        }
+        return fuse(dense_hits, sparse_hits, alpha=0.5)
+
+    def test_empty_flat_hits_is_a_pure_passthrough(self) -> None:
+        from tools.memory.retrieval.fusion import apply_flat_dense_gate
+
+        fused = self._sample_fused()
+        gated = apply_flat_dense_gate(fused, {}, top_k=2)
+        assert gated == fused[:2]
+
+    def test_chunk_already_in_pool_is_never_reinjected(self) -> None:
+        """A chunk the flat channel also finds, but that dense/sparse
+        ALREADY returned somewhere in the pool (even outside the final
+        top_k), must not be appended a second time under the same id --
+        this is the whole reason `apply_flat_dense_gate` needs the FULL
+        pre-truncation `fused_pool`, not just its top_k slice.
+        """
+        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+
+        fused = self._sample_fused()  # chunk-a, chunk-b, chunk-c
+        flat_hits = {
+            "chunk-c": ChannelHit(score=0.99, content="flat also found c", file_path="c.md"),
+        }
+        gated = apply_flat_dense_gate(fused, flat_hits, top_k=1)
+        assert len(gated) == 1  # no injection -- chunk-c was already in the full pool
+        assert not any(c.chunk_id == "chunk-c" and c.flat_dense_score is not None for c in gated)
+
+    def test_injection_never_evicts_appends_past_top_k(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+
+        fused = self._sample_fused()
+        flat_hits = {
+            "chunk-fresh": ChannelHit(score=0.8, content="found only by flat", file_path="fresh.md"),
+        }
+        gated = apply_flat_dense_gate(fused, flat_hits, top_k=2)
+        # The real top-2 candidates are unchanged, in the same order/score.
+        assert gated[:2] == fused[:2]
+        # The flat-exclusive chunk is appended, not substituted for anything,
+        # using its REAL chunk_id -- no synthetic prefix needed (see design
+        # note: flat shares the dense/sparse chunk_id space directly).
+        assert len(gated) == 3
+        assert gated[2].chunk_id == "chunk-fresh"
+        assert gated[2].file_path == "fresh.md"
+        assert gated[2].flat_dense_score == 0.8
+        assert gated[2].dense_norm == 0.0
+        assert gated[2].sparse_norm == 0.0
+
+    def test_no_boost_path_exists_fused_score_of_injected_is_zero(self) -> None:
+        """Gate-only design: an injected chunk gets fused_score=0.0, not a
+        blended/boosted score -- see fusion.py's design note for why no
+        boost variant was built for this channel (unlike ripgrep's)."""
+        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+
+        fused = self._sample_fused()
+        flat_hits = {
+            "chunk-fresh": ChannelHit(score=0.95, content="x", file_path="fresh.md"),
+        }
+        gated = apply_flat_dense_gate(fused, flat_hits, top_k=2)
+        assert gated[2].fused_score == 0.0
+
+    def test_max_injected_caps_off_index_appends(self) -> None:
+        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+
+        fused = self._sample_fused()
+        flat_hits = {
+            f"chunk-off-{i}": ChannelHit(score=float(10 - i), content="x", file_path=f"off_{i}.md")
+            for i in range(5)
+        }
+        gated = apply_flat_dense_gate(fused, flat_hits, top_k=2, max_injected=2)
+        injected_ids = {c.chunk_id for c in gated[2:]}
+        assert len(injected_ids) == 2
+        # Highest-scoring off-pool hits win the limited slots.
+        assert injected_ids == {"chunk-off-0", "chunk-off-1"}
+
+    def test_channel_enabled_env_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools.memory.retrieval.fusion import (
+            HARS_MEMORY_FLAT_CHANNEL_ENV,
+            flat_channel_enabled,
+        )
+
+        monkeypatch.delenv(HARS_MEMORY_FLAT_CHANNEL_ENV, raising=False)
+        assert flat_channel_enabled() is False  # measured default -- see fusion.py's comment
+
+        monkeypatch.setenv(HARS_MEMORY_FLAT_CHANNEL_ENV, "1")
+        assert flat_channel_enabled() is True
+
+        monkeypatch.setenv(HARS_MEMORY_FLAT_CHANNEL_ENV, "0")
+        assert flat_channel_enabled() is False
+
+
 class TestBM25IndexCache:
     """Item: index cache invalidates on kv_store_text_chunks.json mtime change."""
 
