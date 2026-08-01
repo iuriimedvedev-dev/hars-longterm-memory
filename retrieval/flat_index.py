@@ -134,6 +134,115 @@ _CACHE_VECTORS_FILENAME = "flat_dense_vectors.npy"
 # `np.asarray(...)` before use below.
 EmbedFunc = Callable[..., Awaitable[Any]]
 
+# WHY every call to `embed_func` below is BATCHED (never one call for an
+# entire content list), confirmed empirically, not guessed — 2026-08-01:
+#
+# This module's own docstring above ("WHY the same embedder.py doc/query
+# asymmetric convention") documents that the intended `embed_func` for a
+# live server is `rag.embedding_func` — the SAME callable
+# `server/lightrag_init.py::create_lightrag()` wires into the running
+# LightRAG instance, not a second model load. What that section does not
+# say (discovered only when this channel was actually wired into
+# `hars_longterm_memory_mcp.py` and measured against the real object): by
+# the time `create_lightrag()` returns, LightRAG's OWN `__post_init__`
+# (lightrag/lightrag.py) has already REPLACED `rag.embedding_func.func`
+# with `lightrag.utils.priority_limit_async_func_call(...)`'s wrapped
+# version — a bounded worker-pool decorator that kills any single call
+# exceeding a hard wall-clock ceiling (`asyncio.wait_for(..., timeout=
+# max_execution_timeout)`) with `WorkerTimeoutError`/`TimeoutError`, not a
+# graceful slow-down. That ceiling is `default_embedding_timeout * 2`
+# (LightRAG's own `EMBEDDING_TIMEOUT` env, default 30s per
+# `lightrag.constants.DEFAULT_EMBEDDING_TIMEOUT`) = 60 SECONDS, regardless
+# of how this module is configured — it is baked into `rag.embedding_func`
+# itself before this module ever sees it, entirely outside this module's
+# (or hars_longterm_memory_mcp.py's) control.
+#
+# CONFIRMED against the live production embed_func (unsloth/embeddinggemma-
+# 300m, CPU, this corpus's real ~1643-char average chunk content, `env -i`
+# controlled): n=64 chunks in ONE call = 39.6s (618ms/chunk, safely under
+# 60s); n=128 chunks in ONE call exceeded the ceiling and raised
+# `TimeoutError: Embedding func: Worker execution timeout after 60s` —
+# every chunk n=128 was embedding was simply LOST (the underlying
+# `asyncio.to_thread` computation keeps running to completion in an
+# orphaned background thread — CPU wasted, not saved — but `wait_for`
+# already cancelled the awaiting future, so the caller gets an exception,
+# not a slow-but-correct result). Before this fix, `build_index`'s single
+# `await embed_func(contents, context="document")` call for this corpus's
+# real 7,184 chunks (measured full-corpus cost: 68.2 minutes) would ALWAYS
+# hit this 60-second ceiling when driven by `rag.embedding_func` — not
+# "slow", outright BROKEN, silently turning "build could take a while" into
+# "build always raises". The measured "68.2 min / 570 ms-per-chunk" full-
+# build number this module's own docstring cites elsewhere predates this
+# discovery and was necessarily measured with embed_func run OUTSIDE
+# LightRAG's wrapping (a standalone script calling
+# `server/embedder.py::make_embedding_func()` directly) — i.e. under a
+# calling convention this module's OWN documented "WHY reuse rag.
+# embedding_func" contract does not actually protect against in production.
+#
+# FIX: never submit more than `DEFAULT_EMBED_BATCH_SIZE` texts to
+# `embed_func` in one call, regardless of caller-supplied contents length —
+# `_embed_in_batches` below sequentially awaits each batch and concatenates
+# results, so `build_index`/`update_index` behave identically from the
+# caller's point of view (same input, same output shape/order/dtype),
+# just safe against ANY wrapping the passed-in `embed_func` might carry.
+# Sequential (not concurrent-batches-via-gather): a full 7,184-chunk build
+# is a one-time, off-the-request-path cost (see the module docstring's own
+# "incremental update" rationale — this is exactly the expensive path that
+# rationale exists to make rare) where correctness and a bounded, easy-to-
+# reason-about memory/thread footprint matter more than shaving minutes off
+# a per-index, once-per-corpus-lifetime operation; concurrent submission
+# also risks oversubscribing this machine's CPU threads against
+# sentence-transformers' OWN internal BLAS/OMP multi-threading per call
+# (`server/embedder.py`'s `model.encode(..., batch_size=...)`), a real
+# regression risk that was not measured here and should not be assumed
+# free.
+#
+# SIZING: `DEFAULT_EMBED_BATCH_SIZE=48` at the measured worst-case ~711ms/
+# chunk (this corpus's real content, n=32 sample) costs ~34s per batch —
+# comfortable margin under the 60s ceiling (safety factor ~1.75x) without
+# being so small that per-call Python/asyncio overhead starts to matter.
+# Not swept/tuned beyond this safety-margin argument; revisit only if a
+# future corpus's average chunk length changes enough to threaten the
+# margin (`chunk_token_size` in `server/lightrag_init.py` bounds this, so a
+# silent drift is unlikely) or if LightRAG's own `EMBEDDING_TIMEOUT`
+# default changes.
+DEFAULT_EMBED_BATCH_SIZE = 48
+
+
+async def _embed_in_batches(
+    embed_func: EmbedFunc, contents: list[str], context: str, batch_size: int
+) -> np.ndarray:
+    """Call `embed_func` in sequential chunks of at most `batch_size` texts,
+    concatenating the results — see the module-level "WHY every call ...
+    is BATCHED" note above for why a single unbatched call is unsafe
+    against `rag.embedding_func` specifically. Behaves identically to one
+    unbatched `await embed_func(contents, context=context)` call from the
+    caller's perspective (same output shape/dtype/row-order), for any
+    `batch_size >= 1`.
+
+    Returns a `(0, 0)` float32 array for empty `contents` — callers already
+    branch on `if contents:` before calling this (see `build_index`/
+    `update_index`), so this is defensive, not a documented public contract
+    for the empty case.
+    """
+    if not contents:
+        return np.zeros((0, 0), dtype=np.float32)
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+    chunks_of_vectors: list[np.ndarray] = []
+    for start in range(0, len(contents), batch_size):
+        batch = contents[start : start + batch_size]
+        raw = await embed_func(batch, context=context)
+        vecs = np.asarray(raw, dtype=np.float32)
+        if vecs.ndim != 2 or vecs.shape[0] != len(batch):
+            raise RuntimeError(
+                f"embed_func returned shape {vecs.shape} for a batch of {len(batch)} "
+                f"texts (offset {start}), expected ({len(batch)}, dim)"
+            )
+        chunks_of_vectors.append(vecs)
+    return np.concatenate(chunks_of_vectors, axis=0)
+
 
 class FlatIndexUnavailableError(RuntimeError):
     """Raised when the source `kv_store_text_chunks.json` does not exist yet.
@@ -278,7 +387,11 @@ def _content_hash(content: str) -> str:
 
 
 async def build_index(
-    working_dir: str, embed_func: EmbedFunc, *, embed_model: str = ""
+    working_dir: str,
+    embed_func: EmbedFunc,
+    *,
+    embed_model: str = "",
+    embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
 ) -> tuple[FlatDenseIndex, float]:
     """Build a fresh `FlatDenseIndex` from `working_dir/kv_store_text_chunks.json`,
     embedding every chunk unconditionally.
@@ -292,8 +405,14 @@ async def build_index(
     responsibility as `server/embedder.py::validate_embedder_against_index`
     uses for the production LightRAG index).
 
-    This is the expensive, O(corpus size) path (measured: ~570ms/chunk,
-    4,094s / 68.2min for 7,184 chunks) — `get_or_build_index` prefers
+    `embed_batch_size` is forwarded to `_embed_in_batches` (see its
+    module-level "WHY every call ... is BATCHED" note above) — `embed_func`
+    is NEVER called with more than this many texts at once, regardless of
+    corpus size.
+
+    This is the expensive, O(corpus size) path (measured: ~570-710ms/chunk
+    against this corpus's real content, 4,094s / 68.2min for 7,184 chunks
+    at the pre-batching unbatched cost) — `get_or_build_index` prefers
     `update_index` (O(chunks changed)) whenever a usable cache exists; this
     function is the fallback for "no cache", "cache unusable", and
     "different embed_model" (see `get_or_build_index`).
@@ -324,12 +443,7 @@ async def build_index(
         chunk_hashes[chunk_id] = _content_hash(content)
 
     if contents:
-        raw_vectors = await embed_func(contents, context="document")
-        vectors = np.asarray(raw_vectors, dtype=np.float32)
-        if vectors.ndim != 2 or vectors.shape[0] != len(contents):
-            raise RuntimeError(
-                f"embed_func returned shape {vectors.shape}, expected ({len(contents)}, dim)"
-            )
+        vectors = await _embed_in_batches(embed_func, contents, "document", embed_batch_size)
         # Defensive re-normalization: server/embedder.py's own encode() call
         # already sets normalize_embeddings=True, but this module takes
         # embed_func as an opaque parameter and must not silently trust an
@@ -385,6 +499,7 @@ async def update_index(
     cached: FlatDenseIndex,
     *,
     embed_model: str = "",
+    embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
 ) -> tuple[FlatDenseIndex, FlatUpdateStats]:
     """Bring `cached` up to date with the current
     `working_dir/kv_store_text_chunks.json`, embedding only chunks that are
@@ -408,6 +523,11 @@ async def update_index(
     `build_index` would produce for the same source file — so an
     incrementally-updated index and a freshly full-rebuilt one are
     order-for-order identical, not just set-equal.
+
+    `embed_batch_size` is forwarded to `_embed_in_batches` (see its
+    module-level "WHY every call ... is BATCHED" note above) — `embed_func`
+    is NEVER called with more than this many texts at once, regardless of
+    how many chunks in `to_embed_ids` need embedding.
 
     Raises `FlatIndexUnavailableError` if the source chunk store does not
     exist. Raises `FlatIndexDimensionMismatchError` if newly embedded
@@ -467,13 +587,9 @@ async def update_index(
     embedded_dim: int | None = None
     if to_embed_ids:
         contents_to_embed = [current_meta[cid]["content"] for cid in to_embed_ids]
-        raw_vectors = await embed_func(contents_to_embed, context="document")
-        new_vectors = np.asarray(raw_vectors, dtype=np.float32)
-        if new_vectors.ndim != 2 or new_vectors.shape[0] != len(to_embed_ids):
-            raise RuntimeError(
-                f"embed_func returned shape {new_vectors.shape}, "
-                f"expected ({len(to_embed_ids)}, dim)"
-            )
+        new_vectors = await _embed_in_batches(
+            embed_func, contents_to_embed, "document", embed_batch_size
+        )
         # Same defensive re-normalization as build_index — cosine similarity
         # via plain dot product is only correct on unit-norm rows.
         norms = np.linalg.norm(new_vectors, axis=1, keepdims=True)
@@ -643,6 +759,7 @@ async def get_or_build_index(
     embed_func: EmbedFunc,
     *,
     embed_model: str = "",
+    embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
 ) -> tuple[FlatDenseIndex, FlatBuildStats]:
     """Return a ready-to-query `FlatDenseIndex`, choosing between three paths
     — cheapest safe option first:
@@ -718,7 +835,9 @@ async def get_or_build_index(
     if cached is not None:
         try:
             index, update_stats = await update_index(
-                working_dir, embed_func, cached, embed_model=embed_model or cached.embed_model
+                working_dir, embed_func, cached,
+                embed_model=embed_model or cached.embed_model,
+                embed_batch_size=embed_batch_size,
             )
         except FlatIndexDimensionMismatchError as exc:
             logger.warning(
@@ -741,7 +860,9 @@ async def get_or_build_index(
                 reused_count=update_stats.reused_count,
             )
 
-    index, build_seconds = await build_index(working_dir, embed_func, embed_model=embed_model)
+    index, build_seconds = await build_index(
+        working_dir, embed_func, embed_model=embed_model, embed_batch_size=embed_batch_size
+    )
     save_index(index, cache_dir)
     return index, FlatBuildStats(
         chunk_count=index.chunk_count,
@@ -758,6 +879,7 @@ async def get_or_build_index(
 __all__ = [
     "CHUNKS_FILENAME",
     "EmbedFunc",
+    "DEFAULT_EMBED_BATCH_SIZE",
     "FlatIndexUnavailableError",
     "FlatIndexDimensionMismatchError",
     "FlatSearchHit",

@@ -563,6 +563,13 @@ class FusedChunk:
     # path, so old callers/tests that construct FusedChunk positionally
     # without it are unaffected by this addition).
     ripgrep_score: float | None = None
+    # Raw cosine similarity from retrieval/flat_index.py's own embedded
+    # index for this chunk_id, or None if the flat channel had no hit for it
+    # (disabled, cache unavailable, or genuinely outside the flat channel's
+    # own top-`pool_size` cut). Populated only by `apply_flat_dense_gate`
+    # below — `fuse()` itself never touches this field, same convention as
+    # `ripgrep_score` above.
+    flat_dense_score: float | None = None
 
 
 def _min_max_normalize(scores: dict[str, float]) -> dict[str, float]:
@@ -1026,6 +1033,264 @@ def fuse_ripgrep_as_third_weight(
     return fused
 
 
+# ---------------------------------------------------------------------------
+# Flat dense channel wiring (retrieval/flat_index.py) — additive coverage
+# gate, NOT a third convex weight and NOT a boost. See the design note below.
+#
+# WHY GATE-ONLY (no boost variant, unlike apply_ripgrep_gate above):
+#
+# retrieval/flat_index.py's own module docstring states its case plainly:
+# "Its case is NOT quality" — standalone it reproduces `dense_only` almost
+# exactly (measured: recall@10 0.6852 vs 0.685, ndcg@10 0.6096 vs 0.610 on
+# this corpus's labeled set), because it is THE SAME embedder, THE SAME
+# chunk boundaries, and THE SAME asymmetric document/query convention as
+# LightRAG's own `rag.chunks_vdb` — the only structural difference is WHERE
+# the vectors live (a flat numpy matrix built from `kv_store_text_chunks.
+# json` directly vs LightRAG's own vector store). For a chunk BOTH channels
+# already return, boosting `fused_score` with the flat channel's own raw
+# cosine score would be nudging a candidate with a second copy of
+# information `dense_norm` already encodes — unlike ripgrep's boost (a
+# textual signal genuinely independent of the dense/sparse channels it
+# nudges), there is no independent signal here to add, only cost (an extra
+# ~89ms/query CPU embed call — see HARS_MEMORY_FLAT_CHANNEL_ENV's latency
+# note below) for a nudge with no measured basis. ripgrep's own boost
+# variant was built, measured, AND shipped off by default after costing
+# ndcg@10/mrr with zero offsetting benefit (see apply_ripgrep_gate's
+# docstring) — building an analogous flat-dense boost variant here would be
+# repeating that same negative result on a channel that, by the module
+# docstring's own admission, brings even less independent signal to blend
+# than ripgrep did. Not built, per this project's "don't build things
+# without a measured basis" standard — the capability this module actually
+# offers (see below) is coverage, not reordering.
+#
+# WHAT THIS GATE ACTUALLY DOES: identical shape to apply_ripgrep_gate's
+# GATE half (there is no BOOST half here) — a chunk present in the flat
+# channel's own search results but ABSENT from `fused` (the full dense+
+# sparse pool, not just its top_k slice — same "never evict" rule as
+# ripgrep) is APPENDED past `top_k`, up to `max_injected` times. This is the
+# module docstring's actual value proposition made concrete: "the one thing
+# it does that the primary [dense] channel cannot: cover chunks that exist
+# in kv_store_text_chunks.json but are missing or stale in the vector
+# store." A chunk both channels already found needs no gate action at all —
+# it is already visible via `dense_norm`/`sparse_norm` exactly as before.
+#
+# KEYED BY chunk_id, NOT basename (unlike apply_ripgrep_gate): this is the
+# one join-key problem ripgrep's design note (see above) had to solve that
+# this channel does not have. retrieval/flat_index.py builds its index from
+# the SAME `kv_store_text_chunks.json` dense/sparse already key off of (see
+# that module's own docstring, "WHY reuse kv_store_text_chunks.json chunks,
+# not re-chunk from source docs") — its `chunk_id`s are the identical
+# LightRAG-assigned strings, by construction, not a second id space that
+# needs a basename bridge.
+#
+# MEASURED (2026-08-01, env -i controlled — see this constant's sibling
+# HARS_MEMORY_FLAT_CHANNEL_ENV comment for the full numbers/provenance):
+# zero-regression on the 46-query retrieval_queries.yaml labeled set
+# (injection-only shape is structurally incapable of moving a top-k-scored
+# metric, same proof as apply_ripgrep_gate's own docstring); the freshness
+# case it targets is a real, mechanism-proven capability (see this module's
+# unit tests) with NO current real-world trigger on this index
+# (kv_store_text_chunks.json and the Qdrant vdb are presently in exact 1:1
+# correspondence by chunk id, 7184==7184, confirmed directly against the
+# live collection, not assumed) — a safe simulation of that gap across the
+# full labeled set, plus a separate hand-built semantic-paraphrase probe,
+# did NOT surface an actual rescue case on this corpus/embedder pairing
+# (see HARS_MEMORY_FLAT_CHANNEL_ENV comment for why: the 6/36 simulated
+# cases where BM25 also missed were already outside the primary dense
+# channel's own top pool before the gap was even simulated, and this
+# channel shares that channel's exact embedder). See
+# HARS_MEMORY_FLAT_CHANNEL_ENV for the resulting default.
+FLAT_DENSE_MAX_INJECTED: Final[int] = 5
+
+
+def apply_flat_dense_gate(
+    fused: list[FusedChunk],
+    flat_hits_by_chunk_id: dict[str, ChannelHit],
+    *,
+    top_k: int,
+    max_injected: int = FLAT_DENSE_MAX_INJECTED,
+) -> list[FusedChunk]:
+    """Presence-gate `fused` (the FULL pre-truncation dense+sparse fusion
+    pool — callers must NOT have already sliced this to `[:top_k]`, exactly
+    the same contract `apply_ripgrep_gate` places on its own `fused`
+    argument, for the same reason: a chunk the flat channel alone can see
+    could not possibly already be inside a `[:top_k]`-sliced dense/sparse
+    list) with hits from `retrieval/flat_index.py`'s own search, keyed by
+    the SHARED `chunk_id` space (see design note above for why this needs
+    no basename bridge, unlike `apply_ripgrep_gate`).
+
+    Returns up to `top_k + max_injected` chunks: the top `top_k` of `fused`
+    UNCHANGED (no boost — see design note above), followed by up to
+    `max_injected` flat-channel-exclusive chunks `fused` never contained at
+    all anywhere (not just outside the top_k window — see "never evict"
+    note), highest flat cosine score first. Never evicts an existing
+    candidate. A caller that must return exactly `top_k` chunks should slice
+    the result again; this function does not do that itself, since the
+    whole point of the appended tail is to be additional to `top_k`, not a
+    replacement slice of it.
+
+    No-op passthrough (returns `fused[:top_k]`, unmodified) when
+    `flat_hits_by_chunk_id` is empty — the common case (channel disabled,
+    cache unavailable, or the flat channel's own search genuinely found
+    nothing new).
+    """
+    if not flat_hits_by_chunk_id:
+        return fused[:top_k]
+
+    present_ids = {chunk.chunk_id for chunk in fused}
+    top = fused[:top_k]
+
+    exclusive = [
+        (chunk_id, hit)
+        for chunk_id, hit in flat_hits_by_chunk_id.items()
+        if chunk_id not in present_ids
+    ]
+    exclusive.sort(key=lambda item: item[1].score, reverse=True)
+    injected = [
+        FusedChunk(
+            chunk_id=chunk_id,
+            fused_score=0.0,
+            dense_score=None,
+            sparse_score=None,
+            dense_norm=0.0,
+            sparse_norm=0.0,
+            content=hit.content,
+            file_path=hit.file_path,
+            flat_dense_score=hit.score,
+        )
+        for chunk_id, hit in exclusive[:max_injected]
+    ]
+    return top + injected
+
+
+HARS_MEMORY_FLAT_CHANNEL_ENV = "HARS_MEMORY_FLAT_CHANNEL"
+
+# Default OFF (measured 2026-08-01, `env -i` controlled — PATH/HOME/HF_HOME
+# plus explicit HARS_MEMORY_* allowlist, no ambient pollution; every number
+# below is from a real run against the real production index/embedder, not
+# a synthetic corpus) — the inverse default from HARS_MEMORY_RIPGREP_
+# CHANNEL_ENV above, and deliberately so; both channels were held to the
+# same no-regression bar, but only one of the two questions that matter
+# ("does it regress?" / "does it currently help?") came back the same way:
+#
+# 1. No-regression on the 46-query tools/memory/eval/retrieval_queries.yaml
+#    labeled set (hybrid_bm25 channel, top_k=10, pool_multiplier=3,
+#    alpha=0.5 — real production index at HARS_MEMORY_INDEX_DIR, real
+#    unsloth/embeddinggemma-300m CPU embedder, real Qdrant `lightrag_vdb_
+#    chunks`, real BM25, real `apply_flat_dense_gate`; scratch harness
+#    built only on this module's own real functions plus tools/memory/
+#    eval/ab_bench.py's load_queries/run_config/score_query/
+#    aggregate_scores, imported not reimplemented): CONFIRMED
+#    BYTE-IDENTICAL to the no-flat baseline on every metric, both overall
+#    and per-type — recall@1=0.5602, recall@10=0.8102, ndcg@10=0.7178,
+#    mrr=0.7086, supersession_error_rate=0.1667 (matches this corpus's
+#    documented current-shipped-defaults bar exactly). Structurally
+#    guaranteed, not a coincidence of this query set (injection-only, never
+#    evicts a top-k candidate — see design note above), and reconfirmed
+#    bit-identical under PYTHONHASHSEED=0 and PYTHONHASHSEED=42 (same 12
+#    total injected chunks, same per-query injection counts, both seeds).
+#    This alone would justify shipping ON, same as ripgrep's own proof.
+#
+# 2. The freshness case is the deciding difference, and it came back
+#    negative on THIS corpus TODAY, not merely "unproven":
+#      a. The real trigger condition — a `kv_store_text_chunks.json` chunk
+#         id with no corresponding point in `lightrag_vdb_chunks` — was
+#         checked directly against the live Qdrant collection by ID (not
+#         just count): scrolled all 7,184 points, compared their stored
+#         `payload["id"]` against all 7,184 `kv_store_text_chunks.json`
+#         keys. Result: EXACT bijection, 0 missing, 0 orphans. The gap this
+#         channel exists to close is empty right now, confirmed not
+#         assumed.
+#      b. Simulating that gap safely (never mutating the real Qdrant
+#         collection or kv_store_text_chunks.json — only post-filtering the
+#         real dense channel's OWN query results in-process to pretend a
+#         chunk was never returned) across ALL 36 answerable labeled
+#         queries: BM25 (which reads kv_store_text_chunks.json directly,
+#         so it is NOT blinded by a vdb-only gap) already re-covered the
+#         simulated-missing gold document in 30/36 cases on its own —
+#         i.e. for most of this corpus's real queries, a vdb-only gap is
+#         already masked by BM25's independent, always-fresh path, making
+#         the flat channel's contribution redundant with a channel that
+#         already exists. Of the 6/36 cases where BM25 ALSO missed gold
+#         after the simulated gap, the flat channel rescued 0/6 — not
+#         because injection is broken (see design note above and this
+#         module's own unit/integration tests, which prove the mechanism
+#         correct under a controlled embed function), but because those 6
+#         are genuinely hard-for-this-embedder queries where the gold
+#         chunk was ALREADY outside the real, unfiltered dense channel's
+#         own top pool_size BEFORE any simulated removal — the flat
+#         channel uses the IDENTICAL embedder/vectors as the primary dense
+#         channel (see module docstring), so it inherits that same blind
+#         spot rather than rescuing it. A separate, deliberately
+#         hand-constructed semantic-paraphrase probe (real chunk, a
+#         paraphrased query sharing near-zero literal tokens with it,
+#         gap simulated) reached the same conclusion: the flat channel's
+#         OWN real cosine search did not rank the target chunk within its
+#         top pool_size=30 either. This corpus/embedder pairing's
+#         "coverage-only, BM25-and-dense-both-miss-but-flat-would-catch-it"
+#         case, while structurally real (proven on a controlled embed
+#         function — see the report), was not found on real content despite
+#         deliberately looking for it in two independent ways.
+#      c. Net: unlike ripgrep's default-ON (justified by a REAL, observed
+#         demonstration — 3 real off-index files it actually recovered),
+#         this channel's freshness case is CURRENTLY HYPOTHETICAL on this
+#         corpus: real trigger condition absent, and even simulating it
+#         does not surface a rescue this measurement could find.
+# 3. Added latency is real and not free, unlike ripgrep's near-zero-cost-
+#    when-idle shape. Measured two ways, both `env -i` controlled, both
+#    against the real embedder/index:
+#      - Isolated channel cost (the `await flat_index.search(...)` call
+#        alone, bracketed inside `_compute_hybrid_block` itself and inside
+#        an independent scratch harness): mean 55-57ms, median 54-55ms,
+#        max ~76-86ms, consistent across both measurement methods and 46
+#        queries — this is a SECOND, independent query-embedding call on
+#        top of the one `rag.chunks_vdb.query()` already pays internally
+#        for the dense channel (LightRAG owns that internal call; this
+#        channel cannot reuse it without editing a constrained file).
+#      - End-to-end `_compute_hybrid_block` total, flat OFF vs ON, same 46
+#        queries, same process (module-level rag/bm25/flat caches reused
+#        across both passes so only the flat gate's own marginal work
+#        differs): mean added 8.2ms, median added 8.6ms. Lower than the
+#        isolated-channel number — plausibly CPU-cache-locality effects
+#        from calling the same CPU model twice in quick succession on this
+#        (per the coordinator's own note) currently CPU-contended machine,
+#        not a sign the isolated number is wrong; both were measured
+#        directly, not inferred. For capacity planning, treat ~55ms/query
+#        as the conservative added-cost figure; the smaller end-to-end
+#        delta is real but was observed under a specific back-to-back
+#        calling pattern that may not hold in production request spacing.
+#
+# Net: a real, tested, zero-regression capability whose one differentiating
+# benefit (coverage the primary dense channel cannot see) has NO live
+# trigger on this index today and was not observed even under deliberate
+# simulation, at a real (non-zero) per-query cost. This is the "built but
+# not yet needed" outcome, not a workaround: BUILT (this module),
+# WIRED-BUT-GATED-OFF (hars_longterm_memory_mcp.py's `_compute_hybrid_
+# block`), with the trigger condition documented here in machine-checkable
+# terms (`kv_store_text_chunks.json` chunk-id set diverging from
+# `lightrag_vdb_chunks`'s payload-id set — `memory_status` is the natural
+# place a future change could surface that check automatically) rather than
+# asserted from first principles. Escape hatch (in the ENABLING direction,
+# unlike every other _ENV flag in this file): HARS_MEMORY_FLAT_CHANNEL=1
+# turns it on for an operator who has a specific reason to believe the
+# index has diverged from the vector store right now (e.g. mid-migration,
+# as already happened once for this exact channel — see retrieval/
+# flat_index.py's own "Independence" rationale) and wants coverage
+# immediately rather than waiting for the next consolidation cycle. Revisit
+# this default if a future measurement finds a real divergence (the
+# `memory_status` check above returns nonzero) or a corpus/embedder change
+# makes the coverage-only case actually reachable.
+_FLAT_CHANNEL_DEFAULT = "0"
+
+
+def flat_channel_enabled() -> bool:
+    """Public: same env-derived truth callers (hars_longterm_memory_mcp.py's
+    `_compute_hybrid_block`) consult to decide whether to build/load the
+    flat dense index and run its search at all — read fresh on every call,
+    matching `ripgrep_channel_enabled()`'s convention above."""
+    return os.environ.get(HARS_MEMORY_FLAT_CHANNEL_ENV, _FLAT_CHANNEL_DEFAULT).strip().lower() in _TRUTHY
+
+
 __all__ = [
     "DEFAULT_HYBRID_ALPHA",
     "HARS_MEMORY_FUSION_TIE_EPSILON_ENV",
@@ -1051,4 +1316,8 @@ __all__ = [
     "RIPGREP_MAX_INJECTED",
     "apply_ripgrep_gate",
     "fuse_ripgrep_as_third_weight",
+    "HARS_MEMORY_FLAT_CHANNEL_ENV",
+    "flat_channel_enabled",
+    "FLAT_DENSE_MAX_INJECTED",
+    "apply_flat_dense_gate",
 ]

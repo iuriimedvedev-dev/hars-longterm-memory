@@ -661,3 +661,156 @@ class TestIncrementalUpdate:
 
         with pytest.raises(FlatIndexDimensionMismatchError):
             asyncio.run(update_index(str(working_dir), _three_dim_embed, cached, embed_model="fake-2d"))
+
+
+class TestEmbedBatching:
+    """Item (2026-08-01, discovered while wiring this channel into
+    hars_longterm_memory_mcp.py): `rag.embedding_func` — the intended
+    production `embed_func` per this module's own docstring — is wrapped by
+    LightRAG itself (`lightrag.utils.priority_limit_async_func_call`) with a
+    hard 60-SECOND per-call worker timeout. A single unbatched
+    `embed_func(all_contents, ...)` call for any corpus whose embed time
+    exceeds that ceiling is silently killed (`WorkerTimeoutError`), not
+    slow — CONFIRMED empirically against the live production embed_func
+    (see flat_index.py's `DEFAULT_EMBED_BATCH_SIZE` module-level comment for
+    the measured numbers). These tests pin the fix: `embed_func` must never
+    be called with more than `embed_batch_size` texts at once, and the
+    batched result must be indistinguishable from one big unbatched call.
+    """
+
+    def test_build_index_never_exceeds_batch_size(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        # 7 chunks, batch_size=3 -> batches of 3, 3, 1 -- exercises both a
+        # full batch and a final partial batch.
+        chunks = {
+            f"chunk-{i}": {"content": f"alpha chunk number {i}", "file_path": f"{i}.md"}
+            for i in range(7)
+        }
+        _write_chunks(working_dir, chunks)
+
+        recorder = _CallRecordingEmbed()
+        index, _build_seconds = asyncio.run(
+            build_index(str(working_dir), recorder, embed_model="fake-2d", embed_batch_size=3)
+        )
+
+        assert [len(texts) for texts, _ctx in recorder.calls] == [3, 3, 1]
+        assert index.chunk_count == 7
+        # Row order/content is identical to an unbatched build, regardless
+        # of how many calls it took to get there.
+        unbatched_index, _ = asyncio.run(
+            build_index(str(working_dir), _fake_embed, embed_model="fake-2d", embed_batch_size=1000)
+        )
+        assert index.chunk_ids == unbatched_index.chunk_ids
+        np.testing.assert_array_equal(np.asarray(index.vectors), np.asarray(unbatched_index.vectors))
+
+    def test_update_index_batches_only_the_chunks_needing_embedding(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        _write_chunks(working_dir, _sample_chunks())  # 3 chunks
+        cached, _ = asyncio.run(build_index(str(working_dir), _fake_embed, embed_model="fake-2d"))
+
+        richer = _sample_chunks()
+        for i in range(5):
+            richer[f"chunk-new-{i}"] = {"content": f"beta fresh chunk {i}", "file_path": f"n{i}.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        recorder = _CallRecordingEmbed()
+        _updated, stats = asyncio.run(
+            update_index(str(working_dir), recorder, cached, embed_model="fake-2d", embed_batch_size=2)
+        )
+
+        assert stats.new_count == 5
+        assert stats.reused_count == 3
+        # 5 new chunks, batch_size=2 -> batches of 2, 2, 1; the 3 unchanged
+        # chunks are never sent to embed_func at all (see
+        # TestIncrementalUpdate.test_unchanged_chunks_are_not_re_embedded).
+        assert [len(texts) for texts, _ctx in recorder.calls] == [2, 2, 1]
+        assert len(recorder.all_embedded_texts) == 5
+
+    def test_batch_size_of_one_still_produces_correct_result(self, tmp_path: Path) -> None:
+        """Extreme case: one text per call — correctness must not depend on
+        ever batching more than a single item."""
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        _write_chunks(working_dir, _sample_chunks())
+
+        recorder = _CallRecordingEmbed()
+        index, _ = asyncio.run(
+            build_index(str(working_dir), recorder, embed_model="fake-2d", embed_batch_size=1)
+        )
+
+        assert [len(texts) for texts, _ctx in recorder.calls] == [1, 1, 1]
+        assert index.chunk_count == 3
+
+    def test_empty_corpus_makes_no_embed_calls_regardless_of_batch_size(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        _write_chunks(working_dir, {})
+
+        recorder = _CallRecordingEmbed()
+        index, _ = asyncio.run(
+            build_index(str(working_dir), recorder, embed_model="fake-2d", embed_batch_size=4)
+        )
+
+        assert recorder.calls == []
+        assert index.chunk_count == 0
+
+    def test_get_or_build_index_forwards_batch_size_to_full_rebuild(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks = {
+            f"chunk-{i}": {"content": f"alpha chunk number {i}", "file_path": f"{i}.md"}
+            for i in range(5)
+        }
+        _write_chunks(working_dir, chunks)
+
+        recorder = _CallRecordingEmbed()
+        _index, stats = asyncio.run(
+            get_or_build_index(str(working_dir), str(cache_dir), recorder, embed_batch_size=2)
+        )
+
+        assert stats.update_path == "full_rebuild"
+        assert [len(texts) for texts, _ctx in recorder.calls] == [2, 2, 1]
+
+    def test_get_or_build_index_forwards_batch_size_to_incremental_update(self, tmp_path: Path) -> None:
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        chunks_file = working_dir / "kv_store_text_chunks.json"
+        _write_chunks(working_dir, _sample_chunks())
+        asyncio.run(get_or_build_index(str(working_dir), str(cache_dir), _fake_embed))
+
+        richer = _sample_chunks()
+        for i in range(4):
+            richer[f"chunk-new-{i}"] = {"content": f"beta fresh {i}", "file_path": f"n{i}.md"}
+        _write_chunks(working_dir, richer)
+        _bump_mtime(chunks_file)
+
+        recorder = _CallRecordingEmbed()
+        _index, stats = asyncio.run(
+            get_or_build_index(str(working_dir), str(cache_dir), recorder, embed_batch_size=3)
+        )
+
+        assert stats.update_path == "incremental"
+        assert [len(texts) for texts, _ctx in recorder.calls] == [3, 1]
+
+    def test_invalid_batch_size_rejected(self, tmp_path: Path) -> None:
+        from tools.memory.retrieval.flat_index import _embed_in_batches
+
+        with pytest.raises(ValueError, match="batch_size must be >= 1"):
+            asyncio.run(_embed_in_batches(_fake_embed, ["x"], "document", 0))
+
+    def test_default_batch_size_has_real_safety_margin_under_the_60s_ceiling(self) -> None:
+        """Sanity bound on the shipped constant, not a re-derivation of the
+        empirical measurement (that lives in the module docstring) — guards
+        against an accidental edit drifting this back toward "no effective
+        batching" (too large, one batch spans the whole corpus again) or an
+        absurdly small value that would multiply per-call overhead for no
+        safety benefit."""
+        from tools.memory.retrieval.flat_index import DEFAULT_EMBED_BATCH_SIZE
+
+        assert 8 <= DEFAULT_EMBED_BATCH_SIZE <= 128
