@@ -55,6 +55,24 @@ class BM25IndexUnavailableError(RuntimeError):
     """
 
 
+class BM25CacheDirNotAbsoluteError(ValueError):
+    """Raised when `cache_dir` is not an absolute path.
+
+    A relative (or empty-string) `cache_dir` silently resolves against
+    whatever the *calling process's* cwd happens to be, not a deliberate,
+    configured location — `Path("")` and `Path(".")` both resolve to cwd.
+    This is exactly how a stray direct call (bypassing the sanctioned
+    `hars_longterm_memory_mcp.py` / `eval/ab_bench.py` entry points, both of
+    which already pass absolute `/tmp/...` defaults) dumped this index's six
+    on-disk files straight into the repo root instead of a cache directory
+    (observed 2026-08-07: an out-of-band invocation landed six bm25s cache
+    files at repo root while both sanctioned callers' own caches, correctly
+    absolute, sat untouched in `/tmp`). Every caller must resolve `cache_dir`
+    to an absolute path — env var, config, or explicit constant — before
+    calling `save_index` / `load_index` / `get_or_build_index`.
+    """
+
+
 @dataclass(frozen=True)
 class BM25SearchHit:
     chunk_id: str
@@ -132,6 +150,24 @@ def _meta_path(cache_dir: Path) -> Path:
     return cache_dir / _CACHE_META_FILENAME
 
 
+def _require_absolute_cache_dir(cache_dir: str) -> Path:
+    """Resolve `cache_dir` to a `Path`, refusing anything not already absolute.
+
+    Fail fast and loud here rather than silently writing to `Path(cache_dir)`
+    — see `BM25CacheDirNotAbsoluteError` for why a relative/empty value is a
+    real hazard, not just a style nit.
+    """
+    path = Path(cache_dir)
+    if not path.is_absolute():
+        raise BM25CacheDirNotAbsoluteError(
+            f"cache_dir must be an absolute path, got {cache_dir!r} — a "
+            f"relative value silently resolves to {path.resolve()} (the "
+            "calling process's cwd). Pass an absolute, explicitly configured "
+            "directory."
+        )
+    return path
+
+
 def build_index(working_dir: str) -> tuple[BM25SparseIndex, float]:
     """Build a fresh `BM25SparseIndex` from `working_dir/kv_store_text_chunks.json`.
 
@@ -193,7 +229,7 @@ def save_index(index: BM25SparseIndex, cache_dir: str) -> None:
     sidecar, so persisting the chunk text a second time would double the
     on-disk footprint for no benefit.
     """
-    out_dir = Path(cache_dir)
+    out_dir = _require_absolute_cache_dir(cache_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index.retriever.save(str(out_dir), corpus=None, show_progress=False)
     meta = {
@@ -213,7 +249,7 @@ def load_index(cache_dir: str) -> BM25SparseIndex | None:
     """
     import bm25s
 
-    out_dir = Path(cache_dir)
+    out_dir = _require_absolute_cache_dir(cache_dir)
     meta_file = _meta_path(out_dir)
     if not meta_file.is_file():
         return None
@@ -269,6 +305,7 @@ def get_or_build_index(working_dir: str, cache_dir: str) -> tuple[BM25SparseInde
 __all__ = [
     "CHUNKS_FILENAME",
     "BM25IndexUnavailableError",
+    "BM25CacheDirNotAbsoluteError",
     "BM25SearchHit",
     "BM25BuildStats",
     "BM25SparseIndex",
