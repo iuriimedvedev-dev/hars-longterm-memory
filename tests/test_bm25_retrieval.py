@@ -803,3 +803,41 @@ class TestBM25IndexCache:
 
         assert [h.chunk_id for h in hits1] == [h.chunk_id for h in hits2]
         assert [h.score for h in hits1] == pytest.approx([h.score for h in hits2])
+
+    @pytest.mark.parametrize("bad_cache_dir", ["", ".", "relative/cache", "bm25_cache"])
+    def test_save_index_rejects_relative_cache_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_cache_dir: str
+    ) -> None:
+        """A relative (or empty-string) cache_dir must never silently resolve
+        against cwd — this is exactly how six bm25s cache files landed at a
+        repo root instead of a configured cache directory (2026-08-07)."""
+        from tools.memory.retrieval.bm25_index import (
+            BM25CacheDirNotAbsoluteError,
+            build_index,
+            save_index,
+        )
+
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        self._write_chunks(working_dir, self._sample_chunks())
+        index, _ = build_index(str(working_dir))
+
+        cwd_sentinel = tmp_path / "cwd_sentinel"
+        cwd_sentinel.mkdir()
+        monkeypatch.chdir(cwd_sentinel)
+
+        with pytest.raises(BM25CacheDirNotAbsoluteError):
+            save_index(index, bad_cache_dir)
+
+        assert list(cwd_sentinel.iterdir()) == [], (
+            "relative cache_dir must not write anything into cwd"
+        )
+
+    def test_load_index_rejects_relative_cache_dir(self) -> None:
+        from tools.memory.retrieval.bm25_index import (
+            BM25CacheDirNotAbsoluteError,
+            load_index,
+        )
+
+        with pytest.raises(BM25CacheDirNotAbsoluteError):
+            load_index("relative/cache")
