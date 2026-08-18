@@ -62,6 +62,7 @@ dev = [
 memory-index = "hars_memory.cli:index_main"
 memory-mcp   = "hars_memory.cli:mcp_main"
 memory-eval-battle = "hars_memory.cli:eval_battle_main"
+memory = "hars_memory.cli:main"
 
 [tool.hatch.build.targets.wheel]
 # This is an application, not a library.  Packages are declared explicitly to
