@@ -345,13 +345,19 @@ def create_lightrag(
         validate_embedder_against_index,
     )
     from hars_memory.server.reranker import make_rerank_func
-    from hars_memory.schema.entity_types import EntityType
-    from hars_memory.schema.extraction_prompt import DOMAIN_EXTRACTION_GUIDANCE
+    from hars_memory.schema.loader import DEFAULT_SCHEMA_PATH, load_schema
+
+    # Entity/relation vocabulary + extraction guidance: generic package
+    # default, overridable by a consuming project via
+    # HARS_MEMORY_ENTITY_SCHEMA_PATH (e.g. Cortex's HARS-tuned schema at
+    # tools/memory-config/schema/hars_entity_schema.yaml).
+    _schema_path = Path(os.environ.get("HARS_MEMORY_ENTITY_SCHEMA_PATH", str(DEFAULT_SCHEMA_PATH)))
+    _schema = load_schema(_schema_path)
 
     # Append domain guidance (naming normalisation, table handling, type
     # discipline) to LightRAG's default extraction prompt.  Idempotent.
-    if DOMAIN_EXTRACTION_GUIDANCE not in PROMPTS["entity_extraction_system_prompt"]:
-        PROMPTS["entity_extraction_system_prompt"] += DOMAIN_EXTRACTION_GUIDANCE
+    if _schema.guidance and _schema.guidance not in PROMPTS["entity_extraction_system_prompt"]:
+        PROMPTS["entity_extraction_system_prompt"] += _schema.guidance
 
     # --- resolve config (param > env > default) ---
     _wdir = resolve_working_dir(working_dir)
@@ -497,7 +503,7 @@ def create_lightrag(
         max_total_tokens=_llm_max_extract_tokens,
         addon_params={
             "language": os.environ.get("HARS_MEMORY_EXTRACTION_LANGUAGE", "English"),
-            "entity_types": [entity_type.value for entity_type in EntityType],
+            "entity_types": _schema.entity_types,
         },
         max_parallel_insert=int(os.environ.get("HARS_MEMORY_MAX_PARALLEL_INSERT", "2")),
         # Concurrent LLM calls across all inserts.  MUST NOT exceed the number of
