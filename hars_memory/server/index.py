@@ -68,7 +68,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--paths",
         nargs="+",
-        default=[".reports", ".plans", ".session"],
+        default=[".plans", "docs"],
         help="Directories or files to ingest (relative to project root).",
     )
     parser.add_argument(

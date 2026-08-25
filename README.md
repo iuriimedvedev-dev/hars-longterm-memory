@@ -62,7 +62,7 @@ HARS_MEMORY_EXTRACTOR_MODEL=Qwen3.6-27B-Q4_K_M \
 HARS_MEMORY_QUERY_BASE_URL=http://localhost:8080/v1 \
 HARS_MEMORY_QUERY_MODEL=Qwen3.6-27B-Q4_K_M \
 uv run --project tools/memory python tools/memory/server/index.py \
-    --paths .reports .plans .session \
+    --paths .plans docs \
     --db-export
 ```
 
@@ -71,7 +71,7 @@ The script **automatically refuses** to run if the GPU guard detects a running t
 Dry-run (no LLM, just document counts):
 ```bash
 uv run --project tools/memory python tools/memory/server/index.py \
-    --paths .reports .plans --dry-run
+    --paths .plans docs --dry-run
 ```
 
 If either endpoint is down, start `llama-server` with a real local `.gguf` file
@@ -123,9 +123,9 @@ memory_entities(name="Phase C")
 memory_related(entity_id="hyp:abc-123", hops=2)
 
 # Trigger incremental reindex (dry-run by default)
-memory_consolidate(paths=[".reports", ".plans"], dry_run=true)
+memory_consolidate(paths=[".plans", "docs"], dry_run=true)
 # Actual reindex (GPU must be free):
-memory_consolidate(paths=[".reports", ".plans"], db_export=true, dry_run=false)
+memory_consolidate(paths=[".plans", "docs"], db_export=true, dry_run=false)
 ```
 
 ---
@@ -133,7 +133,7 @@ memory_consolidate(paths=[".reports", ".plans"], db_export=true, dry_run=false)
 ## Architecture
 
 ```
-.reports/ .plans/ .session/
+.plans/ docs/
     │
     ▼
 ingest/walker.py          — glob filter + .memoryignore
