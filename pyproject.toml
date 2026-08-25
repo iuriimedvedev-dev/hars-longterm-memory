@@ -61,6 +61,7 @@ dev = [
 [project.scripts]
 memory-index = "hars_memory.cli:index_main"
 memory-mcp   = "hars_memory.cli:mcp_main"
+hars-longterm-memory-mcp = "hars_memory.mcp_server:main"
 memory-eval-battle = "hars_memory.cli:eval_battle_main"
 memory = "hars_memory.cli:main"
 
