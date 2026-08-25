@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Full indexing entrypoint — run this ONLY when the GPU is free.
+"""Full indexing entrypoint.
 
-GPU GUARD: this script refuses to start if a vea/expert/ai_tuner/finetune/
-distillation experiment is currently running on the backend.  It re-uses the
-exact same concurrency-guard pattern as .claude/skills/distillation.py.
+GPU GUARD: this package no longer checks GPU concurrency itself — that check
+moved to tools/memory-config/scripts/gpu_guard.py (Cortex-owned). Cortex's own
+indexing wrapper (update_kb.sh) must call assert_gpu_free() before invoking
+this CLI; running this script directly does not protect a shared GPU.
 
-Usage (run when GPU is free):
+Usage:
     python tools/memory/server/index.py \\
         --paths .reports .plans .session \\
         [--full]              # full reindex (ignore change detection)
@@ -19,10 +20,6 @@ Environment variables (see config/.env.example):
     HARS_MEMORY_EXTRACTOR_MODEL            - model name
     HARS_MEMORY_INDEX_DIR                - LightRAG KV store dir
     HARS_MEMORY_VECTOR_STORAGE             - LightRAG vector backend
-    HARS_API_BASE_URL                   - HARS backend (for GPU guard)
-    HARS_MEMORY_GPU_GUARD_ALLOW_UNREACHABLE - "1" to fail OPEN instead of CLOSED
-                                            when the GPU guard backend is
-                                            unreachable (default: fail closed)
     HARS_MEMORY_CLAUDE_MEMORY_DIR                 - optional extra ingest root (e.g. the
                                             Claude Code project-memory dir)
     HARS_MEMORY_FINGERPRINT_STORE          - sidecar JSON path for
@@ -52,7 +49,6 @@ from hars_memory.ingest.change_detection import (
 )
 from hars_memory.ingest.document import Document
 from hars_memory.ingest.walker import walk
-from hars_memory.server.gpu_guard import GpuBusyError, GpuGuardUnavailableError, assert_gpu_free
 from hars_memory.server.logging_setup import setup_logging
 
 setup_logging()
@@ -63,18 +59,6 @@ logger = logging.getLogger("memory.index")
 # this at their own path; never hardcoded since it lives outside the repo and
 # is user/machine-specific.
 _MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
-
-# Operator override for gpu_guard's fail-closed-on-unreachable-backend default.
-_GPU_GUARD_ALLOW_UNREACHABLE_ENV: Final[str] = "HARS_MEMORY_GPU_GUARD_ALLOW_UNREACHABLE"
-_TRUE_STRINGS: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
-
-
-def _bool_env(name: str, *, default: bool = False) -> bool:
-    """Parse a boolean-ish environment variable ('1'/'true'/'yes'/'on')."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in _TRUE_STRINGS
 
 
 def _parse_args() -> argparse.Namespace:
@@ -112,22 +96,6 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Walk + count documents only — no LLM extraction, no DB writes.",
-    )
-    parser.add_argument(
-        "--api-base-url",
-        default=None,
-        help="HARS backend URL for GPU guard (overrides HARS_API_BASE_URL env).",
-    )
-    parser.add_argument(
-        "--allow-gpu-guard-unreachable",
-        action="store_true",
-        default=_bool_env(_GPU_GUARD_ALLOW_UNREACHABLE_ENV),
-        help=(
-            "Override: proceed with indexing even if the HARS backend is "
-            "unreachable. Normally this fails CLOSED (GpuGuardUnavailableError) "
-            "because GPU state cannot be confirmed. Only use when you know the "
-            f"GPU is idle. Env: {_GPU_GUARD_ALLOW_UNREACHABLE_ENV}=1."
-        ),
     )
     return parser.parse_args()
 
@@ -251,23 +219,10 @@ async def _insert_all_batches(
 
 
 async def _run_indexing(args: argparse.Namespace) -> None:
-    api_url = args.api_base_url or os.environ.get("HARS_API_BASE_URL", "http://localhost:8765")
-
-    # -----------------------------------------------------------------------
-    # GPU guard — refuse to run while training is active.
-    # -----------------------------------------------------------------------
-    if not args.dry_run:
-        try:
-            assert_gpu_free(
-                api_url, allow_unreachable_backend=args.allow_gpu_guard_unreachable
-            )
-        except (GpuBusyError, GpuGuardUnavailableError) as exc:
-            logger.error("BLOCKED: %s", exc)
-            logger.error(
-                "Wait for the training run to complete, then re-run:\n"
-                "  python tools/memory/server/index.py --paths .reports .plans"
-            )
-            sys.exit(1)
+    # GPU-guard moved to tools/memory-config/scripts/gpu_guard.py — Cortex's own
+    # indexing wrapper (update_kb.sh) must call assert_gpu_free() before invoking
+    # this CLI; the package itself no longer knows Cortex's GPU is a shared
+    # resource. (Task 4.x's cutover updates update_kb.sh to make this call.)
 
     project_root = _PROJECT_ROOT
     resolved_paths = _resolve_ingest_paths(args.paths, project_root)
