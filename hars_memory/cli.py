@@ -136,7 +136,12 @@ def _cmd_regress(args: argparse.Namespace) -> int:
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
     candidate = json.loads(args.candidate.read_text(encoding="utf-8"))
     try:
-        verdict = compare_reports(baseline, candidate)
+        verdict = compare_reports(
+            baseline,
+            candidate,
+            baseline_ab_bench_config=args.baseline_ab_bench_config,
+            candidate_ab_bench_config=args.candidate_ab_bench_config,
+        )
     except RegressionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -216,6 +221,20 @@ def _build_parser() -> argparse.ArgumentParser:
     regress_p.add_argument("--baseline", required=True, type=Path)
     regress_p.add_argument("--candidate", required=True, type=Path)
     regress_p.add_argument("--report", type=Path, default=None)
+    regress_p.add_argument(
+        "--baseline-ab-bench-config",
+        default=None,
+        help=(
+            "Which config to compare from the baseline report, when it's an "
+            "ab_bench.py report with more than one config (required unless "
+            "the report only ever ran one config)."
+        ),
+    )
+    regress_p.add_argument(
+        "--candidate-ab-bench-config",
+        default=None,
+        help="Same as --baseline-ab-bench-config, for the candidate report.",
+    )
     regress_p.set_defaults(func=_cmd_regress)
 
     status_p = sub.add_parser("status", help="Print a corpus manifest summary.")
