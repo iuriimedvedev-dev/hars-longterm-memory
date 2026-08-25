@@ -26,14 +26,22 @@ Usage
     uv run --project tools/memory python tools/memory/scripts/qdrant_transplant.py \\
         --working-dir /home/user/.local/share/hars-graphrag/index_gemma_v4 \\
         --qdrant-url http://localhost:6335 \\
-        --workspace hars_longterm_memory
+        --workspace hars_longterm_memory \\
+        --collection-prefix hars_longterm_memory
 
     # Reverse: Qdrant -> JSON (rollback / export current state)
     uv run --project tools/memory python tools/memory/scripts/qdrant_transplant.py \\
         --reverse \\
         --working-dir /tmp/qdrant_export \\
         --qdrant-url http://localhost:6335 \\
-        --workspace hars_longterm_memory
+        --workspace hars_longterm_memory \\
+        --collection-prefix hars_longterm_memory
+
+``--collection-prefix`` (or env ``HARS_MEMORY_QDRANT_COLLECTION_PREFIX``) is
+required — it namespaces the fixed ``lightrag_vdb_{chunks,entities,
+relationships}`` collection names so multiple projects can share one Qdrant
+container without colliding on schema (embedding dimension is a
+per-collection property, not per-workspace).
 """
 from __future__ import annotations
 
@@ -49,6 +57,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from hars_memory.server.embedder import qdrant_collection_names
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("qdrant_transplant")
@@ -71,8 +81,9 @@ CREATED_AT_FIELD = "created_at"
 EXPECTED_EMBEDDING_DIM = 768
 
 
-def _qdrant_collection_name(namespace: str) -> str:
-    return f"lightrag_vdb_{namespace}"
+def _qdrant_collection_name(namespace: str, prefix: str) -> str:
+    names = qdrant_collection_names(prefix)
+    return dict(zip(NAMESPACES.keys(), names))[namespace]
 
 
 def _compute_point_id(record_id: str, workspace: str):
@@ -114,6 +125,7 @@ def transplant_namespace_forward(
     working_dir: Path,
     namespace: str,
     workspace: str,
+    collection_prefix: str,
     batch_size: int,
 ) -> dict[str, Any]:
     from qdrant_client import models
@@ -125,7 +137,7 @@ def transplant_namespace_forward(
         return {"namespace": namespace, "skipped": True}
 
     data, matrix = _load_vdb_json(path)
-    collection = _qdrant_collection_name(namespace)
+    collection = _qdrant_collection_name(namespace, collection_prefix)
     logger.info(
         "[%s] loaded %d records (dim=%d) from %s -> collection %r (workspace=%r)",
         namespace, len(data), matrix.shape[1] if matrix.size else EXPECTED_EMBEDDING_DIM,
@@ -205,12 +217,13 @@ def transplant_namespace_reverse(
     working_dir: Path,
     namespace: str,
     workspace: str,
+    collection_prefix: str,
     scroll_batch_size: int,
 ) -> dict[str, Any]:
     from qdrant_client import models
 
     filename, meta_fields = NAMESPACES[namespace]
-    collection = _qdrant_collection_name(namespace)
+    collection = _qdrant_collection_name(namespace, collection_prefix)
     if not client.collection_exists(collection):
         logger.warning("Collection %r does not exist — skipping namespace %r", collection, namespace)
         return {"namespace": namespace, "skipped": True}
@@ -287,6 +300,17 @@ def parse_args() -> argparse.Namespace:
         help="Tenant id written to/read from workspace_id — NOT a Qdrant collection name.",
     )
     ap.add_argument(
+        "--collection-prefix",
+        default=os.environ.get("HARS_MEMORY_QDRANT_COLLECTION_PREFIX"),
+        required="HARS_MEMORY_QDRANT_COLLECTION_PREFIX" not in os.environ,
+        help=(
+            "Per-project prefix applied to the fixed lightrag_vdb_{chunks,entities,"
+            "relationships} collection names, so multiple projects can share one "
+            "Qdrant container without colliding on schema. Required (env: "
+            "HARS_MEMORY_QDRANT_COLLECTION_PREFIX) — no default."
+        ),
+    )
+    ap.add_argument(
         "--namespace",
         choices=[*NAMESPACES.keys(), "all"],
         default="all",
@@ -313,6 +337,7 @@ def main() -> None:
                 working_dir=working_dir,
                 namespace=namespace,
                 workspace=args.workspace,
+                collection_prefix=args.collection_prefix,
                 scroll_batch_size=args.batch_size,
             )
         else:
@@ -321,6 +346,7 @@ def main() -> None:
                 working_dir=working_dir,
                 namespace=namespace,
                 workspace=args.workspace,
+                collection_prefix=args.collection_prefix,
                 batch_size=args.batch_size,
             )
         results.append(result)
