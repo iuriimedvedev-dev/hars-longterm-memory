@@ -113,6 +113,7 @@ class ChangeReport:
     """Outcome of comparing a batch of documents against a ``FingerprintStore``."""
 
     changed_doc_ids: tuple[str, ...]
+    unchanged_doc_ids: tuple[str, ...]  # byte-identical to the stored fingerprint
     unchanged_count: int
     no_fingerprint_count: int  # never deleted — fingerprint recorded going forward
 
@@ -136,7 +137,7 @@ def detect_changed_documents(
         then reinsert.
     """
     changed: list[str] = []
-    unchanged = 0
+    unchanged: list[str] = []
     no_fingerprint = 0
     for doc in docs:
         current = compute_fingerprint(doc.content)
@@ -151,11 +152,12 @@ def detect_changed_documents(
                 doc.source_path,
             )
         else:
-            unchanged += 1
+            unchanged.append(doc.doc_id)
         store.set(doc.doc_id, current)
     return ChangeReport(
         changed_doc_ids=tuple(changed),
-        unchanged_count=unchanged,
+        unchanged_doc_ids=tuple(unchanged),
+        unchanged_count=len(unchanged),
         no_fingerprint_count=no_fingerprint,
     )
 

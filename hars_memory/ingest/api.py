@@ -41,26 +41,46 @@ raising (e.g. a broken vector store), ``rag.adelete_by_doc_id()`` raising, or
 ``rag.ainsert()`` raising a programming error -- not per-document extraction
 failures, which are LightRAG's own concern to retry.
 
-Content fingerprinting does NOT gate ``ainsert()``
-----------------------------------------------------
-Every call to ``ingest_documents()`` hands *every* incoming document to
-``ainsert()``, exactly like ``server/index.py``'s walk-driven CLI does for
-its own full document set on every run. The content fingerprint (see
-``change_detection.py``) is used only to detect documents whose content
-changed since a previous call, so their stale content can be force-deleted
-(``adelete_by_doc_id``) before the batched reinsert -- LightRAG's own
-doc_id-based dedupe would otherwise silently keep the old content forever.
-Unchanged documents are still passed to ``ainsert()`` on every call (this is
-cheap: LightRAG's own doc_status set-diff, done at enqueue time before any
-embed/extract work, already skips already-``processed`` doc_ids and retries
-``FAILED``/``PENDING``/``PROCESSING`` ones). An earlier version of this
-function used the fingerprint to *skip* calling ``ainsert()`` for
-byte-identical content -- that defeated the self-healing story above, since
-a document LightRAG had marked ``FAILED`` would never be handed to
-``ainsert()`` again as long as its content stayed unchanged. Fingerprints
-are only persisted (``store.save()``) after the whole insert call completes
-without raising, so a failed/errored call leaves the on-disk store exactly
-as it was and is safe to retry with the same input.
+Content fingerprinting DOES gate ``ainsert()`` -- but only for documents that
+were previously inserted successfully
+--------------------------------------------------------------------------
+Unlike ``server/index.py``'s walk-driven CLI (which re-hands its *entire*
+document set to ``ainsert()`` on every run, gated only by the opt-in
+``--refresh-changed`` delete-before-reinsert step), ``ingest_documents()``
+uses the content fingerprint (see ``change_detection.py``) to decide, per
+document, whether to call ``ainsert()`` at all this call:
+
+* Unchanged content, previously recorded fingerprint matches -- the document
+  is SKIPPED, not handed to ``ainsert()``. This is required, not just an
+  optimisation: the installed ``lightrag-hku`` package's default
+  ``JsonDocStatusStorage.filter_keys()`` is a blunt existence check (any
+  doc_id already present in doc_status counts as "seen", regardless of
+  whether its status is ``PROCESSED`` or ``FAILED``), and
+  ``apipeline_enqueue_documents`` writes a brand-new, non-idempotent
+  ``FAILED``/``is_duplicate`` doc_status record (plus a warning log) for
+  every doc_id it is asked to enqueue that is already present -- there is no
+  free "already processed, no-op" path inside LightRAG itself. Resubmitting
+  unchanged, already-successful documents on every call would therefore
+  permanently accumulate junk duplicate-marker records in doc_status storage
+  on every repeat ingest of the same corpus. Skipping them here is what
+  keeps repeat calls over an unchanged corpus (the normal staging ->
+  periodic-reingest cycle) side-effect-free.
+* No previously recorded fingerprint (never inserted, OR a prior call's
+  insert failed and therefore never reached ``store.save()`` -- see below)
+  -- the document IS handed to ``ainsert()``. This is what gives a document
+  LightRAG marked ``FAILED``, or a document this module never got to persist
+  a fingerprint for, a real retry path.
+* Changed content (fingerprint differs from what's on record) -- the
+  document IS handed to ``ainsert()``, and its stale content is
+  force-deleted first (``adelete_by_doc_id``) so LightRAG's doc_id-based
+  dedupe cannot silently keep the old content forever.
+
+Fingerprints are only persisted (``store.save()``) after the whole
+delete+insert call completes without raising, so a failed/errored call
+leaves the on-disk store exactly as it was and the same documents are
+retried, unchanged, on the next call -- restoring a document to "unchanged,
+skip it" status only happens once an insert of ITS batch has actually
+succeeded.
 """
 
 from __future__ import annotations
@@ -89,10 +109,10 @@ _DEFAULT_INSERT_BATCH_SIZE = 10
 class IngestResult:
     """Outcome of an `ingest_documents()` call.
 
-    `documents_skipped` is informational only: it counts documents whose
-    content fingerprint was unchanged from a previous call. It does NOT mean
-    those documents were excluded from `ainsert()` -- every document in the
-    call is always passed to `ainsert()`; see the module docstring.
+    `documents_skipped` counts documents whose content fingerprint matched a
+    previously *successful* insert -- these were excluded from `ainsert()`
+    entirely this call (see the module docstring for why: LightRAG's own
+    doc_status dedupe is not a free no-op for already-seen doc_ids).
     """
 
     documents_written: int
@@ -109,17 +129,18 @@ def ingest_documents(docs: list[Document], *, index_dir: Path) -> IngestResult:
     `memory-index` walker path instead -- this function does not walk
     anything, it only accepts documents the caller has already built.
 
-    Uses the same content-fingerprint change detection as
-    ``server/index.py --refresh-changed``: every document is handed to
-    LightRAG's ``ainsert()`` on every call (see this module's docstring,
-    "Content fingerprinting does NOT gate ``ainsert()``"); a document whose
-    content changed since a previous call is additionally deleted (by
-    ``doc_id``) before that same batched insert. ``documents_skipped``
-    reports how many of the incoming documents were byte-identical to what
-    was recorded for their ``doc_id`` on a previous call -- informational
-    only, it does not mean they were excluded from ``ainsert()``. See this
-    module's docstring for what "written" does and does not guarantee about
-    downstream LLM extraction.
+    Uses content-fingerprint change detection (see ``change_detection.py``)
+    to decide, per document, whether to call LightRAG's ``ainsert()`` at all
+    this call (see this module's docstring, "Content fingerprinting DOES
+    gate ``ainsert()``"): documents byte-identical to a previously
+    *successful* insert are skipped; documents with no recorded fingerprint
+    (never inserted, or a prior insert of them failed) or with changed
+    content are handed to ``ainsert()``, with changed-content documents
+    additionally deleted (by ``doc_id``) first so LightRAG's doc_id-based
+    dedupe cannot silently keep stale content. ``documents_skipped`` reports
+    how many incoming documents were excluded from ``ainsert()`` this call
+    for exactly that reason. See this module's docstring for what "written"
+    does and does not guarantee about downstream LLM extraction.
     """
     return asyncio.run(_ingest_documents_async(docs, index_dir))
 
@@ -131,6 +152,14 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
     fingerprint_path = default_fingerprint_store_path(index_dir)
     store = FingerprintStore.load(fingerprint_path)
     report = detect_changed_documents(docs, store)
+
+    # Pre-filter: documents whose content fingerprint matched a previously
+    # *successful* insert are never handed to ainsert() at all -- see the
+    # module docstring's "Content fingerprinting DOES gate ainsert()"
+    # section for why this is required, not optional. Everything else
+    # (no recorded fingerprint yet, or a fingerprint mismatch) is inserted.
+    unchanged_doc_ids = set(report.unchanged_doc_ids)
+    to_insert = [doc for doc in docs if doc.doc_id not in unchanged_doc_ids]
 
     from hars_memory.server.lightrag_init import create_lightrag
 
@@ -146,15 +175,22 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
             # doc_id -- delete the stale version before reinsert so
             # LightRAG's doc_id-based dedupe cannot silently keep it.
             await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
-        batch_size = int(
-            os.environ.get(_INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE))
-        )
-        await _insert_all_batches(rag, docs, batch_size)
-        written = len(docs)
+        if to_insert:
+            batch_size = int(
+                os.environ.get(_INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE))
+            )
+            await _insert_all_batches(rag, to_insert, batch_size)
+        written = len(to_insert)
         # Only persist fingerprints once the delete+insert above is fully
         # done -- an exception anywhere in this block leaves the on-disk
         # store untouched, so a retried call sees the same previous/current
         # comparison it would have seen if this call had never happened.
+        # This is what lets a document whose insert just failed be retried
+        # on the next call (its fingerprint never made it to disk, so it is
+        # classified as "no recorded fingerprint" -- not "unchanged, skip
+        # it" -- next time). Documents that were pre-filtered out above are
+        # re-recorded here too, but with the exact same value they already
+        # had on disk, so this is a no-op for them.
         store.save()
     except Exception as exc:  # noqa: BLE001 -- reported to the caller, not swallowed
         errors.append(str(exc))

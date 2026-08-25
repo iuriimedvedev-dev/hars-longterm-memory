@@ -128,6 +128,105 @@ def test_initialize_storages_failure_is_reported_via_errors_not_raised(
     fake_rag.finalize_storages.assert_not_called()
 
 
+def test_unchanged_previously_successful_doc_is_not_reinserted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A doc that succeeded on a previous call must NOT be handed to
+    _insert_all_batches() again on a later call with byte-identical content.
+
+    This is the regression this fix-round addresses: round 1 removed the
+    fingerprint pre-filter entirely, so every call unconditionally
+    resubmitted every document -- including unchanged, already-successful
+    ones -- to LightRAG's ainsert(), which (per the installed lightrag-hku
+    JsonDocStatusStorage.filter_keys()/apipeline_enqueue_documents behavior)
+    permanently writes a new duplicate FAILED doc_status record on every
+    such resubmission. The fingerprint gate must skip these documents
+    entirely, not just mark them "skipped" for reporting purposes.
+    """
+    doc = Document(
+        doc_id="ext:stable-1",
+        content="Experiment E11 confirmed hypothesis H4.",
+        source_kind=SourceKind.EXTERNAL,
+        source_path="postgres://experiments/11",
+        metadata={},
+    )
+
+    fake_rag = _make_fake_rag()
+    monkeypatch.setattr(
+        "hars_memory.server.lightrag_init.create_lightrag", lambda **kwargs: fake_rag
+    )
+
+    call_doc_id_batches: list[list[str]] = []
+
+    async def tracking_insert(rag, docs, batch_size):
+        call_doc_id_batches.append([d.doc_id for d in docs])
+
+    monkeypatch.setattr(api_module, "_insert_all_batches", tracking_insert)
+
+    first = ingest_documents([doc], index_dir=tmp_path)
+    assert first.documents_written == 1
+    assert first.documents_skipped == 0
+    assert first.errors == []
+    assert call_doc_id_batches == [["ext:stable-1"]]
+
+    second = ingest_documents([doc], index_dir=tmp_path)
+    assert second.errors == []
+    # The critical assertion: _insert_all_batches must NOT be called again
+    # for this doc -- the batch list must have exactly the one entry from
+    # the first call, not two.
+    assert call_doc_id_batches == [["ext:stable-1"]]
+    assert second.documents_written == 0
+    assert second.documents_skipped == 1
+
+
+def test_changed_content_is_always_resubmitted_and_deletes_stale_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A doc whose content changed since a previous successful call must
+    always be resubmitted to _insert_all_batches(), regardless of its prior
+    (successful) status -- and its stale content must be deleted first."""
+    doc_v1 = Document(
+        doc_id="ext:changing-1",
+        content="Experiment E12 confirmed hypothesis H5.",
+        source_kind=SourceKind.EXTERNAL,
+        source_path="postgres://experiments/12",
+        metadata={},
+    )
+    doc_v2 = Document(
+        doc_id="ext:changing-1",
+        content="Experiment E12 confirmed hypothesis H5 -- REVISED.",
+        source_kind=SourceKind.EXTERNAL,
+        source_path="postgres://experiments/12",
+        metadata={},
+    )
+
+    fake_rag = _make_fake_rag()
+    monkeypatch.setattr(
+        "hars_memory.server.lightrag_init.create_lightrag", lambda **kwargs: fake_rag
+    )
+
+    call_doc_id_batches: list[list[str]] = []
+
+    async def tracking_insert(rag, docs, batch_size):
+        call_doc_id_batches.append([d.doc_id for d in docs])
+
+    monkeypatch.setattr(api_module, "_insert_all_batches", tracking_insert)
+
+    first = ingest_documents([doc_v1], index_dir=tmp_path)
+    assert first.documents_written == 1
+    assert call_doc_id_batches == [["ext:changing-1"]]
+    fake_rag.adelete_by_doc_id.assert_not_awaited()  # nothing to delete yet
+
+    second = ingest_documents([doc_v2], index_dir=tmp_path)
+    assert second.errors == []
+    assert second.documents_written == 1
+    assert second.documents_skipped == 0
+    # The critical assertion: the changed doc IS resubmitted a second time.
+    assert call_doc_id_batches == [["ext:changing-1"], ["ext:changing-1"]]
+    # And its stale content was deleted before the reinsert.
+    fake_rag.adelete_by_doc_id.assert_awaited_once_with("ext:changing-1")
+
+
 def test_source_kind_has_no_postgres_specific_members() -> None:
     from hars_memory.ingest.document import SourceKind
 
