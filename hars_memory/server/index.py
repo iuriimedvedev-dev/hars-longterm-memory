@@ -8,7 +8,7 @@ this CLI; running this script directly does not protect a shared GPU.
 
 Usage:
     python tools/memory/server/index.py \\
-        --paths .reports .plans .session \\
+        --paths .plans docs \\
         [--full]              # full reindex (ignore change detection)
         [--refresh-changed]   # opt-in: delete+reinsert docs whose content
                                # changed since last ingest (default OFF, never
