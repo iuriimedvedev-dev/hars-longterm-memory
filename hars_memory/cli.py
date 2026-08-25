@@ -38,7 +38,7 @@ def _ensure_project_root() -> None:
 
 def index_main() -> None:
     _ensure_project_root()
-    from tools.memory.server.index import main
+    from hars_memory.server.index import main
 
     main()
 
@@ -57,7 +57,7 @@ def mcp_main() -> None:
 
 def eval_battle_main() -> None:
     _ensure_project_root()
-    from tools.memory.eval.battle import main
+    from hars_memory.eval.battle import main
 
     main()
 
@@ -68,7 +68,7 @@ def eval_battle_main() -> None:
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
-    from tools.memory.corpus.build import (
+    from hars_memory.corpus.build import (
         DEFAULT_CHUNK_OVERLAP,
         DEFAULT_CHUNK_SIZE,
         CorpusBuildError,
@@ -101,7 +101,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
 
 def _cmd_query(args: argparse.Namespace) -> int:
-    from tools.memory.corpus.query import DEFAULT_TOP_K, CorpusQueryError, search
+    from hars_memory.corpus.query import DEFAULT_TOP_K, CorpusQueryError, search
 
     top_k = args.top_k if args.top_k is not None else DEFAULT_TOP_K
     mode = args.mode or "fusion"
@@ -121,7 +121,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
-    from tools.memory.eval.corpus_eval import DEFAULT_MODE, DEFAULT_TOP_K, CorpusEvalError, run_eval
+    from hars_memory.eval.corpus_eval import DEFAULT_MODE, DEFAULT_TOP_K, CorpusEvalError, run_eval
 
     top_k = args.top_k if args.top_k is not None else DEFAULT_TOP_K
     mode = args.mode or DEFAULT_MODE
@@ -139,7 +139,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 
 def _cmd_regress(args: argparse.Namespace) -> int:
-    from tools.memory.eval.regression import RegressionError, compare_reports
+    from hars_memory.eval.regression import RegressionError, compare_reports
 
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
     candidate = json.loads(args.candidate.read_text(encoding="utf-8"))
@@ -162,7 +162,7 @@ def _cmd_regress(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    from tools.memory.corpus.build import MANIFEST_FILENAME
+    from hars_memory.corpus.build import MANIFEST_FILENAME
 
     manifest_path = args.index_dir / MANIFEST_FILENAME
     if not manifest_path.is_file():

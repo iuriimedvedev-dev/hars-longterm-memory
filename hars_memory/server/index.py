@@ -50,15 +50,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tools.memory.ingest.change_detection import (
+from hars_memory.ingest.change_detection import (
     FingerprintStore,
     default_fingerprint_store_path,
     detect_changed_documents,
 )
-from tools.memory.ingest.document import Document
-from tools.memory.ingest.walker import walk
-from tools.memory.server.gpu_guard import GpuBusyError, GpuGuardUnavailableError, assert_gpu_free
-from tools.memory.server.logging_setup import setup_logging
+from hars_memory.ingest.document import Document
+from hars_memory.ingest.walker import walk
+from hars_memory.server.gpu_guard import GpuBusyError, GpuGuardUnavailableError, assert_gpu_free
+from hars_memory.server.logging_setup import setup_logging
 
 setup_logging()
 logger = logging.getLogger("memory.index")
@@ -302,7 +302,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
         dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
         logger.info("Exporting Postgres tables from: %s", dsn.split("@")[-1])
         try:
-            from tools.memory.ingest.postgres_export import export_all
+            from hars_memory.ingest.postgres_export import export_all
             db_docs, db_stats = await export_all(dsn)
             logger.info(
                 "Postgres export: %d experiments, %d hypotheses, %d links",
@@ -328,7 +328,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     # LightRAG insertion (requires GPU-free extractor LLM)
     # -----------------------------------------------------------------------
-    from tools.memory.server.lightrag_init import create_lightrag, resolve_working_dir
+    from hars_memory.server.lightrag_init import create_lightrag, resolve_working_dir
 
     rag = create_lightrag()
     await rag.initialize_storages()
@@ -400,7 +400,7 @@ def main() -> None:
     # Permanent fail-closed guard: refuse to start against a stale GRAPHRAG_*
     # env (pre-2026-07-29 rename) instead of silently falling back to
     # HARS_MEMORY_* defaults. See server/legacy_env_guard.py.
-    from tools.memory.server.legacy_env_guard import refuse_if_legacy_graphrag_env
+    from hars_memory.server.legacy_env_guard import refuse_if_legacy_graphrag_env
 
     refuse_if_legacy_graphrag_env()
 

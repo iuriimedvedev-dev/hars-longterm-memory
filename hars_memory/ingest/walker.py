@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tools.memory.ingest.document import (
+from hars_memory.ingest.document import (
     HEADER_DATE_UNKNOWN,
     Document,
     SourceKind,

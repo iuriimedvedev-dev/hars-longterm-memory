@@ -88,11 +88,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
-from tools.memory.ingest.change_detection import compute_fingerprint
-from tools.memory.ingest.chunker import chunk_text
-from tools.memory.ingest.document import Document
-from tools.memory.ingest.walker import WalkStats, walk
-from tools.memory.retrieval.bm25_index import CHUNKS_FILENAME
+from hars_memory.ingest.change_detection import compute_fingerprint
+from hars_memory.ingest.chunker import chunk_text
+from hars_memory.ingest.document import Document
+from hars_memory.ingest.walker import WalkStats, walk
+from hars_memory.retrieval.bm25_index import CHUNKS_FILENAME
 
 logger = logging.getLogger(__name__)
 

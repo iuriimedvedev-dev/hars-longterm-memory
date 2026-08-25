@@ -34,9 +34,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from tools.memory.retrieval.bm25_index import BM25SparseIndex
-from tools.memory.retrieval.fusion import ChannelHit, fuse
-from tools.memory.retrieval.tokenizer import extract_identifier_terms
+from hars_memory.retrieval.bm25_index import BM25SparseIndex
+from hars_memory.retrieval.fusion import ChannelHit, fuse
+from hars_memory.retrieval.tokenizer import extract_identifier_terms
 
 # Matches HYBRID_CANDIDATE_POOL_MULTIPLIER in hars_longterm_memory_mcp.py — each
 # channel retrieves top_k * this many candidates before fusion/rerank.

@@ -71,7 +71,7 @@ async def _run_checks(mode: str) -> bool:
     questions = _load_gold()
 
     # Import the query function from the MCP server logic
-    from tools.memory.server.lightrag_init import create_lightrag, create_query_model_func
+    from hars_memory.server.lightrag_init import create_lightrag, create_query_model_func
     from lightrag import QueryParam  # type: ignore[import-not-found]
 
     rag = create_lightrag()

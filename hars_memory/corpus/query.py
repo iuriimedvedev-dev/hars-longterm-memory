@@ -36,14 +36,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Final
 
-from tools.memory.retrieval.bm25_index import (
+from hars_memory.retrieval.bm25_index import (
     CHUNKS_FILENAME,
     get_or_build_index as _bm25_get_or_build_index,
 )
-from tools.memory.retrieval.flat_index import (
+from hars_memory.retrieval.flat_index import (
     get_or_build_index as _flat_get_or_build_index,
 )
-from tools.memory.retrieval.fusion import ChannelHit, DEFAULT_HYBRID_ALPHA, fuse
+from hars_memory.retrieval.fusion import ChannelHit, DEFAULT_HYBRID_ALPHA, fuse
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ async def _search_dense_or_fusion(
     alpha: float,
 ) -> list[SearchHit]:
     _ensure_cpu_only()
-    from tools.memory.server.embedder import make_embedding_func  # lazy: see module docstring
+    from hars_memory.server.embedder import make_embedding_func  # lazy: see module docstring
 
     working_dir = str(index_dir)
     flat_cache = _resolve_flat_cache_dir(index_dir, flat_cache_dir)
