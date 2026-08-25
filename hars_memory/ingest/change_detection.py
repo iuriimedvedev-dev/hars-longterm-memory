@@ -98,6 +98,18 @@ class FingerprintStore:
     def set(self, doc_id: str, fingerprint: str) -> None:
         self._data[doc_id] = fingerprint
 
+    def discard(self, doc_id: str) -> None:
+        """Remove any recorded fingerprint for *doc_id*, if present.
+
+        Used to walk back an in-memory ``set()`` (e.g. from
+        ``detect_changed_documents()``) once the caller learns the insert it
+        was provisionally recorded for did not actually reach a durable
+        success state -- so the doc_id reverts to "no fingerprint on
+        record" (retry-eligible) rather than being persisted as current on
+        the next ``save()``.
+        """
+        self._data.pop(doc_id, None)
+
     def save(self) -> None:
         """Write the store to disk atomically (write-tmp then replace)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
