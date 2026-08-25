@@ -47,7 +47,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tools.memory.ingest.document import Document
+from hars_memory.ingest.document import Document
 
 logger = logging.getLogger(__name__)
 

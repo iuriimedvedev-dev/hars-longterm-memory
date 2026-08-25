@@ -335,18 +335,18 @@ def create_lightrag(
     # server / index.py startup). Re-running setup_logging() here — idempotent,
     # cheap — re-applies our level/handlers to the "lightrag" logger every
     # time. See logging_setup._capture_lightrag_logger's docstring.
-    from tools.memory.server.logging_setup import setup_logging
+    from hars_memory.server.logging_setup import setup_logging
 
     setup_logging()
 
-    from tools.memory.server.embedder import (
+    from hars_memory.server.embedder import (
         embedding_dimension,
         make_embedding_func,
         validate_embedder_against_index,
     )
-    from tools.memory.server.reranker import make_rerank_func
-    from tools.memory.schema.entity_types import EntityType
-    from tools.memory.schema.extraction_prompt import DOMAIN_EXTRACTION_GUIDANCE
+    from hars_memory.server.reranker import make_rerank_func
+    from hars_memory.schema.entity_types import EntityType
+    from hars_memory.schema.extraction_prompt import DOMAIN_EXTRACTION_GUIDANCE
 
     # Append domain guidance (naming normalisation, table handling, type
     # discipline) to LightRAG's default extraction prompt.  Idempotent.

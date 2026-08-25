@@ -47,7 +47,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 
-from tools.memory.retrieval.supersession import apply_supersession_scoring
+from hars_memory.retrieval.supersession import apply_supersession_scoring
 
 # Guards the supersession-aware re-scoring pass (retrieval/supersession.py)
 # behind an env flag, following the HARS_MEMORY_* env convention used

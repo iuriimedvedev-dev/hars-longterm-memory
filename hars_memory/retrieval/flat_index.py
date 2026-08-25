@@ -120,7 +120,7 @@ from typing import Any, Awaitable, Callable
 
 import numpy as np
 
-from tools.memory.retrieval.bm25_index import CHUNKS_FILENAME
+from hars_memory.retrieval.bm25_index import CHUNKS_FILENAME
 
 logger = logging.getLogger(__name__)
 

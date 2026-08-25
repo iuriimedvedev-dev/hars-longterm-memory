@@ -158,7 +158,7 @@ async def purge_documents(
     os.environ.setdefault("HARS_MEMORY_EMBED_LOCAL_FILES_ONLY", "1")
     os.environ.setdefault("HARS_MEMORY_EMBED_DEVICE", "cpu")
     os.environ.setdefault("HF_HOME", "/mnt/datasets/models/.hf_home")
-    from tools.memory.server.lightrag_init import create_lightrag
+    from hars_memory.server.lightrag_init import create_lightrag
 
     rag = create_lightrag(working_dir=str(working_dir))
     await rag.initialize_storages()

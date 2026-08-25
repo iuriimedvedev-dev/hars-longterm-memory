@@ -56,7 +56,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import yaml  # type: ignore[import-not-found]
 
-from tools.memory.eval.channels import (
+from hars_memory.eval.channels import (
     RankedHit,
     dense_only,
     hybrid_bm25,
@@ -65,7 +65,7 @@ from tools.memory.eval.channels import (
     lightrag_mode,
     ranked_file_paths,
 )
-from tools.memory.eval.metrics import (
+from hars_memory.eval.metrics import (
     dedupe_preserve_order,
     mean_reciprocal_rank,
     ndcg_at_k,
@@ -75,8 +75,8 @@ from tools.memory.eval.metrics import (
     supersession_error_rate,
     supersession_violated,
 )
-from tools.memory.retrieval import fusion as fusion_config
-from tools.memory.server.lightrag_init import DEFAULT_WORKING_DIR as _DEFAULT_LIGHTRAG_WORKING_DIR
+from hars_memory.retrieval import fusion as fusion_config
+from hars_memory.server.lightrag_init import DEFAULT_WORKING_DIR as _DEFAULT_LIGHTRAG_WORKING_DIR
 
 logger = logging.getLogger("memory.eval.ab_bench")
 
@@ -486,7 +486,7 @@ def aggregate_scores(
 
 
 async def _build_rag(embed_cache: bool = True) -> tuple[Any, Any]:
-    from tools.memory.server.lightrag_init import create_lightrag
+    from hars_memory.server.lightrag_init import create_lightrag
 
     rag = create_lightrag()
     await rag.initialize_storages()
@@ -495,7 +495,7 @@ async def _build_rag(embed_cache: bool = True) -> tuple[Any, Any]:
 
 
 async def _build_bm25(working_dir: str, cache_dir: str) -> Any:
-    from tools.memory.retrieval.bm25_index import get_or_build_index
+    from hars_memory.retrieval.bm25_index import get_or_build_index
 
     index, stats = await asyncio.to_thread(get_or_build_index, working_dir, cache_dir)
     logger.info(
@@ -506,7 +506,7 @@ async def _build_bm25(working_dir: str, cache_dir: str) -> Any:
 
 
 def _build_rerank_func(model_name: str, hf_cache_dir: str) -> Any:
-    from tools.memory.server.reranker import make_rerank_func
+    from hars_memory.server.reranker import make_rerank_func
 
     return make_rerank_func(model_name=model_name, device="cpu", hf_cache_dir=hf_cache_dir)
 

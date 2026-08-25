@@ -177,8 +177,8 @@ from json import JSONDecodeError, loads as json_loads
 from pathlib import Path
 from typing import Final
 
-from tools.memory.ingest.document import file_stable_id
-from tools.memory.retrieval.tokenizer import extract_identifier_terms, looks_like_identifier
+from hars_memory.ingest.document import file_stable_id
+from hars_memory.retrieval.tokenizer import extract_identifier_terms, looks_like_identifier
 
 logger = logging.getLogger(__name__)
 

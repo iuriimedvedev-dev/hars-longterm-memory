@@ -73,9 +73,9 @@ from typing import Any, Final
 
 import yaml  # type: ignore[import-not-found]
 
-from tools.memory.corpus.build import MANIFEST_FILENAME, TOOL_VERSION
-from tools.memory.corpus.query import DEFAULT_ALPHA, DEFAULT_EMBED_MODEL, SearchHit, search
-from tools.memory.eval.metrics import (
+from hars_memory.corpus.build import MANIFEST_FILENAME, TOOL_VERSION
+from hars_memory.corpus.query import DEFAULT_ALPHA, DEFAULT_EMBED_MODEL, SearchHit, search
+from hars_memory.eval.metrics import (
     dedupe_preserve_order,
     mean_reciprocal_rank,
     ndcg_at_k,

@@ -3,11 +3,11 @@
 One stable-ID document per row.  No LLM calls.  GPU-free.
 
 Usage (dry-run, no DB needed):
-    from tools.memory.ingest.postgres_export import transform_experiment_row
+    from hars_memory.ingest.postgres_export import transform_experiment_row
     doc = transform_experiment_row({"id": "abc", "name": "test", "status": "running"})
 
 Usage (live, requires DB):
-    from tools.memory.ingest.postgres_export import export_all
+    from hars_memory.ingest.postgres_export import export_all
     docs, stats = await export_all(dsn="postgresql://...")
 """
 
@@ -18,8 +18,8 @@ import json
 import logging
 from dataclasses import dataclass
 
-from tools.memory.ingest.document import HEADER_DATE_UNKNOWN, Document, SourceKind, build_source_header
-from tools.memory.schema.entity_types import make_stable_id
+from hars_memory.ingest.document import HEADER_DATE_UNKNOWN, Document, SourceKind, build_source_header
+from hars_memory.schema.entity_types import make_stable_id
 
 logger = logging.getLogger(__name__)
 

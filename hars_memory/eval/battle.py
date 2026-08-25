@@ -26,8 +26,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tools.memory.ingest.document import Document
-from tools.memory.ingest.walker import walk
+from hars_memory.ingest.document import Document
+from hars_memory.ingest.walker import walk
 
 logger = logging.getLogger("memory.eval.battle")
 
@@ -189,7 +189,7 @@ async def _load_docs(paths: list[str], *, db_export: bool) -> list[Document]:
 
     if db_export:
         dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
-        from tools.memory.ingest.postgres_export import export_all
+        from hars_memory.ingest.postgres_export import export_all
 
         db_docs, db_stats = await export_all(dsn)
         docs.extend(db_docs)
@@ -224,7 +224,7 @@ async def _run_battle(args: argparse.Namespace) -> int:
         return 0
 
     from lightrag import QueryParam  # type: ignore[import-not-found]
-    from tools.memory.server.lightrag_init import create_lightrag, create_query_model_func
+    from hars_memory.server.lightrag_init import create_lightrag, create_query_model_func
 
     rag = create_lightrag()
     await rag.initialize_storages()

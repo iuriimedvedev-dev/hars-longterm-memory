@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tools.memory.retrieval.tokenizer import tokenize_identifiers
+from hars_memory.retrieval.tokenizer import tokenize_identifiers
 
 logger = logging.getLogger(__name__)
 

@@ -247,7 +247,7 @@ def setup_logging(*, level: str | None = None) -> logging.Logger:
     Safe to call from every entrypoint in this process tree (MCP server,
     index.py, eval CLIs) and more than once within a single one (e.g. the
     MCP server at startup, then again from
-    ``tools.memory.server.lightrag_init.create_lightrag()`` once LightRAG
+    ``hars_memory.server.lightrag_init.create_lightrag()`` once LightRAG
     has actually been imported — see ``_capture_lightrag_logger``'s
     docstring for why that second call matters).
 
