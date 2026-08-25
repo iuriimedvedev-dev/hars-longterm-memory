@@ -23,9 +23,14 @@ class SourceKind(str, Enum):
     PYTHON = "python"
     JSON = "json"
     TEXT = "text"
-    POSTGRES_EXPERIMENT = "postgres:experiment"
-    POSTGRES_HYPOTHESIS = "postgres:hypothesis"
-    POSTGRES_HYPOTHESIS_LINK = "postgres:hypothesis_link"
+    # Generic tag for documents that did not come from a walked file on
+    # disk -- e.g. rows exported from an external database (Cortex's
+    # experiments/hypotheses tables, or any other caller's own source).
+    # Deliberately not one member per external system/table: hars_memory
+    # itself must stay free of any particular external system's schema or
+    # vocabulary (see ingest/api.py). Per-source detail belongs in
+    # Document.metadata, not in this enum.
+    EXTERNAL = "external"
 
 
 @dataclass(slots=True)

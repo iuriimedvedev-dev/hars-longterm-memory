@@ -106,7 +106,7 @@ def transform_experiment_row(row: dict[str, object]) -> Document:
     return Document(
         doc_id=doc_id,
         content=content,
-        source_kind=SourceKind.POSTGRES_EXPERIMENT,
+        source_kind=SourceKind.EXTERNAL,
         source_path=f"postgres://experiments/{row_id}",
         metadata={k: v for k, v in row.items() if k not in ("config",)},
     )
@@ -146,7 +146,7 @@ def transform_hypothesis_row(row: dict[str, object]) -> Document:
     return Document(
         doc_id=doc_id,
         content=content,
-        source_kind=SourceKind.POSTGRES_HYPOTHESIS,
+        source_kind=SourceKind.EXTERNAL,
         source_path=f"postgres://hypotheses/{row_id}",
         metadata=dict(row),
     )
@@ -177,7 +177,7 @@ def transform_hypothesis_link_row(row: dict[str, object]) -> Document:
     return Document(
         doc_id=doc_id,
         content=content,
-        source_kind=SourceKind.POSTGRES_HYPOTHESIS_LINK,
+        source_kind=SourceKind.EXTERNAL,
         source_path=f"postgres://hypothesis_links/{row_id}",
         metadata=dict(row),
     )
