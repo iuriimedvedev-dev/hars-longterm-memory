@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from lightrag.base import DocProcessingStatus, DocStatus
 
 from hars_memory.ingest import api as api_module
 from hars_memory.ingest.api import IngestResult, ingest_documents
@@ -25,11 +26,50 @@ def test_ingest_documents_returns_result_with_counts(tmp_path: Path) -> None:
     assert result.errors == []
 
 
-def _make_fake_rag() -> AsyncMock:
+def _make_fake_rag(doc_statuses: dict[str, DocStatus] | None = None) -> AsyncMock:
+    """Build a fake LightRAG instance, mirroring the real
+    `rag.doc_status.get_docs_by_status(DocStatus)` API `_ingest_documents_async`
+    now queries after an insert (see `hars_memory.ingest.api`).
+
+    Callers' `_insert_all_batches` replacements must record which doc_ids
+    they "inserted" via `rag._known_doc_ids.update(doc_id, ...)` -- the fake
+    `get_docs_by_status` only knows about doc_ids explicitly registered this
+    way, exactly like a real doc_status store only knows about doc_ids it
+    has actually seen.
+
+    `doc_statuses` overrides the per-doc_id status a *registered* doc_id is
+    reported as; any registered doc_id not present there defaults to
+    `DocStatus.PROCESSED` (i.e. "insert succeeded for real"), which is what
+    every pre-existing invariant test in this module expects.
+    """
+    overrides = doc_statuses or {}
+    known_doc_ids: set[str] = set()
+
+    async def fake_get_docs_by_status(
+        status: DocStatus,
+    ) -> dict[str, DocProcessingStatus]:
+        result: dict[str, DocProcessingStatus] = {}
+        for doc_id in known_doc_ids:
+            effective_status = overrides.get(doc_id, DocStatus.PROCESSED)
+            if effective_status != status:
+                continue
+            result[doc_id] = DocProcessingStatus(
+                content_summary="stub",
+                content_length=0,
+                file_path="stub",
+                status=effective_status,
+                created_at="2026-01-01T00:00:00",
+                updated_at="2026-01-01T00:00:00",
+            )
+        return result
+
     rag = AsyncMock()
     rag.initialize_storages = AsyncMock(return_value=None)
     rag.finalize_storages = AsyncMock(return_value=None)
     rag.adelete_by_doc_id = AsyncMock(return_value=None)
+    rag.doc_status = AsyncMock()
+    rag.doc_status.get_docs_by_status = AsyncMock(side_effect=fake_get_docs_by_status)
+    rag._known_doc_ids = known_doc_ids
     return rag
 
 
@@ -45,6 +85,13 @@ def test_failed_insert_does_not_permanently_skip_unchanged_content(
     once would be silently skipped forever on every subsequent call with
     unchanged content -- defeating LightRAG's own FAILED-doc retry story
     that this module's docstring relies on.
+
+    This covers the *call-level* failure mode: _insert_all_batches() itself
+    raises. See
+    test_per_doc_failed_status_inside_non_raising_insert_is_not_persisted
+    below for the distinct, more subtle case fixed in round 3: the insert
+    call returns normally but LightRAG marked one of its documents FAILED
+    internally.
     """
     doc = Document(
         doc_id="ext:retry-1",
@@ -75,6 +122,7 @@ def test_failed_insert_does_not_permanently_skip_unchanged_content(
 
     async def succeeding_insert(rag, docs, batch_size):
         call_doc_id_batches.append([d.doc_id for d in docs])
+        rag._known_doc_ids.update(d.doc_id for d in docs)
 
     monkeypatch.setattr(api_module, "_insert_all_batches", succeeding_insert)
 
@@ -86,6 +134,76 @@ def test_failed_insert_does_not_permanently_skip_unchanged_content(
     # despite the earlier failure.
     assert call_doc_id_batches == [["ext:retry-1"], ["ext:retry-1"]]
     assert second.documents_written == 1
+
+
+def test_per_doc_failed_status_inside_non_raising_insert_is_not_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The insert *call* not raising must not be conflated with "this
+    document was actually processed successfully".
+
+    Per LightRAG's documented self-healing model (see this module's
+    docstring): when the extractor LLM is unreachable, ainsert() does NOT
+    raise -- LightRAG catches the per-document extraction failure
+    internally, marks that individual document's doc_status FAILED, and
+    returns normally. This test mocks exactly that: _insert_all_batches()
+    returns normally (no exception), but the doc's simulated doc_status
+    comes back FAILED. The fingerprint for that doc_id must NOT be
+    persisted -- it must remain eligible for resubmission (and hence
+    LightRAG's own internal FAILED-doc retry sweep) on the next call with
+    unchanged content, exactly like a call-level failure.
+    """
+    doc = Document(
+        doc_id="ext:extraction-failed-1",
+        content="Experiment E13 confirmed hypothesis H6.",
+        source_kind=SourceKind.EXTERNAL,
+        source_path="postgres://experiments/13",
+        metadata={},
+    )
+
+    fake_rag = _make_fake_rag(
+        doc_statuses={"ext:extraction-failed-1": DocStatus.FAILED}
+    )
+    monkeypatch.setattr(
+        "hars_memory.server.lightrag_init.create_lightrag", lambda **kwargs: fake_rag
+    )
+
+    call_doc_id_batches: list[list[str]] = []
+
+    async def non_raising_insert(rag, docs, batch_size):
+        # Simulates LightRAG's self-healing behaviour: the call itself
+        # completes normally even though the document's own extraction
+        # failed internally. Registering the doc_id here mimics LightRAG
+        # actually having written a (FAILED) doc_status record for it --
+        # `rag.doc_status.get_docs_by_status` is queried separately below.
+        call_doc_id_batches.append([d.doc_id for d in docs])
+        rag._known_doc_ids.update(d.doc_id for d in docs)
+
+    monkeypatch.setattr(api_module, "_insert_all_batches", non_raising_insert)
+
+    first = ingest_documents([doc], index_dir=tmp_path)
+    # The call-level contract is unchanged: "written" only means "handed to
+    # ainsert() without that call raising", per the module docstring -- it
+    # does NOT require extraction to have succeeded.
+    assert first.documents_written == 1
+    assert first.documents_skipped == 0
+    assert first.errors == []
+    assert call_doc_id_batches == [["ext:extraction-failed-1"]]
+    fake_rag.doc_status.get_docs_by_status.assert_awaited_once_with(DocStatus.PROCESSED)
+
+    second = ingest_documents([doc], index_dir=tmp_path)
+    assert second.errors == []
+    # The critical assertion: even though content is byte-identical to the
+    # first call, and that first call's _insert_all_batches() did NOT raise,
+    # the doc must be handed to _insert_all_batches() again -- because its
+    # doc_status came back FAILED, not PROCESSED, so no fingerprint was ever
+    # persisted for it.
+    assert call_doc_id_batches == [
+        ["ext:extraction-failed-1"],
+        ["ext:extraction-failed-1"],
+    ]
+    assert second.documents_written == 1
+    assert second.documents_skipped == 0
 
 
 def test_initialize_storages_failure_is_reported_via_errors_not_raised(
@@ -160,6 +278,7 @@ def test_unchanged_previously_successful_doc_is_not_reinserted(
 
     async def tracking_insert(rag, docs, batch_size):
         call_doc_id_batches.append([d.doc_id for d in docs])
+        rag._known_doc_ids.update(d.doc_id for d in docs)
 
     monkeypatch.setattr(api_module, "_insert_all_batches", tracking_insert)
 
@@ -209,6 +328,7 @@ def test_changed_content_is_always_resubmitted_and_deletes_stale_content(
 
     async def tracking_insert(rag, docs, batch_size):
         call_doc_id_batches.append([d.doc_id for d in docs])
+        rag._known_doc_ids.update(d.doc_id for d in docs)
 
     monkeypatch.setattr(api_module, "_insert_all_batches", tracking_insert)
 

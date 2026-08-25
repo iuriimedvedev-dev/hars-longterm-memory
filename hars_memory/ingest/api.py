@@ -65,22 +65,36 @@ document, whether to call ``ainsert()`` at all this call:
   on every repeat ingest of the same corpus. Skipping them here is what
   keeps repeat calls over an unchanged corpus (the normal staging ->
   periodic-reingest cycle) side-effect-free.
-* No previously recorded fingerprint (never inserted, OR a prior call's
-  insert failed and therefore never reached ``store.save()`` -- see below)
-  -- the document IS handed to ``ainsert()``. This is what gives a document
-  LightRAG marked ``FAILED``, or a document this module never got to persist
-  a fingerprint for, a real retry path.
+* No previously recorded fingerprint (never inserted, OR a prior call never
+  confirmed a durable success for it -- see below) -- the document IS handed
+  to ``ainsert()``. This is what gives a document LightRAG marked ``FAILED``,
+  or a document this module never got to persist a fingerprint for, a real
+  retry path.
 * Changed content (fingerprint differs from what's on record) -- the
   document IS handed to ``ainsert()``, and its stale content is
   force-deleted first (``adelete_by_doc_id``) so LightRAG's doc_id-based
   dedupe cannot silently keep the old content forever.
 
-Fingerprints are only persisted (``store.save()``) after the whole
-delete+insert call completes without raising, so a failed/errored call
-leaves the on-disk store exactly as it was and the same documents are
-retried, unchanged, on the next call -- restoring a document to "unchanged,
-skip it" status only happens once an insert of ITS batch has actually
-succeeded.
+A fingerprint is only ever persisted (``store.save()``) for a doc_id once
+BOTH of the following hold: the delete+insert call for its batch completed
+without raising, AND that specific doc_id's ``doc_status`` -- queried
+afterwards via ``rag.doc_status.get_docs_by_status(DocStatus.PROCESSED)``
+(mirroring the doc-selection pattern
+``LightRAG.apipeline_process_enqueue_documents`` itself uses internally) --
+came back ``PROCESSED``. The insert call not raising is necessary but NOT
+sufficient: per the self-healing model above, a per-document extraction
+failure is caught internally and leaves that one doc_id ``FAILED`` without
+raising anything, so a batch can complete "successfully" while individual
+documents inside it did not. Any doc_id in the batch that is not confirmed
+``PROCESSED`` has its provisional fingerprint (recorded in memory by
+``detect_changed_documents()`` before the insert ran) discarded before
+``store.save()``, so it reverts to "no fingerprint on record" and stays
+retry-eligible on the next call -- exactly like a doc_id whose insert call
+itself raised. A failed/errored call (an exception anywhere in the
+try-block) leaves the on-disk store completely untouched, for the same
+reason. Restoring a document to "unchanged, skip it" status therefore only
+happens once THAT document, specifically, has been confirmed ``PROCESSED``
+-- never merely because the batch call around it didn't raise.
 """
 
 from __future__ import annotations
@@ -162,6 +176,7 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
     to_insert = [doc for doc in docs if doc.doc_id not in unchanged_doc_ids]
 
     from hars_memory.server.lightrag_init import create_lightrag
+    from lightrag.base import DocStatus  # type: ignore[import-not-found]
 
     rag = create_lightrag(working_dir=str(index_dir))
     written = 0
@@ -180,17 +195,56 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
                 os.environ.get(_INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE))
             )
             await _insert_all_batches(rag, to_insert, batch_size)
+
+            inserted_ids = [doc.doc_id for doc in to_insert]
+            # _insert_all_batches()/ainsert() not raising only means the
+            # insert *call* completed -- it says nothing about whether any
+            # individual document actually reached a durable success state.
+            # Per LightRAG's self-healing model (see module docstring),
+            # ainsert() awaits apipeline_process_enqueue_documents() to
+            # completion, and that method's own doc-selection logic reads
+            # status via ``self.doc_status.get_docs_by_statuses(...)`` (see
+            # lightrag.py: it pulls PENDING/PROCESSING/FAILED docs to
+            # (re)process on every call) -- that per-doc-status storage,
+            # ``rag.doc_status`` (a ``DocStatusStorage``), is the
+            # authoritative source this mirrors here. Note:
+            # ``LightRAG.aget_docs_by_ids()`` is NOT used for this -- despite
+            # its type hint promising ``DocProcessingStatus`` values, the
+            # installed lightrag-hku's JSON backend has it wrap
+            # ``doc_status.get_by_id()``, which actually returns raw
+            # ``dict[str, Any]`` records (confirmed against
+            # ``JsonDocStatusStorage.get_by_ids()``), while
+            # ``get_docs_by_status(es)`` reliably normalises into typed
+            # ``DocProcessingStatus`` objects for every backend, per the
+            # ``DocStatusStorage`` ABC's own contract.
+            processed_docs = await rag.doc_status.get_docs_by_status(  # type: ignore[attr-defined]
+                DocStatus.PROCESSED
+            )
+            processed_ids = set(processed_docs)
+            for doc_id in inserted_ids:
+                if doc_id not in processed_ids:
+                    # FAILED (or PENDING/PROCESSING left mid-flight, or
+                    # missing from doc_status entirely) -- walk back the
+                    # provisional fingerprint detect_changed_documents()
+                    # recorded in memory for this doc_id so it is NOT
+                    # persisted below. It reverts to "no fingerprint on
+                    # record", which keeps it eligible for the pre-filter to
+                    # include (and hence resubmit / trigger LightRAG's own
+                    # FAILED-doc retry sweep) on the next call.
+                    store.discard(doc_id)
         written = len(to_insert)
         # Only persist fingerprints once the delete+insert above is fully
         # done -- an exception anywhere in this block leaves the on-disk
         # store untouched, so a retried call sees the same previous/current
         # comparison it would have seen if this call had never happened.
-        # This is what lets a document whose insert just failed be retried
-        # on the next call (its fingerprint never made it to disk, so it is
-        # classified as "no recorded fingerprint" -- not "unchanged, skip
-        # it" -- next time). Documents that were pre-filtered out above are
-        # re-recorded here too, but with the exact same value they already
-        # had on disk, so this is a no-op for them.
+        # This is what lets a document whose insert call itself failed (or
+        # whose individual extraction LightRAG marked FAILED, per the
+        # per-doc status check above) be retried on the next call (its
+        # fingerprint never made it to disk, so it is classified as "no
+        # recorded fingerprint" -- not "unchanged, skip it" -- next time).
+        # Documents that were pre-filtered out above are re-recorded here
+        # too, but with the exact same value they already had on disk, so
+        # this is a no-op for them.
         store.save()
     except Exception as exc:  # noqa: BLE001 -- reported to the caller, not swallowed
         errors.append(str(exc))
