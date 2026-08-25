@@ -1,8 +1,13 @@
 """Tests for attribution-header emission (`[Document: ... | Section: ... | Date: ...]`)
-on walker- and postgres-sourced documents.
+on walker-sourced documents.
 
 Reuses ``scripts/cleanup_kb.py``'s actual ``HEADER_RE`` (rather than a
 hand-copied regex) so these tests fail loudly if the two formats ever drift.
+
+Postgres-sourced header emission (transform_experiment_row and friends) is
+tested in ``tools/memory-config/tests/test_postgres_export.py`` now — the
+package itself is no longer coupled to Postgres (see
+``tools/memory-config/scripts/postgres_export.py``).
 """
 
 from __future__ import annotations
@@ -10,11 +15,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from hars_memory.ingest.document import HEADER_DATE_UNKNOWN, build_source_header
-from hars_memory.ingest.postgres_export import (
-    transform_experiment_row,
-    transform_hypothesis_link_row,
-    transform_hypothesis_row,
-)
 from hars_memory.ingest.walker import walk
 from hars_memory.scripts.cleanup_kb import HEADER_RE
 
@@ -108,30 +108,3 @@ class TestWalkerHeaderEmission:
         assert m.group("section").strip() == "memory"
         # Frontmatter survives, unmodified, right after the header.
         assert content.endswith(original)
-
-
-class TestPostgresHeaderEmission:
-    def test_experiment_row_header(self) -> None:
-        row = {"id": "42", "name": "exp-42", "status": "succeeded", "updated_at": "2026-06-01T10:00:00"}
-        doc = transform_experiment_row(row)
-        m = HEADER_RE.search(doc.content[:400])
-        assert m is not None
-        assert m.group("name").strip() == "exp:42"
-        assert m.group("section").strip() == "experiment"
-        assert m.group("date") == "2026-06-01"
-
-    def test_hypothesis_row_header_falls_back_to_created_at(self) -> None:
-        row = {"id": "abc", "title": "H1", "created_at": "2026-01-15T00:00:00"}
-        doc = transform_hypothesis_row(row)
-        m = HEADER_RE.search(doc.content[:400])
-        assert m is not None
-        assert m.group("section").strip() == "hypothesis"
-        assert m.group("date") == "2026-01-15"
-
-    def test_hypothesis_link_row_header_unknown_date_when_no_timestamp(self) -> None:
-        row = {"id": "9", "hypothesis_id": "abc", "entity_type": "experiment", "entity_id": "42"}
-        doc = transform_hypothesis_link_row(row)
-        m = HEADER_RE.search(doc.content[:400])
-        assert m is not None
-        assert m.group("section").strip() == "hypothesis_link"
-        assert m.group("date") == HEADER_DATE_UNKNOWN

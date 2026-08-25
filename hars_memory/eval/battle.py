@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import random
 import re
 from dataclasses import asdict, dataclass
@@ -172,7 +171,11 @@ def score_case(case: BattleCase, response: Any) -> BattleResult:
     )
 
 
-async def _load_docs(paths: list[str], *, db_export: bool) -> list[Document]:
+async def _load_docs(paths: list[str]) -> list[Document]:
+    # Postgres export moved to tools/memory-config/scripts/postgres_export.py
+    # (Cortex-specific, not part of the generic package — see
+    # docs/superpowers/specs/2026-08-25-hars-longterm-memory-standalone-extraction-design.md §1).
+    # This eval CLI only loads walked file docs now.
     resolved_paths = [
         _PROJECT_ROOT / p if not Path(p).is_absolute() else Path(p)
         for p in paths
@@ -184,20 +187,6 @@ async def _load_docs(paths: list[str], *, db_export: bool) -> list[Document]:
         json.dumps(stats.per_kind, sort_keys=True),
     )
 
-    if db_export:
-        dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
-        from hars_memory.ingest.postgres_export import export_all
-
-        db_docs, db_stats = await export_all(dsn)
-        docs.extend(db_docs)
-        logger.info(
-            "Loaded %d DB docs for eval generation (%d experiments, %d hypotheses, %d links)",
-            len(db_docs),
-            db_stats.experiments,
-            db_stats.hypotheses,
-            db_stats.hypothesis_links,
-        )
-
     return docs
 
 
@@ -205,7 +194,7 @@ async def _run_battle(args: argparse.Namespace) -> int:
     if args.cases < 1 or args.cases > 1000:
         raise SystemExit("--cases must be between 1 and 1000")
 
-    docs = await _load_docs(args.paths, db_export=args.db_export)
+    docs = await _load_docs(args.paths)
     cases = build_cases(docs, count=args.cases, seed=args.seed)
 
     if args.write_cases:
@@ -288,7 +277,6 @@ async def _run_battle(args: argparse.Namespace) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run generated long-term memory battle eval.")
     parser.add_argument("--paths", nargs="+", default=[".reports", ".plans", ".session"])
-    parser.add_argument("--db-export", action="store_true", default=False)
     parser.add_argument("--cases", type=int, default=100)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--mode", default="hybrid", choices=["local", "global", "hybrid", "naive", "mix"])

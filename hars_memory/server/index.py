@@ -8,7 +8,6 @@ exact same concurrency-guard pattern as .claude/skills/distillation.py.
 Usage (run when GPU is free):
     python tools/memory/server/index.py \\
         --paths .reports .plans .session \\
-        --db-export \\
         [--full]              # full reindex (ignore change detection)
         [--refresh-changed]   # opt-in: delete+reinsert docs whose content
                                # changed since last ingest (default OFF, never
@@ -20,7 +19,6 @@ Environment variables (see config/.env.example):
     HARS_MEMORY_EXTRACTOR_MODEL            - model name
     HARS_MEMORY_INDEX_DIR                - LightRAG KV store dir
     HARS_MEMORY_VECTOR_STORAGE             - LightRAG vector backend
-    HARS_MEMORY_POSTGRES_DSN               - hars-postgres DSN (read-only)
     HARS_API_BASE_URL                   - HARS backend (for GPU guard)
     HARS_MEMORY_GPU_GUARD_ALLOW_UNREACHABLE - "1" to fail OPEN instead of CLOSED
                                             when the GPU guard backend is
@@ -88,12 +86,6 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         default=[".reports", ".plans", ".session"],
         help="Directories or files to ingest (relative to project root).",
-    )
-    parser.add_argument(
-        "--db-export",
-        action="store_true",
-        default=False,
-        help="Also export experiments/hypotheses from hars-postgres.",
     )
     parser.add_argument(
         "--full",
@@ -273,7 +265,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
             logger.error("BLOCKED: %s", exc)
             logger.error(
                 "Wait for the training run to complete, then re-run:\n"
-                "  python tools/memory/server/index.py --paths .reports .plans --db-export"
+                "  python tools/memory/server/index.py --paths .reports .plans"
             )
             sys.exit(1)
 
@@ -291,26 +283,12 @@ async def _run_indexing(args: argparse.Namespace) -> None:
         json.dumps(stats.per_kind, indent=None),
     )
 
-    # -----------------------------------------------------------------------
-    # Postgres export
-    # -----------------------------------------------------------------------
-    db_docs: list = []
-    if args.db_export:
-        dsn = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
-        logger.info("Exporting Postgres tables from: %s", dsn.split("@")[-1])
-        try:
-            from hars_memory.ingest.postgres_export import export_all
-            db_docs, db_stats = await export_all(dsn)
-            logger.info(
-                "Postgres export: %d experiments, %d hypotheses, %d links",
-                db_stats.experiments,
-                db_stats.hypotheses,
-                db_stats.hypothesis_links,
-            )
-        except Exception as exc:
-            logger.warning("Postgres export failed (skipping): %s", exc)
-
-    all_docs = docs + db_docs
+    # Postgres export moved to tools/memory-config/scripts/postgres_export.py
+    # (Cortex-specific, not part of the generic package — see
+    # docs/superpowers/specs/2026-08-25-hars-longterm-memory-standalone-extraction-design.md §1).
+    # Run that script separately (it calls hars_memory.ingest.api.ingest_documents()
+    # directly) instead of via this walker-driven CLI.
+    all_docs = docs
     logger.info("Total documents to index: %d", len(all_docs))
 
     if args.dry_run:
