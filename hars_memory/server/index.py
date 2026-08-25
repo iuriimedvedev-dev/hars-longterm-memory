@@ -327,12 +327,14 @@ async def _run_indexing(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    # Permanent fail-closed guard: refuse to start against a stale GRAPHRAG_*
-    # env (pre-2026-07-29 rename) instead of silently falling back to
-    # HARS_MEMORY_* defaults. See server/legacy_env_guard.py.
-    from hars_memory.server.legacy_env_guard import refuse_if_legacy_graphrag_env
+    # Permanent fail-closed guard: refuse to start against a legacy env
+    # prefix (e.g. Cortex's pre-2026-07-29 GRAPHRAG_* rename) instead of
+    # silently falling back to HARS_MEMORY_* defaults. Configured via
+    # HARS_MEMORY_LEGACY_ENV_PREFIXES (comma-separated); empty/unset = no-op.
+    # See server/legacy_env_guard.py.
+    from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 
-    refuse_if_legacy_graphrag_env()
+    refuse_if_legacy_env()
 
     args = _parse_args()
     asyncio.run(_run_indexing(args))
