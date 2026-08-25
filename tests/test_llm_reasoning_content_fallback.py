@@ -29,7 +29,7 @@ import httpx
 import openai
 import pytest
 
-from tools.memory.server.lightrag_init import make_llm_func
+from hars_memory.server.lightrag_init import make_llm_func
 
 
 def _client_factory_using_transport(transport: httpx.MockTransport):

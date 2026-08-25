@@ -36,7 +36,7 @@ def _doc(name: str, section: str, date: str, body: str = "body") -> dict[str, st
 
 class TestFindCandidates:
     def test_selects_docs_before_cutoff(self, tmp_path: Path) -> None:
-        from tools.memory.scripts.cleanup_kb import find_candidates
+        from hars_memory.scripts.cleanup_kb import find_candidates
 
         _write_index(
             tmp_path,
@@ -50,7 +50,7 @@ class TestFindCandidates:
         assert report.docs_total == 2
 
     def test_never_deletes_undated_docs(self, tmp_path: Path) -> None:
-        from tools.memory.scripts.cleanup_kb import find_candidates
+        from hars_memory.scripts.cleanup_kb import find_candidates
 
         _write_index(
             tmp_path,
@@ -68,7 +68,7 @@ class TestFindCandidates:
         assert report.undated_count == 1
 
     def test_protect_pattern_excludes_matches(self, tmp_path: Path) -> None:
-        from tools.memory.scripts.cleanup_kb import find_candidates
+        from hars_memory.scripts.cleanup_kb import find_candidates
 
         _write_index(
             tmp_path,
@@ -85,7 +85,7 @@ class TestFindCandidates:
         assert report.protected_count == 1
 
     def test_sections_filter(self, tmp_path: Path) -> None:
-        from tools.memory.scripts.cleanup_kb import find_candidates
+        from hars_memory.scripts.cleanup_kb import find_candidates
 
         _write_index(
             tmp_path,
@@ -98,7 +98,7 @@ class TestFindCandidates:
         assert [v.doc_id for v in report.victims] == ["doc:session"]
 
     def test_missing_index_raises_file_not_found(self, tmp_path: Path) -> None:
-        from tools.memory.scripts.cleanup_kb import find_candidates
+        from hars_memory.scripts.cleanup_kb import find_candidates
 
         with pytest.raises(FileNotFoundError):
             find_candidates(tmp_path, dt.date(2026, 1, 1), [], set())

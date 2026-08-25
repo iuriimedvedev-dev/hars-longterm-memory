@@ -19,34 +19,34 @@ import pytest
 
 class TestExtractChunkDate:
     def test_parses_iso_date_from_header(self) -> None:
-        from tools.memory.retrieval.supersession import extract_chunk_date
+        from hars_memory.retrieval.supersession import extract_chunk_date
 
         content = "[Document: foo.md | Section: session | Date: 2026-04-18]\n\nBody text."
         assert extract_chunk_date(content) == date(2026, 4, 18)
 
     def test_unknown_date_returns_none(self) -> None:
-        from tools.memory.retrieval.supersession import extract_chunk_date
+        from hars_memory.retrieval.supersession import extract_chunk_date
 
         content = "[Document: foo.md | Section: memory | Date: unknown]\n\nBody text."
         assert extract_chunk_date(content) is None
 
     def test_missing_header_returns_none(self) -> None:
-        from tools.memory.retrieval.supersession import extract_chunk_date
+        from hars_memory.retrieval.supersession import extract_chunk_date
 
         # Non-chunk-000 chunks carry no header at all — this is the expected,
         # majority case (only chunk-000 of each doc gets the header).
         assert extract_chunk_date("...continuation of a chunk with no header...") is None
 
     def test_empty_content_returns_none(self) -> None:
-        from tools.memory.retrieval.supersession import extract_chunk_date
+        from hars_memory.retrieval.supersession import extract_chunk_date
 
         assert extract_chunk_date("") is None
 
 
 class TestMarkerPenalty:
     def test_deprecated_name_field_triggers_penalty(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         # Real content shape (trimmed) from project_hires_hypothesis_disproven.md.
         content = (
@@ -70,8 +70,8 @@ class TestMarkerPenalty:
         TOPIC (a sidecar family that was falsified), not a self-verdict on
         this note. Must NOT be penalized — this is the CORRECT doc for sq03.
         """
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = (
             "[Document: project_b1_sidecar_family_falsified.md | Section: memory | Date: unknown]\n\n"
@@ -94,8 +94,8 @@ class TestMarkerPenalty:
         wrong" describes a DIFFERENT, already-superseded artifact — this doc
         is itself the CORRECT, current one for sq05. Must NOT be penalized.
         """
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = (
             "[Document: project_droid_mapping_v3.md | Section: memory | Date: unknown]\n\n"
@@ -115,8 +115,8 @@ class TestMarkerPenalty:
         assert out[0].fused_score == pytest.approx(0.95)
 
     def test_plain_chunk_with_no_marker_is_unaffected(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = "[Document: some_report.md | Section: session | Date: 2026-05-01]\n\nNormal body text."
         chunk = FusedChunk(
@@ -132,11 +132,11 @@ class TestMarkerPenalty:
         mirrors the real corpus finding that late-body mentions are about
         OTHER artifacts, not a self-verdict.
         """
-        from tools.memory.retrieval.supersession import (
+        from hars_memory.retrieval.supersession import (
             _SCAN_ZONE_CHARS,
             apply_supersession_scoring,
         )
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.fusion import FusedChunk
 
         padding = "x" * (_SCAN_ZONE_CHARS + 200)
         content = f"[Document: foo.md | Section: reports | Date: 2026-01-01]\n\n{padding}\nDEPRECATED"
@@ -150,8 +150,8 @@ class TestMarkerPenalty:
 
 class TestRecencyDiscount:
     def test_unknown_date_chunk_is_never_discounted(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = "[Document: foo.md | Section: memory | Date: unknown]\n\nCurrent living note."
         chunk = FusedChunk(
@@ -164,11 +164,11 @@ class TestRecencyDiscount:
         assert out[0].fused_score == pytest.approx(0.5)
 
     def test_old_dated_chunk_is_discounted_but_bounded(self) -> None:
-        from tools.memory.retrieval.supersession import (
+        from hars_memory.retrieval.supersession import (
             MAX_RECENCY_DISCOUNT,
             apply_supersession_scoring,
         )
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.fusion import FusedChunk
 
         # Far older than RECENCY_SATURATION_DAYS relative to the reference date
         # -> ramp saturates at the hard cap, never below it.
@@ -183,8 +183,8 @@ class TestRecencyDiscount:
         assert out[0].fused_score == pytest.approx(1.0 * (1.0 - MAX_RECENCY_DISCOUNT))
 
     def test_recent_dated_chunk_is_discounted_less_than_older_one(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         ref = date(2026, 7, 29)
         recent = FusedChunk(
@@ -206,8 +206,8 @@ class TestRecencyDiscount:
         assert by_id["recent"].fused_score > by_id["older"].fused_score
 
     def test_future_or_same_day_date_is_not_discounted(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = "[Document: t.md | Section: session | Date: 2026-07-29]\n\nBody."
         chunk = FusedChunk(
@@ -222,8 +222,8 @@ class TestRecencyDiscount:
 
 class TestApplySupersessionScoringReordersAndIsPure:
     def test_reorders_after_penalty_drops_a_chunk_below_a_competitor(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         deprecated = FusedChunk(
             chunk_id="dep", fused_score=0.9, dense_score=0.9, sparse_score=None,
@@ -245,13 +245,13 @@ class TestApplySupersessionScoringReordersAndIsPure:
         assert [c.chunk_id for c in out] == ["cur", "dep"]
 
     def test_empty_list_returns_empty_list(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
 
         assert apply_supersession_scoring([]) == []
 
     def test_input_list_is_not_mutated(self) -> None:
-        from tools.memory.retrieval.supersession import apply_supersession_scoring
-        from tools.memory.retrieval.fusion import FusedChunk
+        from hars_memory.retrieval.supersession import apply_supersession_scoring
+        from hars_memory.retrieval.fusion import FusedChunk
 
         content = (
             "[Document: dep.md | Section: memory | Date: unknown]\n\n---\n"
@@ -273,7 +273,7 @@ class TestFusionEnvGating:
     comment for the measurement that justified this flip."""
 
     def test_enabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
         # THREE dense hits (not two): with min-max normalization a two-item
@@ -306,7 +306,7 @@ class TestFusionEnvGating:
     def test_explicitly_disabled_via_env_restores_raw_ranking(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Escape hatch: HARS_MEMORY_SUPERSESSION_SCORING=0 must restore the
         pre-flip behaviour (raw dense/sparse fused ranking, no rescoring)."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "0")
         dense = {
@@ -333,7 +333,7 @@ class TestFusionEnvGating:
         to the (now identical) default — kept as its own test so an explicit
         opt-in is pinned independently of the default value ever changing
         again."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "1")
         dense = {
@@ -374,24 +374,24 @@ _OTHER_CONTENT = "[Document: other.md | Section: session | Date: 2026-05-01]\n\n
 
 class TestIsSelfDeclaredDeprecatedPublicWrapper:
     def test_matches_private_predicate_on_flagged_content(self) -> None:
-        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+        from hars_memory.retrieval.supersession import is_self_declared_deprecated
 
         assert is_self_declared_deprecated(_DEPRECATED_CONTENT) is True
 
     def test_matches_private_predicate_on_plain_content(self) -> None:
-        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+        from hars_memory.retrieval.supersession import is_self_declared_deprecated
 
         assert is_self_declared_deprecated(_CURRENT_CONTENT) is False
 
     def test_empty_content_is_false(self) -> None:
-        from tools.memory.retrieval.supersession import is_self_declared_deprecated
+        from hars_memory.retrieval.supersession import is_self_declared_deprecated
 
         assert is_self_declared_deprecated("") is False
 
 
 class TestApplyMarkerPenaltyToRankedList:
     def test_demotes_flagged_candidate_below_unflagged_ones(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         # "dep" ranks FIRST going in (e.g. LightRAG's own graph/vector order,
         # which carries no score at all and is never touched by fuse()'s own
@@ -401,24 +401,24 @@ class TestApplyMarkerPenaltyToRankedList:
         assert apply_marker_penalty_to_ranked_list(ranked) == ["cur.md", "other.md", "dep.md"]
 
     def test_no_flagged_candidates_preserves_original_order(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         ranked = [("a.md", _CURRENT_CONTENT), ("b.md", _OTHER_CONTENT)]
         assert apply_marker_penalty_to_ranked_list(ranked) == ["a.md", "b.md"]
 
     def test_all_flagged_candidates_preserves_original_order(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         ranked = [("dep1.md", _DEPRECATED_CONTENT), ("dep2.md", _DEPRECATED_CONTENT)]
         assert apply_marker_penalty_to_ranked_list(ranked) == ["dep1.md", "dep2.md"]
 
     def test_empty_list_returns_empty_list(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         assert apply_marker_penalty_to_ranked_list([]) == []
 
     def test_multiple_unflagged_candidates_keep_relative_order_around_a_flagged_one(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         ranked = [
             ("first.md", _CURRENT_CONTENT),
@@ -436,7 +436,7 @@ class TestApplyMarkerPenaltyToRankedList:
         single pass would. Applying the function a second time to its own
         output must be a no-op: f(f(x)) == f(x).
         """
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         content_by_key = {"dep.md": _DEPRECATED_CONTENT, "cur.md": _CURRENT_CONTENT, "other.md": _OTHER_CONTENT}
         ranked = [("dep.md", _DEPRECATED_CONTENT), ("cur.md", _CURRENT_CONTENT), ("other.md", _OTHER_CONTENT)]
@@ -447,7 +447,7 @@ class TestApplyMarkerPenaltyToRankedList:
         assert once == twice == ["cur.md", "other.md", "dep.md"]
 
     def test_returns_new_list_does_not_mutate_input(self) -> None:
-        from tools.memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
+        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         ranked = [("dep.md", _DEPRECATED_CONTENT), ("cur.md", _CURRENT_CONTENT)]
         original = list(ranked)
@@ -462,7 +462,7 @@ class TestFusionPublicFlagHelpers:
     """
 
     def test_supersession_scoring_enabled_reads_master_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import supersession_scoring_enabled
+        from hars_memory.retrieval.fusion import supersession_scoring_enabled
 
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
         assert supersession_scoring_enabled() is True, "unset env -> default ON (flipped 2026-07-30)"
@@ -472,7 +472,7 @@ class TestFusionPublicFlagHelpers:
         assert supersession_scoring_enabled() is True
 
     def test_marker_penalty_enabled_requires_both_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import marker_penalty_enabled
+        from hars_memory.retrieval.fusion import marker_penalty_enabled
 
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_MARKER_PENALTY", raising=False)

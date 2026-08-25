@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from tools.memory.ingest.document import file_stable_id
+from hars_memory.ingest.document import file_stable_id
 
 
 class TestFileStableIdArchiveInvariance:

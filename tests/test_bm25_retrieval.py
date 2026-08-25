@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.retrieval.tokenizer import (
+from hars_memory.retrieval.tokenizer import (
     extract_identifier_terms,
     looks_like_identifier,
     tokenize_identifiers,
@@ -120,7 +120,7 @@ class TestFusionMath:
     """
 
     def _sample_hits(self):
-        from tools.memory.retrieval.fusion import ChannelHit
+        from hars_memory.retrieval.fusion import ChannelHit
 
         dense_hits = {
             "chunk-a": ChannelHit(score=0.9, content="dense top", file_path="a.md"),
@@ -135,7 +135,7 @@ class TestFusionMath:
         return dense_hits, sparse_hits
 
     def test_alpha_one_is_pure_dense_ranking(self) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         dense_hits, sparse_hits = self._sample_hits()
         fused = fuse(dense_hits, sparse_hits, alpha=1.0)
@@ -152,7 +152,7 @@ class TestFusionMath:
         assert by_id["chunk-c"].fused_score == 0.0  # no dense hit -> zero at alpha=1
 
     def test_alpha_zero_is_pure_sparse_ranking(self) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         dense_hits, sparse_hits = self._sample_hits()
         fused = fuse(dense_hits, sparse_hits, alpha=0.0)
@@ -168,7 +168,7 @@ class TestFusionMath:
         assert by_id["chunk-a"].fused_score == 0.0  # no sparse hit -> zero at alpha=0
 
     def test_alpha_half_blends_both_channels(self) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         dense_hits, sparse_hits = self._sample_hits()
         fused = fuse(dense_hits, sparse_hits, alpha=0.5)
@@ -178,7 +178,7 @@ class TestFusionMath:
         )
 
     def test_invalid_alpha_raises(self) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         dense_hits, sparse_hits = self._sample_hits()
         with pytest.raises(ValueError, match="alpha"):
@@ -187,7 +187,7 @@ class TestFusionMath:
             fuse(dense_hits, sparse_hits, alpha=-0.1)
 
     def test_tied_scores_normalize_to_neutral_midpoint(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             "chunk-a": ChannelHit(score=0.5, content="x", file_path="a.md"),
@@ -197,7 +197,7 @@ class TestFusionMath:
         assert all(c.dense_norm == pytest.approx(0.5) for c in fused)
 
     def test_empty_channels_do_not_crash(self) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         assert fuse({}, {}, alpha=0.5) == []
 
@@ -224,7 +224,7 @@ class TestFusionDeterministicTieBreak:
         by descending chunk_id (matching ir_measures' own docstring-cited
         tie-break convention, tools/memory/eval/metrics.py).
         """
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             "chunk-zzz": ChannelHit(score=0.9, content="dense-only top", file_path="z.md"),
@@ -246,7 +246,7 @@ class TestFusionDeterministicTieBreak:
         order, so this is directly controllable from a test, unlike the
         real `PYTHONHASHSEED`-driven `set` nondeterminism itself).
         """
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             f"chunk-{i:03d}": ChannelHit(score=float(i), content="x", file_path=f"{i}.md")
@@ -302,7 +302,7 @@ class TestFusionDeterministicTieBreak:
         exercises (the quantized-epsilon + chunk_id fallback mechanism
         itself, independent of that later feature).
         """
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV,
             HARS_MEMORY_SUPERSESSION_SCORING_ENV,
             ChannelHit,
@@ -335,7 +335,7 @@ class TestFusionDeterministicTieBreak:
         never fold together two candidates whose score gap is a real,
         above-noise signal — only near-exact-tie noise should be affected.
         """
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             "chunk-strong": ChannelHit(score=0.9, content="x", file_path="strong.md"),
@@ -345,7 +345,7 @@ class TestFusionDeterministicTieBreak:
         assert [c.chunk_id for c in fused] == ["chunk-strong", "chunk-weak"]
 
     def test_epsilon_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL_ENV,
             HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
             HARS_MEMORY_SUPERSESSION_SCORING_ENV,
@@ -383,7 +383,7 @@ class TestFusionDeterministicTieBreak:
         assert [c.chunk_id for c in fused_wide] == ["chunk-b", "chunk-a"]
 
     def test_invalid_epsilon_env_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
             ChannelHit,
             fuse,
@@ -400,7 +400,7 @@ class TestFusionDeterministicTieBreak:
         regressing this back toward "no effective tie-break" (too large,
         swallows real signal) or "no effective quantization" (zero/negative).
         """
-        from tools.memory.retrieval.fusion import _DEFAULT_FUSION_TIE_EPSILON
+        from hars_memory.retrieval.fusion import _DEFAULT_FUSION_TIE_EPSILON
 
         assert 0.0 < _DEFAULT_FUSION_TIE_EPSILON < 1e-4
 
@@ -413,7 +413,7 @@ class TestRipgrepFusion:
     """
 
     def _sample_fused(self):
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             "chunk-a": ChannelHit(score=0.9, content="dense top", file_path="a.md"),
@@ -426,14 +426,14 @@ class TestRipgrepFusion:
         return fuse(dense_hits, sparse_hits, alpha=0.5)
 
     def test_empty_ripgrep_hits_is_a_pure_passthrough(self) -> None:
-        from tools.memory.retrieval.fusion import apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import apply_ripgrep_gate
 
         fused = self._sample_fused()
         gated = apply_ripgrep_gate(fused, {}, top_k=2)
         assert gated == fused[:2]
 
     def test_injection_never_evicts_appends_past_top_k(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
 
         fused = self._sample_fused()
         ripgrep_hits = {
@@ -457,7 +457,7 @@ class TestRipgrepFusion:
         chunk's file_path basename must be treated as the SAME document even
         though the two `chunk_id`s are completely different strings.
         """
-        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
 
         fused = self._sample_fused()
         # "b.md" is already in the fused pool (chunk-b); ripgrep reports it
@@ -474,7 +474,7 @@ class TestRipgrepFusion:
         assert len(gated) == 3  # still exactly the fused pool, no injection
 
     def test_boost_default_off_leaves_fused_score_untouched(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
 
         fused = self._sample_fused()
         by_id = {c.chunk_id: c for c in fused}
@@ -485,7 +485,7 @@ class TestRipgrepFusion:
         assert matched.ripgrep_score == 6.0  # still recorded, even though score is untouched
 
     def test_boost_enabled_increases_fused_score_but_stays_bounded(self) -> None:
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             RIPGREP_BOOST_CAP,
             ChannelHit,
             apply_ripgrep_gate,
@@ -501,7 +501,7 @@ class TestRipgrepFusion:
         assert matched.fused_score == pytest.approx(by_id["chunk-b"].fused_score + RIPGREP_BOOST_CAP)
 
     def test_max_injected_caps_off_index_appends(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
 
         fused = self._sample_fused()
         ripgrep_hits = {
@@ -515,7 +515,7 @@ class TestRipgrepFusion:
         assert {c.chunk_id for c in injected} == {"ripgrep:off_0.md", "ripgrep:off_1.md"}
 
     def test_injection_disabled_never_appends(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate
 
         fused = self._sample_fused()
         ripgrep_hits = {"off_index.md": ChannelHit(score=9.0, content="x", file_path="off_index.md")}
@@ -524,7 +524,7 @@ class TestRipgrepFusion:
         assert not any(c.chunk_id.startswith("ripgrep:") for c in gated)
 
     def test_channel_enabled_env_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             HARS_MEMORY_RIPGREP_CHANNEL_ENV,
             ripgrep_channel_enabled,
         )
@@ -547,13 +547,13 @@ class TestRipgrepThirdWeightRejectedVariant:
     """
 
     def test_weights_must_sum_to_one(self) -> None:
-        from tools.memory.retrieval.fusion import fuse_ripgrep_as_third_weight
+        from hars_memory.retrieval.fusion import fuse_ripgrep_as_third_weight
 
         with pytest.raises(ValueError, match="sum to 1.0"):
             fuse_ripgrep_as_third_weight({}, {}, {}, 0.5, 0.5, 0.5)
 
     def test_negative_weight_rejected(self) -> None:
-        from tools.memory.retrieval.fusion import fuse_ripgrep_as_third_weight
+        from hars_memory.retrieval.fusion import fuse_ripgrep_as_third_weight
 
         with pytest.raises(ValueError, match=">= 0.0"):
             fuse_ripgrep_as_third_weight({}, {}, {}, 1.2, -0.1, -0.1)
@@ -565,7 +565,7 @@ class TestRipgrepThirdWeightRejectedVariant:
         as a brand-new, dense_norm=sparse_norm=0 entry, exactly the
         distortion described in fusion.py's design note.
         """
-        from tools.memory.retrieval.fusion import ChannelHit, fuse_ripgrep_as_third_weight
+        from hars_memory.retrieval.fusion import ChannelHit, fuse_ripgrep_as_third_weight
 
         dense_hits = {"chunk-a": ChannelHit(score=0.9, content="x", file_path="a.md")}
         ripgrep_hits = {
@@ -588,7 +588,7 @@ class TestFlatDenseFusion:
     """
 
     def _sample_fused(self):
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             "chunk-a": ChannelHit(score=0.9, content="dense top", file_path="a.md"),
@@ -601,7 +601,7 @@ class TestFlatDenseFusion:
         return fuse(dense_hits, sparse_hits, alpha=0.5)
 
     def test_empty_flat_hits_is_a_pure_passthrough(self) -> None:
-        from tools.memory.retrieval.fusion import apply_flat_dense_gate
+        from hars_memory.retrieval.fusion import apply_flat_dense_gate
 
         fused = self._sample_fused()
         gated = apply_flat_dense_gate(fused, {}, top_k=2)
@@ -614,7 +614,7 @@ class TestFlatDenseFusion:
         this is the whole reason `apply_flat_dense_gate` needs the FULL
         pre-truncation `fused_pool`, not just its top_k slice.
         """
-        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
 
         fused = self._sample_fused()  # chunk-a, chunk-b, chunk-c
         flat_hits = {
@@ -625,7 +625,7 @@ class TestFlatDenseFusion:
         assert not any(c.chunk_id == "chunk-c" and c.flat_dense_score is not None for c in gated)
 
     def test_injection_never_evicts_appends_past_top_k(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
 
         fused = self._sample_fused()
         flat_hits = {
@@ -648,7 +648,7 @@ class TestFlatDenseFusion:
         """Gate-only design: an injected chunk gets fused_score=0.0, not a
         blended/boosted score -- see fusion.py's design note for why no
         boost variant was built for this channel (unlike ripgrep's)."""
-        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
 
         fused = self._sample_fused()
         flat_hits = {
@@ -658,7 +658,7 @@ class TestFlatDenseFusion:
         assert gated[2].fused_score == 0.0
 
     def test_max_injected_caps_off_index_appends(self) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
+        from hars_memory.retrieval.fusion import ChannelHit, apply_flat_dense_gate
 
         fused = self._sample_fused()
         flat_hits = {
@@ -672,7 +672,7 @@ class TestFlatDenseFusion:
         assert injected_ids == {"chunk-off-0", "chunk-off-1"}
 
     def test_channel_enabled_env_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import (
+        from hars_memory.retrieval.fusion import (
             HARS_MEMORY_FLAT_CHANNEL_ENV,
             flat_channel_enabled,
         )
@@ -712,7 +712,7 @@ class TestBM25IndexCache:
         }
 
     def test_missing_source_raises_unavailable(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.bm25_index import (
+        from hars_memory.retrieval.bm25_index import (
             BM25IndexUnavailableError,
             get_or_build_index,
         )
@@ -721,7 +721,7 @@ class TestBM25IndexCache:
             get_or_build_index(str(tmp_path), str(tmp_path / "cache"))
 
     def test_build_index_indexes_expected_chunk_count(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.bm25_index import build_index
+        from hars_memory.retrieval.bm25_index import build_index
 
         self._write_chunks(tmp_path, self._sample_chunks())
         index, build_seconds = build_index(str(tmp_path))
@@ -729,7 +729,7 @@ class TestBM25IndexCache:
         assert build_seconds >= 0.0
 
     def test_search_finds_verbatim_identifier(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.bm25_index import build_index
+        from hars_memory.retrieval.bm25_index import build_index
 
         self._write_chunks(tmp_path, self._sample_chunks())
         index, _ = build_index(str(tmp_path))
@@ -739,7 +739,7 @@ class TestBM25IndexCache:
         assert "A2S32" in hits[0].content
 
     def test_get_or_build_index_caches_on_disk(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.bm25_index import get_or_build_index
+        from hars_memory.retrieval.bm25_index import get_or_build_index
 
         working_dir = tmp_path / "working"
         working_dir.mkdir()
@@ -756,7 +756,7 @@ class TestBM25IndexCache:
         assert stats2.chunk_count == 3
 
     def test_cache_invalidates_on_mtime_change(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.bm25_index import get_or_build_index
+        from hars_memory.retrieval.bm25_index import get_or_build_index
 
         working_dir = tmp_path / "working"
         working_dir.mkdir()
@@ -786,7 +786,7 @@ class TestBM25IndexCache:
         """The disk-persisted (cache_hit=True) path must return identical
         results to a fresh in-memory build — proves save/load round-trips the
         sparse matrix + chunk metadata correctly, not just the chunk count."""
-        from tools.memory.retrieval.bm25_index import get_or_build_index
+        from hars_memory.retrieval.bm25_index import get_or_build_index
 
         working_dir = tmp_path / "working"
         working_dir.mkdir()
@@ -811,7 +811,7 @@ class TestBM25IndexCache:
         """A relative (or empty-string) cache_dir must never silently resolve
         against cwd — this is exactly how six bm25s cache files landed at a
         repo root instead of a configured cache directory (2026-08-07)."""
-        from tools.memory.retrieval.bm25_index import (
+        from hars_memory.retrieval.bm25_index import (
             BM25CacheDirNotAbsoluteError,
             build_index,
             save_index,
@@ -834,7 +834,7 @@ class TestBM25IndexCache:
         )
 
     def test_load_index_rejects_relative_cache_dir(self) -> None:
-        from tools.memory.retrieval.bm25_index import (
+        from hars_memory.retrieval.bm25_index import (
             BM25CacheDirNotAbsoluteError,
             load_index,
         )

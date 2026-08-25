@@ -29,7 +29,7 @@ import httpx
 import openai
 import pytest
 
-from tools.memory.server.lightrag_init import make_llm_func
+from hars_memory.server.lightrag_init import make_llm_func
 
 
 def _client_factory_using_transport(
@@ -165,7 +165,7 @@ class TestMakeLlmFuncRetriesTransientFailures:
         _patch_client_factory(monkeypatch, httpx.MockTransport(handler))
 
         llm_func = _make_llm_func_for_test()
-        with caplog.at_level(logging.WARNING, logger="tools.memory.server.lightrag_init"):
+        with caplog.at_level(logging.WARNING, logger="hars_memory.server.lightrag_init"):
             asyncio.run(llm_func("hello"))  # type: ignore[operator]
 
         retry_records = [r for r in caplog.records if "transient failure" in r.message]

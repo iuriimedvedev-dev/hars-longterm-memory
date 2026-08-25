@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.server import logging_setup as ls
+from hars_memory.server import logging_setup as ls
 
 
 @pytest.fixture(autouse=True)

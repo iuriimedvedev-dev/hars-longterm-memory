@@ -34,13 +34,9 @@ import datetime as dt
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT))
 
 HEADER_RE = re.compile(
     r"\[Document:\s*(?P<name>[^|\]]+)\|\s*Section:\s*(?P<section>[^|\]]+)"

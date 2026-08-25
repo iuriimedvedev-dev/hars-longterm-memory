@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.corpus.build import build_corpus
-from tools.memory.corpus.query import (
+from hars_memory.corpus.build import build_corpus
+from hars_memory.corpus.query import (
     CorpusIndexNotFoundError,
     GpuNotAllowedError,
     SearchMode,
@@ -64,9 +64,9 @@ class TestSparseSearch:
 
         # If server.embedder were imported as a side effect of sparse search,
         # it would already be in sys.modules after this call.
-        sys.modules.pop("tools.memory.server.embedder", None)
+        sys.modules.pop("hars_memory.server.embedder", None)
         search(small_index, "zebras", mode="sparse", top_k=3)
-        assert "tools.memory.server.embedder" not in sys.modules
+        assert "hars_memory.server.embedder" not in sys.modules
 
     def test_mode_accepts_enum_or_string(self, small_index: Path) -> None:
         by_string = search(small_index, "zebras", mode="sparse", top_k=3)
@@ -98,16 +98,16 @@ class TestCpuOnlyGuard:
     ) -> None:
         import sys
 
-        sys.modules.pop("tools.memory.server.embedder", None)
+        sys.modules.pop("hars_memory.server.embedder", None)
         monkeypatch.setenv("HARS_MEMORY_EMBED_DEVICE", "cuda")
         with pytest.raises(GpuNotAllowedError):
             search(small_index, "zebras", mode="dense", top_k=3)
-        assert "tools.memory.server.embedder" not in sys.modules
+        assert "hars_memory.server.embedder" not in sys.modules
 
     def test_cpu_device_explicitly_set_is_allowed_past_the_guard(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.corpus.query import _ensure_cpu_only
+        from hars_memory.corpus.query import _ensure_cpu_only
 
         monkeypatch.setenv("HARS_MEMORY_EMBED_DEVICE", "cpu")
         _ensure_cpu_only()  # must not raise

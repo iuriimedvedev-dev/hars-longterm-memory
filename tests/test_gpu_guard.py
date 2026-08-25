@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tools.memory.server.gpu_guard import (
+from hars_memory.server.gpu_guard import (
     GpuBusyError,
     GpuGuardUnavailableError,
     assert_gpu_free,
@@ -27,7 +27,7 @@ def _raise_connection_error(*_args: object, **_kwargs: object) -> None:
 class TestCheckGpuConcurrencyFailsClosed:
     def test_unreachable_backend_raises_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", _raise_connection_error
+            "hars_memory.server.gpu_guard.requests.get", _raise_connection_error
         )
         with pytest.raises(GpuGuardUnavailableError):
             check_gpu_concurrency("http://localhost:8765")
@@ -36,7 +36,7 @@ class TestCheckGpuConcurrencyFailsClosed:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", _raise_connection_error
+            "hars_memory.server.gpu_guard.requests.get", _raise_connection_error
         )
         result = check_gpu_concurrency(
             "http://localhost:8765", allow_unreachable_backend=True
@@ -50,7 +50,7 @@ class TestCheckGpuConcurrencyFailsClosed:
         resp.raise_for_status.return_value = None
         resp.json.return_value = []
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", lambda *a, **k: resp
+            "hars_memory.server.gpu_guard.requests.get", lambda *a, **k: resp
         )
         result = check_gpu_concurrency("http://localhost:8765")
         assert result is None
@@ -64,7 +64,7 @@ class TestCheckGpuConcurrencyFailsClosed:
             {"id": "exp-1", "workflow_type": "vea", "status": "running"}
         ]
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", lambda *a, **k: resp
+            "hars_memory.server.gpu_guard.requests.get", lambda *a, **k: resp
         )
         result = check_gpu_concurrency("http://localhost:8765")
         assert result == ("exp-1", "vea")
@@ -75,14 +75,14 @@ class TestAssertGpuFree:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", _raise_connection_error
+            "hars_memory.server.gpu_guard.requests.get", _raise_connection_error
         )
         with pytest.raises(GpuGuardUnavailableError):
             assert_gpu_free("http://localhost:8765")
 
     def test_unreachable_backend_override_proceeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", _raise_connection_error
+            "hars_memory.server.gpu_guard.requests.get", _raise_connection_error
         )
         # Must not raise.
         assert_gpu_free("http://localhost:8765", allow_unreachable_backend=True)
@@ -98,7 +98,7 @@ class TestAssertGpuFree:
             {"id": "exp-1", "workflow_type": "expert", "status": "running"}
         ]
         monkeypatch.setattr(
-            "tools.memory.server.gpu_guard.requests.get", lambda *a, **k: resp
+            "hars_memory.server.gpu_guard.requests.get", lambda *a, **k: resp
         )
         with pytest.raises(GpuBusyError):
             assert_gpu_free("http://localhost:8765", allow_unreachable_backend=True)

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from tools.memory.eval.regression import (
+from hars_memory.eval.regression import (
     AmbiguousAbBenchConfigError,
     IncomparableReportsError,
     UnrecognizedReportShapeError,

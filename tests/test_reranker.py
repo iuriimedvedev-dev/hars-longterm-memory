@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tools.memory.server.reranker import make_rerank_func
+from hars_memory.server.reranker import make_rerank_func
 
 
 class _FakeCrossEncoder:
@@ -50,7 +50,7 @@ class TestMakeRerankFuncShapeAndOrdering:
         scores_by_doc = {docs[0]: 0.1, docs[1]: 5.0, docs[2]: 11.5}
         fake_model = _FakeCrossEncoder(scores_by_doc)
         monkeypatch.setattr(
-            "tools.memory.server.reranker._load_model",
+            "hars_memory.server.reranker._load_model",
             lambda *a, **kw: fake_model,
         )
 
@@ -71,7 +71,7 @@ class TestMakeRerankFuncShapeAndOrdering:
         docs = ["a", "b", "c", "d"]
         scores_by_doc = {"a": 1.0, "b": 4.0, "c": 3.0, "d": 2.0}
         monkeypatch.setattr(
-            "tools.memory.server.reranker._load_model",
+            "hars_memory.server.reranker._load_model",
             lambda *a, **kw: _FakeCrossEncoder(scores_by_doc),
         )
 
@@ -85,7 +85,7 @@ class TestMakeRerankFuncShapeAndOrdering:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         load_mock = MagicMock(side_effect=AssertionError("must not load model for empty input"))
-        monkeypatch.setattr("tools.memory.server.reranker._load_model", load_mock)
+        monkeypatch.setattr("hars_memory.server.reranker._load_model", load_mock)
 
         rerank = make_rerank_func(model_name="fake/reranker")
         results = asyncio.run(rerank(query="q", documents=[]))
@@ -99,7 +99,7 @@ class TestMakeRerankFuncLazyLoad:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         load_mock = MagicMock(side_effect=AssertionError("model must not load at construction time"))
-        monkeypatch.setattr("tools.memory.server.reranker._load_model", load_mock)
+        monkeypatch.setattr("hars_memory.server.reranker._load_model", load_mock)
 
         # Constructing the closure must be free of side effects — this is
         # what lets create_lightrag() build rerank_model_func unconditionally
@@ -112,7 +112,7 @@ class TestMakeRerankFuncLazyLoad:
     def test_model_loads_only_on_first_actual_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = _FakeCrossEncoder({"doc": 1.0})
         load_mock = MagicMock(return_value=fake_model)
-        monkeypatch.setattr("tools.memory.server.reranker._load_model", load_mock)
+        monkeypatch.setattr("hars_memory.server.reranker._load_model", load_mock)
 
         rerank = make_rerank_func(model_name="fake/reranker")
         load_mock.assert_not_called()
@@ -151,9 +151,9 @@ class TestCreateLightragRerankGating:
     ) -> None:
         self._base_env(monkeypatch, tmp_path)
         load_mock = MagicMock(side_effect=AssertionError("reranker must not load when disabled"))
-        monkeypatch.setattr("tools.memory.server.reranker._load_model", load_mock)
+        monkeypatch.setattr("hars_memory.server.reranker._load_model", load_mock)
 
-        from tools.memory.server.lightrag_init import create_lightrag
+        from hars_memory.server.lightrag_init import create_lightrag
 
         rag = create_lightrag()
 
@@ -176,9 +176,9 @@ class TestCreateLightragRerankGating:
         self._base_env(monkeypatch, tmp_path)
         monkeypatch.setenv("HARS_MEMORY_RERANK_MODEL", "cross-encoder/ettin-reranker-68m-v1")
         load_mock = MagicMock(side_effect=AssertionError("model must not load at create_lightrag() time"))
-        monkeypatch.setattr("tools.memory.server.reranker._load_model", load_mock)
+        monkeypatch.setattr("hars_memory.server.reranker._load_model", load_mock)
 
-        from tools.memory.server.lightrag_init import create_lightrag
+        from hars_memory.server.lightrag_init import create_lightrag
 
         rag = create_lightrag()
 

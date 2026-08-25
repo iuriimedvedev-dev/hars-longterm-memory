@@ -17,14 +17,11 @@ import logging
 import os
 import random
 import re
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from hars_memory.ingest.document import Document
 from hars_memory.ingest.walker import walk

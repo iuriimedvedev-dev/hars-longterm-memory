@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.corpus.build import (
+from hars_memory.corpus.build import (
     CorpusPathNotFoundError,
     EmptyCorpusError,
     LiveGraphIndexGuardError,
@@ -19,7 +19,7 @@ from tools.memory.corpus.build import (
     UnsafeOverwriteTargetError,
     build_corpus,
 )
-from tools.memory.retrieval.bm25_index import CHUNKS_FILENAME
+from hars_memory.retrieval.bm25_index import CHUNKS_FILENAME
 
 
 def _write(path: Path, content: str) -> None:
@@ -243,7 +243,7 @@ class TestAtomicSwap:
         original_chunk_store = (index_dir / CHUNKS_FILENAME).read_text(encoding="utf-8")
         original_manifest = (index_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
 
-        import tools.memory.corpus.build as build_module
+        import hars_memory.corpus.build as build_module
 
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("simulated mid-build failure")

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.ingest.walker import walk
-from tools.memory.server.index import _MEMORY_DIR_ENV, _resolve_ingest_paths
+from hars_memory.ingest.walker import walk
+from hars_memory.server.index import _MEMORY_DIR_ENV, _resolve_ingest_paths
 
 
 class TestResolveIngestPaths:
