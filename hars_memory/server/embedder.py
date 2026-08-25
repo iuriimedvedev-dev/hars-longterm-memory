@@ -261,13 +261,25 @@ _EMBEDDING_DIM_RE = re.compile(r'"embedding_dim"\s*:\s*(\d+)')
 # LightRAG's QdrantVectorDBStorage collapses every namespace to exactly
 # ``lightrag_vdb_{namespace}`` (see qdrant_impl.py::__post_init__) because
 # EmbeddingFunc in lightrag_init.create_lightrag() carries no model_name, so
-# model_suffix is always None. This is NOT a config value — it is a fixed
-# consequence of that call site — so it is intentionally not env-driven here.
-_QDRANT_COLLECTION_NAMES: tuple[str, ...] = (
-    "lightrag_vdb_chunks",
-    "lightrag_vdb_entities",
-    "lightrag_vdb_relationships",
-)
+# model_suffix is always None. That base name is NOT a config value — it is a
+# fixed consequence of that call site. What IS configurable is the per-project
+# prefix applied in front of it, so multiple projects can share one Qdrant
+# container without colliding on schema (embedding dimension is a
+# per-collection property, not per-workspace).
+def qdrant_collection_names(prefix: str) -> tuple[str, str, str]:
+    """Return this project's (chunks, entities, relationships) Qdrant
+    collection names, namespaced by `prefix` so multiple projects can
+    share one Qdrant container without colliding on schema (embedding
+    dimension is a per-collection property, not per-workspace — see
+    docs/superpowers/specs/2026-08-25-hars-longterm-memory-standalone-extraction-design.md §5).
+    """
+    if not prefix:
+        raise ValueError("prefix must be non-empty — set HARS_MEMORY_QDRANT_COLLECTION_PREFIX")
+    return (
+        f"{prefix}_lightrag_vdb_chunks",
+        f"{prefix}_lightrag_vdb_entities",
+        f"{prefix}_lightrag_vdb_relationships",
+    )
 
 
 def _resolve_qdrant_embedding_dim(qdrant_url: str) -> int | None:
@@ -300,7 +312,8 @@ def _resolve_qdrant_embedding_dim(qdrant_url: str) -> int | None:
     try:
         client = QdrantClient(url=qdrant_url, timeout=3)
         dims: dict[str, int] = {}
-        for name in _QDRANT_COLLECTION_NAMES:
+        prefix = os.environ["HARS_MEMORY_QDRANT_COLLECTION_PREFIX"]
+        for name in qdrant_collection_names(prefix):
             if not client.collection_exists(name):
                 continue
             info = client.get_collection(name)
