@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.memory.ingest.document import file_stable_id
-from tools.memory.ingest.walker import walk
+from hars_memory.ingest.document import file_stable_id
+from hars_memory.ingest.walker import walk
 
 
 class TestIngestedArchiveExcludedViaMemoryignore:

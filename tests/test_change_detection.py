@@ -13,14 +13,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tools.memory.ingest.change_detection import (
+from hars_memory.ingest.change_detection import (
     FingerprintStore,
     FingerprintStoreError,
     compute_fingerprint,
     default_fingerprint_store_path,
     detect_changed_documents,
 )
-from tools.memory.ingest.document import Document, SourceKind
+from hars_memory.ingest.document import Document, SourceKind
 
 
 def _doc(doc_id: str, content: str) -> Document:
@@ -172,7 +172,7 @@ class TestApplyRefreshChangedDefaultSafety:
     def test_refresh_changed_false_never_deletes_or_touches_store(
         self, tmp_path: Path
     ) -> None:
-        from tools.memory.server.index import _apply_refresh_changed
+        from hars_memory.server.index import _apply_refresh_changed
 
         store_path = tmp_path / "fp.json"
         # Pre-existing store with a DIFFERENT fingerprint — if the safety gate
@@ -197,7 +197,7 @@ class TestApplyRefreshChangedDefaultSafety:
     def test_refresh_changed_true_changed_doc_triggers_delete(
         self, tmp_path: Path
     ) -> None:
-        from tools.memory.server.index import _apply_refresh_changed
+        from hars_memory.server.index import _apply_refresh_changed
 
         store_path = tmp_path / "fp.json"
         store_path.write_text(
@@ -223,7 +223,7 @@ class TestApplyRefreshChangedDefaultSafety:
     def test_refresh_changed_true_no_prior_fingerprint_never_deletes(
         self, tmp_path: Path
     ) -> None:
-        from tools.memory.server.index import _apply_refresh_changed
+        from hars_memory.server.index import _apply_refresh_changed
 
         store_path = tmp_path / "fp.json"  # no prior store at all
         rag = _make_rag()
@@ -245,7 +245,7 @@ class TestApplyRefreshChangedDefaultSafety:
         assert persisted["file:brand_new"] == compute_fingerprint("content")
 
     def test_refresh_changed_true_unchanged_doc_no_delete(self, tmp_path: Path) -> None:
-        from tools.memory.server.index import _apply_refresh_changed
+        from hars_memory.server.index import _apply_refresh_changed
 
         store_path = tmp_path / "fp.json"
         store_path.write_text(

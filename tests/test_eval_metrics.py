@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from tools.memory.eval.metrics import (
+from hars_memory.eval.metrics import (
     dedupe_preserve_order,
     first_rank,
     mean_reciprocal_rank,

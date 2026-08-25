@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.memory.ingest.document import HEADER_DATE_UNKNOWN, build_source_header
-from tools.memory.ingest.postgres_export import (
+from hars_memory.ingest.document import HEADER_DATE_UNKNOWN, build_source_header
+from hars_memory.ingest.postgres_export import (
     transform_experiment_row,
     transform_hypothesis_link_row,
     transform_hypothesis_row,
 )
-from tools.memory.ingest.walker import walk
-from tools.memory.scripts.cleanup_kb import HEADER_RE
+from hars_memory.ingest.walker import walk
+from hars_memory.scripts.cleanup_kb import HEADER_RE
 
 
 class TestBuildSourceHeader:

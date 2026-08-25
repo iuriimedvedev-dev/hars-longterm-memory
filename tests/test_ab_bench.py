@@ -36,8 +36,8 @@ import os
 
 import pytest
 
-from tools.memory.eval import ab_bench
-from tools.memory.retrieval import fusion
+from hars_memory.eval import ab_bench
+from hars_memory.retrieval import fusion
 
 
 # ---------------------------------------------------------------------------

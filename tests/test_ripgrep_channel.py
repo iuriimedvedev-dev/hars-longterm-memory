@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory.retrieval import ripgrep_channel as rgc
-from tools.memory.retrieval.ripgrep_channel import (
+from hars_memory.retrieval import ripgrep_channel as rgc
+from hars_memory.retrieval.ripgrep_channel import (
     HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV,
     RipgrepSearchHit,
     check_availability,
@@ -408,14 +408,14 @@ class TestGlobConventionsMatchWalker:
     """
 
     def test_include_globs_cover_the_same_extensions(self) -> None:
-        from tools.memory.ingest import walker
+        from hars_memory.ingest import walker
 
         walker_extensions = {g.removeprefix("**/*") for g in walker._DEFAULT_INCLUDE_GLOBS}
         rg_extensions = {g.removeprefix("*") for g in rgc._INCLUDE_GLOBS_RG}
         assert walker_extensions == rg_extensions
 
     def test_exclude_globs_cover_the_same_names(self) -> None:
-        from tools.memory.ingest import walker
+        from hars_memory.ingest import walker
 
         def _normalize(pattern: str) -> str:
             return pattern.strip("*/").removeprefix(".")
@@ -427,7 +427,7 @@ class TestGlobConventionsMatchWalker:
         assert walker_names <= rg_names
 
     def test_ignore_file_name_matches_walker(self) -> None:
-        from tools.memory.ingest import walker
+        from hars_memory.ingest import walker
 
         assert rgc._DEFAULT_IGNORE_FILE == walker._DEFAULT_IGNORE_FILE
         assert rgc._LEGACY_IGNORE_FILE == walker._LEGACY_IGNORE_FILE

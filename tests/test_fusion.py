@@ -39,7 +39,7 @@ def _three_item_pools():
     same value a chunk with NO hit in that channel defaults to, which would
     make assertions about "single-channel exclusive" ambiguous with
     "channel's own weakest returned hit"."""
-    from tools.memory.retrieval.fusion import ChannelHit
+    from hars_memory.retrieval.fusion import ChannelHit
 
     dense_hits = {
         # Decisive winner: far above the rest of ITS OWN pool.
@@ -68,7 +68,7 @@ class TestDefaultModeIsZscoreTiebreak:
     def test_no_env_var_set_reproduces_zscore_tiebreak_behaviour(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.delenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", raising=False)
         dense_hits, sparse_hits = _three_item_pools()
@@ -84,7 +84,7 @@ class TestDefaultModeIsZscoreTiebreak:
         assert fused[1].chunk_id == "sparse-borderline"
 
     def test_unset_matches_explicit_zscore_tiebreak(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         dense_hits, sparse_hits = _three_item_pools()
         monkeypatch.delenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", raising=False)
@@ -95,7 +95,7 @@ class TestDefaultModeIsZscoreTiebreak:
         assert [c.fused_score for c in unset] == [c.fused_score for c in explicit]
 
     def test_invalid_mode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "bogus")
         dense_hits, sparse_hits = _three_item_pools()
@@ -113,7 +113,7 @@ class TestOffModeIsStillAvailable:
     def test_explicit_off_reproduces_the_documented_collapse(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "off")
         dense_hits, sparse_hits = _three_item_pools()
@@ -137,7 +137,7 @@ class TestZscoreTiebreak:
     def test_decisive_dense_win_outranks_borderline_sparse_win(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "zscore_tiebreak")
         dense_hits, sparse_hits = _three_item_pools()
@@ -159,7 +159,7 @@ class TestZscoreTiebreak:
         """Same shape, decisiveness swapped to the SPARSE side -- proves the
         mode is driven by the actual signal, not a hidden dense/sparse
         bias."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "zscore_tiebreak")
         dense_hits = {
@@ -183,7 +183,7 @@ class TestZscoreTiebreak:
         (it already has two independent continuous norms) -- confirm two
         such chunks that happen to tie exactly still break by chunk_id,
         same as `off` mode."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "zscore_tiebreak")
         dense_hits = {
@@ -207,7 +207,7 @@ class TestZscoreTiebreak:
     ) -> None:
         """A single-item pool has zero std -> z-score is 0.0 for both sides
         -> falls through to the chunk_id tertiary key, same as `off`."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "zscore_tiebreak")
         dense_hits = {"zzz-solo": ChannelHit(score=0.9, content="d", file_path="z.md")}
@@ -216,7 +216,7 @@ class TestZscoreTiebreak:
         assert [c.chunk_id for c in fused] == ["zzz-solo", "aaa-solo"]
 
     def test_deterministic_across_repeated_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "zscore_tiebreak")
         dense_hits, sparse_hits = _three_item_pools()
@@ -235,7 +235,7 @@ class TestAgreementBonus:
     def test_both_channel_chunk_outranks_an_equal_scoring_single_channel_chunk(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "agreement_bonus")
         monkeypatch.setenv("HARS_MEMORY_FUSION_AGREEMENT_BONUS", "0.05")
@@ -265,7 +265,7 @@ class TestAgreementBonus:
         """Documents the scope limit: the flagship dense-exclusive vs
         sparse-exclusive collision is UNCHANGED by this mode, since neither
         side is ever a both-channel hit."""
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "agreement_bonus")
         dense_hits, sparse_hits = _three_item_pools()
@@ -275,7 +275,7 @@ class TestAgreementBonus:
         assert by_id["sparse-borderline"].fused_score == pytest.approx(0.5)
 
     def test_custom_bonus_value_via_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "agreement_bonus")
         monkeypatch.setenv("HARS_MEMORY_FUSION_AGREEMENT_BONUS", "0.2")
@@ -291,7 +291,7 @@ class TestAgreementBonus:
         assert fused[0].fused_score == pytest.approx(0.5 * 1.0 + 0.5 * 1.0 + 0.2)
 
     def test_negative_bonus_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "agreement_bonus")
         monkeypatch.setenv("HARS_MEMORY_FUSION_AGREEMENT_BONUS", "-0.1")
@@ -308,7 +308,7 @@ class TestImputeFloor:
     symmetric on both sides of that specific comparison."""
 
     def test_missing_channel_imputed_below_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "impute_floor")
         dense_hits, sparse_hits = _three_item_pools()
@@ -329,7 +329,7 @@ class TestImputeFloor:
         the exact tie this whole feature targets is UNCHANGED by this
         mode. Pinned so a future edit cannot silently "fix" this without
         the test flagging that the documented negative result changed."""
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "impute_floor")
         dense_hits, sparse_hits = _three_item_pools()
@@ -347,7 +347,7 @@ class TestImputeFloor:
         mode CAN change relative order versus `off` -- confirms the
         imputation actually participates in scoring, even though it cannot
         fix the flagship case."""
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", "impute_floor")
         dense_hits = {  # 5-item pool -> floor = -1/6
@@ -366,7 +366,7 @@ class TestImputeFloor:
         assert by_id["d4"].fused_score != pytest.approx(by_id["s0"].fused_score)
 
     def test_off_mode_still_imputes_exactly_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tools.memory.retrieval.fusion import fuse
+        from hars_memory.retrieval.fusion import fuse
 
         monkeypatch.delenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", raising=False)
         dense_hits, sparse_hits = _three_item_pools()
@@ -386,7 +386,7 @@ class TestSingleChannelSignalDeterminism:
         "mode", ["off", "zscore_tiebreak", "agreement_bonus", "impute_floor"]
     )
     def test_insertion_order_independence(self, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         monkeypatch.setenv("HARS_MEMORY_FUSION_SINGLE_CHANNEL_SIGNAL", mode)
         dense_hits = {
@@ -412,7 +412,7 @@ class TestSingleChannelSignalLatency:
     def test_all_modes_stay_within_a_generous_multiple_of_off(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.memory.retrieval.fusion import ChannelHit, fuse
+        from hars_memory.retrieval.fusion import ChannelHit, fuse
 
         dense_hits = {
             f"chunk-{i:04d}": ChannelHit(score=float(i % 97) / 97.0, content="x" * 200, file_path=f"{i}.md")

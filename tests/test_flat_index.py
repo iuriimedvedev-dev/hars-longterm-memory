@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tools.memory.retrieval.flat_index import (
+from hars_memory.retrieval.flat_index import (
     FlatDenseIndex,
     FlatIndexDimensionMismatchError,
     FlatIndexUnavailableError,
@@ -799,7 +799,7 @@ class TestEmbedBatching:
         assert [len(texts) for texts, _ctx in recorder.calls] == [3, 1]
 
     def test_invalid_batch_size_rejected(self, tmp_path: Path) -> None:
-        from tools.memory.retrieval.flat_index import _embed_in_batches
+        from hars_memory.retrieval.flat_index import _embed_in_batches
 
         with pytest.raises(ValueError, match="batch_size must be >= 1"):
             asyncio.run(_embed_in_batches(_fake_embed, ["x"], "document", 0))
@@ -811,6 +811,6 @@ class TestEmbedBatching:
         batching" (too large, one batch spans the whole corpus again) or an
         absurdly small value that would multiply per-call overhead for no
         safety benefit."""
-        from tools.memory.retrieval.flat_index import DEFAULT_EMBED_BATCH_SIZE
+        from hars_memory.retrieval.flat_index import DEFAULT_EMBED_BATCH_SIZE
 
         assert 8 <= DEFAULT_EMBED_BATCH_SIZE <= 128

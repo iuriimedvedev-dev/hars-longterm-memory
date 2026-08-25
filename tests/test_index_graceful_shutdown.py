@@ -52,7 +52,7 @@ class TestInsertAllBatches:
     """_insert_all_batches is a pure async helper — test it in isolation."""
 
     def test_calls_ainsert_per_batch(self) -> None:
-        from tools.memory.server.index import _insert_all_batches
+        from hars_memory.server.index import _insert_all_batches
 
         async def run() -> None:
             rag = _make_rag()
@@ -64,7 +64,7 @@ class TestInsertAllBatches:
         asyncio.run(run())
 
     def test_propagates_cancelled_error(self) -> None:
-        from tools.memory.server.index import _insert_all_batches
+        from hars_memory.server.index import _insert_all_batches
 
         async def run() -> None:
             rag = _make_rag(ainsert_side_effect=asyncio.CancelledError)
@@ -75,7 +75,7 @@ class TestInsertAllBatches:
         asyncio.run(run())
 
     def test_propagates_generic_exception(self) -> None:
-        from tools.memory.server.index import _insert_all_batches
+        from hars_memory.server.index import _insert_all_batches
 
         async def run() -> None:
             rag = _make_rag(ainsert_side_effect=RuntimeError("extractor offline"))
@@ -96,7 +96,7 @@ async def _run_insert_with_finalize(
     docs: list[FakeDoc],
 ) -> None:
     """Reproduces the try/await insert_task/finally finalize pattern from _run_indexing."""
-    from tools.memory.server.index import _insert_all_batches
+    from hars_memory.server.index import _insert_all_batches
 
     loop = asyncio.get_running_loop()
     insert_task: asyncio.Task[None] = loop.create_task(
@@ -172,7 +172,7 @@ async def _run_insert_with_finalize_reraise(
     docs: list[FakeDoc],
 ) -> None:
     """Like _run_insert_with_finalize but re-raises non-CancelledError exceptions."""
-    from tools.memory.server.index import _insert_all_batches
+    from hars_memory.server.index import _insert_all_batches
 
     loop = asyncio.get_running_loop()
     insert_task: asyncio.Task[None] = loop.create_task(
@@ -199,7 +199,7 @@ class TestSignalHandlerLogic:
 
     def test_first_signal_cancels_task_and_sets_event(self) -> None:
         """First call to the handler must cancel the task and set shutdown_event."""
-        from tools.memory.server.index import _install_signal_handlers
+        from hars_memory.server.index import _install_signal_handlers
 
         loop = asyncio.new_event_loop()
         try:
@@ -232,7 +232,7 @@ class TestSignalHandlerLogic:
 
     def test_second_signal_calls_os_exit(self) -> None:
         """Second call to the handler must invoke os._exit(130)."""
-        from tools.memory.server.index import _install_signal_handlers
+        from hars_memory.server.index import _install_signal_handlers
 
         loop = asyncio.new_event_loop()
         try:
@@ -251,7 +251,7 @@ class TestSignalHandlerLogic:
 
             cb, cb_args = registered[signal.SIGINT]
 
-            import tools.memory.server.index as index_mod
+            import hars_memory.server.index as index_mod
 
             with patch.object(index_mod.os, "_exit") as mock_exit:
                 cb(*cb_args)  # first signal — graceful, no exit
@@ -264,7 +264,7 @@ class TestSignalHandlerLogic:
 
     def test_done_task_not_cancelled_on_first_signal(self) -> None:
         """A task that is already done must not have cancel() called."""
-        from tools.memory.server.index import _install_signal_handlers
+        from hars_memory.server.index import _install_signal_handlers
 
         loop = asyncio.new_event_loop()
         try:
