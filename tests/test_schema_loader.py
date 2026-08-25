@@ -41,9 +41,15 @@ def test_rejects_entity_type_with_pipe(tmp_path: Path) -> None:
         load_schema(path)
 
 
-def test_rejects_relation_type_with_slash_or_pipe(tmp_path: Path) -> None:
+def test_rejects_relation_type_with_slash(tmp_path: Path) -> None:
     path = _write_schema(tmp_path, ["Concept"], relation_types=["uses/depends"])
-    with pytest.raises(SchemaValidationError):
+    with pytest.raises(SchemaValidationError, match="/"):
+        load_schema(path)
+
+
+def test_rejects_relation_type_with_pipe(tmp_path: Path) -> None:
+    path = _write_schema(tmp_path, ["Concept"], relation_types=["uses|depends"])
+    with pytest.raises(SchemaValidationError, match=r"\|"):
         load_schema(path)
 
 
