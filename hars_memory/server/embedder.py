@@ -298,6 +298,14 @@ def _resolve_qdrant_embedding_dim(qdrant_url: str) -> int | None:
     ``None``: this guard exists to catch wrong-dimension embedding configs,
     not to duplicate the reachability check that memory_status/memory_recall
     already perform with an actionable error at call time.
+
+    A missing ``HARS_MEMORY_QDRANT_COLLECTION_PREFIX`` is NOT a connectivity
+    failure — it is a required-config error, and is deliberately resolved
+    OUTSIDE the connectivity try/except below so it fails loudly (raises)
+    instead of being caught by the broad ``except Exception`` and coerced
+    into the "nothing to validate against" ``None`` sentinel. Silently
+    disabling this guard on missing config is exactly the failure mode
+    ``validate_embedder_against_index``'s docstring warns against.
     """
     try:
         from qdrant_client import QdrantClient  # type: ignore[import-not-found]
@@ -309,10 +317,24 @@ def _resolve_qdrant_embedding_dim(qdrant_url: str) -> int | None:
         )
         return None
 
+    # Required config — resolve BEFORE the connectivity try/except so a missing
+    # var raises immediately and is never mistaken for "Qdrant unreachable" or
+    # "no index yet". Do not fold this into the broad except below.
+    try:
+        prefix = os.environ["HARS_MEMORY_QDRANT_COLLECTION_PREFIX"]
+    except KeyError as exc:
+        raise RuntimeError(
+            "HARS_MEMORY_QDRANT_COLLECTION_PREFIX is not set — required to resolve "
+            "this project's Qdrant collection names for the embedder/index "
+            "dimension guard. This is a configuration error, not a Qdrant "
+            "connectivity problem: set HARS_MEMORY_QDRANT_COLLECTION_PREFIX rather "
+            "than ignoring this error, or the guard would silently no-op and let "
+            "queries embed into the wrong vector space with no error."
+        ) from exc
+
     try:
         client = QdrantClient(url=qdrant_url, timeout=3)
         dims: dict[str, int] = {}
-        prefix = os.environ["HARS_MEMORY_QDRANT_COLLECTION_PREFIX"]
         for name in qdrant_collection_names(prefix):
             if not client.collection_exists(name):
                 continue
