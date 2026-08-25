@@ -1,67 +1,17 @@
 """Domain entity and relation type definitions for the HARS long-term memory knowledge graph.
 
-These types seed the LightRAG extraction prompt.  They are also used by the
-ingest layer when building stable-ID documents from Postgres rows.
+The entity/relation *vocabulary* itself now lives in a loadable YAML schema
+(see ``hars_memory.schema.loader``) rather than as hardcoded enums — this
+module keeps only the pieces that are generic enough to stay in code:
+stable-ID construction for the ingest layer, and a thin re-export of the
+loader's dynamic-enum entry point for backward-compatible import sites.
 """
 
 from __future__ import annotations
 
-from enum import Enum
-
-
-class EntityType(str, Enum):
-    """Typed entities extracted from HARS corpus.
-
-    IMPORTANT: LightRAG rejects entity types that contain ``/``, ``|``, or
-    other special characters (see lightrag/operate.py).  All values here must
-    be slash-free.  The extractor LLM lowercases and strips spaces before
-    storing, so names are matched case-insensitively at insertion time.
-
-    ``Model/Backbone`` was split into ``Model`` + ``Backbone`` and
-    ``Pipeline/Phase`` was split into ``Pipeline`` + ``Phase`` to ensure the
-    LLM's output is accepted rather than silently dropped.
-    """
-
-    HYPOTHESIS = "Hypothesis"
-    EXPERIMENT = "Experiment"
-    JOB_RUN = "JobRun"
-    CHECKPOINT = "Checkpoint"
-    METRIC = "Metric"
-    DATASET = "Dataset"
-    MODEL = "Model"
-    BACKBONE = "Backbone"
-    ENCODER = "Encoder"
-    PIPELINE = "Pipeline"
-    PHASE = "Phase"
-    REPORT = "Report"
-    PLAN = "Plan"
-    FINDING = "Finding"
-    CONFIG = "Config"
-    COMPONENT = "Component"
-    # Added 2026-07-10: the extractor kept emitting these on real corpus chunks
-    # and LightRAG dropped the entities as invalid-type. Keep the list tight.
-    ARTIFACT = "Artifact"    # files, paths, tarballs, logs
-    CONCEPT = "Concept"      # methods, ideas, failure modes
-    TOOL = "Tool"            # CLIs, services, libraries
-    TASK = "Task"            # work items, action points
-
-
-class RelationType(str, Enum):
-    """Typed relations between HARS entities."""
-
-    TESTS = "tests"
-    CONFIRMS = "confirms"
-    INVALIDATES = "invalidates"
-    DERIVED_FROM = "derived_from"
-    PRODUCES = "produces"
-    EVALUATED_ON = "evaluated_on"
-    OUTPERFORMS = "outperforms"
-    REGRESSES = "regresses"
-    SUPERSEDES = "supersedes"
-    USES = "uses"
-    DOCUMENTED_IN = "documented_in"
-    DEPENDS_ON = "depends_on"
-
+# Re-exported for backward-compatible import sites
+# (``from hars_memory.schema.entity_types import load_entity_types``).
+from hars_memory.schema.loader import load_entity_types as load_entity_types
 
 # Stable-ID prefixes for DB-origin nodes (ensures prose mentions resolve to
 # the same graph node as the Postgres row document).
