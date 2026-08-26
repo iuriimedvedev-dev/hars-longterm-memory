@@ -115,35 +115,28 @@ publish-container:
       image_sha="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
       image_short="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
 
-      docker build \
+      set -- \
         --pull \
+        --push \
         --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
         --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
         --file Dockerfile.service \
         --tag "$image_sha" \
-        .
-      docker push "$image_sha"
-
-      docker tag "$image_sha" "$image_short"
-      docker push "$image_short"
+        --tag "$image_short"
 
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         image_tag="$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
-        docker tag "$image_sha" "$image_tag"
-        docker push "$image_tag"
+        set -- "$@" --tag "$image_tag"
       fi
 
       if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ]; then
         image_latest="$CI_REGISTRY_IMAGE:latest"
-        docker tag "$image_sha" "$image_latest"
-        docker push "$image_latest"
+        set -- "$@" --tag "$image_latest"
       fi
+
+      docker buildx build "$@" .
   after_script:
     - docker logout "$CI_REGISTRY" || true
-    - docker image rm -f "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" || true
-    - docker image rm -f "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" || true
-    - docker image rm -f "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" || true
-    - docker image rm -f "$CI_REGISTRY_IMAGE:latest" || true
   rules:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
