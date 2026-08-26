@@ -20,8 +20,13 @@ dependencies = [
   "qdrant-client>=1.9.0",
   # Postgres export — async driver (preferred) + sync fallback
   "asyncpg>=0.29.0",
-  # Official MCP SDK — used by hars_longterm_memory_mcp.py
-  "mcp>=1.0.0",
+  # Official MCP SDK — used by hars_memory/mcp_server.py. Upper-bounded:
+  # mcp 2.x removed/renamed the Server.list_tools() decorator API this
+  # module uses (discovered when a fresh resolution in a downstream
+  # consumer picked mcp 2.1.1 and the server failed to even import).
+  # Every test in this project has only ever run against the 1.x line —
+  # bump the bound deliberately, with re-verification, not by drift.
+  "mcp>=1.0.0,<2.0.0",
   # Config + HTTP
   "pyyaml>=6.0",
   "httpx>=0.27.0",

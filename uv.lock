@@ -719,7 +719,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "ir-measures", specifier = ">=0.4.0" },
     { name = "lightrag-hku", specifier = ">=1.4.16" },
-    { name = "mcp", specifier = ">=1.0.0" },
+    { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
     { name = "networkx", specifier = ">=3.3" },
     { name = "openai", specifier = ">=2.0.0,<3.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
