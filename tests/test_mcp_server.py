@@ -591,6 +591,41 @@ class TestMemoryConsolidateDispatch:
         # index.py logs (not prints) its summary, so it lands in stderr, not stdout.
         assert "DRY RUN complete" in data["stderr"], data["stderr"]
 
+    def test_real_subprocess_default_relative_paths_resolve_against_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for a bug discovered during this fix wave's own
+        end-to-end verification: server/index.py had the EXACT SAME
+        `_PROJECT_ROOT = Path(__file__).resolve().parents[3]` disease as C1's
+        mcp_server.py findings, just not one of the three named call sites.
+        Once genuinely installed (site-packages), that resolved to a nonsense
+        path — memory_consolidate's DEFAULT `paths=[".plans", "docs"]` (no
+        explicit override — the common case) silently walked ZERO documents
+        from inside `.venv/lib/python3.13/` with `ok: true`, no error at all.
+        Fixed: relative --paths now resolve against Path.cwd() at invocation
+        time, matching mcp_server.py's subprocess spawn (no `cwd=` override —
+        the subprocess inherits the caller's cwd) and update_kb.sh's own
+        relative extra-paths convention (no `cd` before invoking).
+        """
+        import asyncio
+        import json
+
+        project_dir = tmp_path / "project"
+        (project_dir / ".plans").mkdir(parents=True)
+        (project_dir / ".plans" / "note.md").write_text("# plan\ncontent\n", encoding="utf-8")
+        (project_dir / "docs").mkdir()
+
+        monkeypatch.chdir(project_dir)
+        mod = _load_mcp_module_with_env({"HARS_MEMORY_INDEX_DIR": str(tmp_path / "index")})
+
+        # No `paths` override — exercises the DEFAULT [".plans", "docs"],
+        # the exact case that silently indexed zero documents before the fix.
+        result = asyncio.run(mod.call_tool("memory_consolidate", {"dry_run": True}))
+        data = json.loads(result[0].text)
+        assert data["ok"] is True, data
+        assert "documents=1" in data["stderr"], data["stderr"]
+        assert "documents=0" not in data["stderr"], data["stderr"]
+
 
 class TestMemoryConsolidateGpuGuard:
     """C1 fix #2: HARS_MEMORY_GPU_GUARD_SCRIPT_PATH replaces the old
