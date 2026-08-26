@@ -99,6 +99,25 @@ Its HTTP surface is `/health`, `POST/GET /v1/index-jobs`, job cancellation,
 latest/version descriptors, and checksum-bearing artifact downloads under
 `/v1/indexes/{index_id}/versions/...`.
 
+## GitLab CI and container registry
+
+Every branch and merge request runs repository-wide Ruff, the complete pytest
+suite (live LLM tests remain opt-in/skipped), and builds wheel/sdist artifacts.
+The default branch and tags additionally build `Dockerfile.service` on the
+existing `sh` runner and publish the service image to GitLab Container
+Registry using GitLab's short-lived `CI_REGISTRY_*` credentials.
+
+Published tags are:
+
+- `$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA` — immutable provenance tag;
+- `$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA` — operator-friendly commit tag;
+- `$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG` — tag pipelines only;
+- `$CI_REGISTRY_IMAGE:latest` — default branch only.
+
+No personal or long-lived registry token is stored in the repository. Test
+results are exposed as GitLab JUnit reports, while wheel/sdist files remain
+downloadable pipeline artifacts for 30 days.
+
 ## Index/search strategy evaluation and benchmarks
 
 Indexing parameters are represented by a validated `IndexStrategy`; the SDK
