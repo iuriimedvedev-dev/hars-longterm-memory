@@ -18,6 +18,7 @@ import pytest
 from hars_memory.retrieval import ripgrep_channel as rgc
 from hars_memory.retrieval.ripgrep_channel import (
     HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV,
+    HARS_MEMORY_RIPGREP_ROOTS_ENV,
     RipgrepSearchHit,
     check_availability,
     default_roots,
@@ -434,25 +435,90 @@ class TestGlobConventionsMatchWalker:
 
 
 class TestDefaultRoots:
-    def test_memory_dir_env_unset_yields_project_root_only(
+    """C1 fix #3: HARS_MEMORY_RIPGREP_ROOTS_ENV replaces the old hardcoded
+    `_PROJECT_ROOT` positional argument — default_roots() now reads its
+    root(s) from that env var (comma-separated), with no meaningful default."""
+
+    def test_roots_env_unset_yields_empty_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
+        monkeypatch.delenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, raising=False)
+        assert default_roots() == []
+
+    def test_roots_env_set_single_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, str(tmp_path))
         monkeypatch.delenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, raising=False)
-        roots = default_roots(tmp_path)
+        roots = default_roots()
         assert roots == [tmp_path.resolve()]
+
+    def test_roots_env_set_comma_separated_multiple_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root_a = tmp_path / "a"
+        root_b = tmp_path / "b"
+        root_a.mkdir()
+        root_b.mkdir()
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, f"{root_a}, {root_b}")
+        monkeypatch.delenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, raising=False)
+        roots = default_roots()
+        assert roots == [root_a.resolve(), root_b.resolve()]
 
     def test_memory_dir_env_set_is_appended(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, str(tmp_path / "project"))
         monkeypatch.setenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, str(memory_dir))
-        roots = default_roots(tmp_path / "project")
+        roots = default_roots()
         assert roots == [(tmp_path / "project").resolve(), memory_dir.resolve()]
 
-    def test_memory_dir_not_duplicated_if_same_as_project_root(
+    def test_memory_dir_not_duplicated_if_same_as_configured_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, str(tmp_path))
         monkeypatch.setenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, str(tmp_path))
-        roots = default_roots(tmp_path)
+        roots = default_roots()
         assert roots == [tmp_path.resolve()]
+
+    def test_memory_dir_appended_even_when_roots_env_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legitimate pre-existing behaviour preserved: the memory dir is
+        appended unconditionally when configured, independent of whether the
+        primary roots env var is set."""
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
+        monkeypatch.setenv(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, str(tmp_path))
+        roots = default_roots()
+        assert roots == [tmp_path.resolve()]
+
+
+class TestSearchUnavailableWithoutConfiguredRoots:
+    """C1 fix #3: search() must report unavailable (not silently search cwd)
+    when handed an empty roots list — the shape default_roots() returns when
+    HARS_MEMORY_RIPGREP_ROOTS is unset."""
+
+    def test_empty_roots_reports_unavailable_not_a_silent_search(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rgc, "check_availability", lambda: rgc.RipgrepAvailability(
+            available=True, reason=None, binary_path="/usr/bin/rg"
+        ))
+        result = search("what is A2S32?", roots=[])
+        assert result.available is False
+        assert result.hits == []
+        assert HARS_MEMORY_RIPGREP_ROOTS_ENV in (result.unavailable_reason or "")
+
+    def test_configured_roots_are_actually_searched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
+        _write(tmp_path / "docs" / "note.md", "A2S32 is the identifier under test.\n")
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, str(tmp_path))
+        roots = default_roots()
+        result = search("A2S32", roots=roots)
+        assert result.available is True
+        assert any("note.md" in hit.file_path for hit in result.hits)

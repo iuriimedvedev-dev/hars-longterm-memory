@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Query/keyword LLM for local long-term memory — Qwen3.5-4B on CPU, port 8082.
 # CPU-only BY DESIGN: memory_recall queries must stay available while the GPU trains.
-# Usage: tools/memory/scripts/start_query_llm.sh [--gpu]
+# Usage: cortex-scripts/start_query_llm.sh [--gpu]
 set -euo pipefail
 
 HF_HOME="${HF_HOME:-/mnt/datasets/models/.hf_home}"

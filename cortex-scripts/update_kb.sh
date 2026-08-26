@@ -2,16 +2,30 @@
 # Incremental knowledge-base update: merge staged agent notes (+ optional extra
 # paths) into the live long-term memory index using the local gemma-4-12b extractor.
 #
+# CORTEX-OPERATIONAL SCRIPT — NOT part of the hars-longterm-memory package
+# that ships to every consumer. Moved here (top-level cortex-scripts/, out of
+# hars_memory/scripts/) in the 2026-08-25 final-review fix wave (C2): it
+# assumes Cortex's own GPU-guard/extractor/vector-store choices, which are
+# this project's concern, not something a generic package should hardcode.
+# Run it from wherever `hars_memory` is installed and importable (e.g. via
+# `uv run --project tools/memory-config`, or after activating that project's
+# venv) — it invokes indexing as an installed module
+# (`python3 -m hars_memory.server.index`), matching mcp_server.py's own
+# memory_consolidate dispatch (C1 fix #1), never a constructed monorepo-
+# relative file path.
+#
 # Usage:
-#   tools/memory/scripts/update_kb.sh [extra paths...]
+#   cortex-scripts/update_kb.sh [extra paths...]
 #     no args  -> index staging notes only
 #     paths    -> also index the given dirs/files (e.g. .reports .session)
 #
 # GPU is needed ONLY for the duration of this run (extractor LLM). Queries stay
-# LLM-free. index.py refuses to run if a training experiment is active (gpu_guard).
+# LLM-free. See the GPU guard step below (I1) — configured via
+# HARS_MEMORY_GPU_GUARD_SCRIPT_PATH, same mechanism as mcp_server.py's
+# memory_consolidate tool (C1 fix #2); if unset, this script proceeds without
+# a GPU-concurrency check.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HF_HOME="${HF_HOME:-/mnt/datasets/models/.hf_home}"
 STAGING="${HARS_MEMORY_STAGING_DIR:-/mnt/datasets/graphrag/staging}"
 INDEX="${HARS_MEMORY_INDEX_DIR:-/home/angkira/.local/share/hars-graphrag/index_gemma_v4}"
@@ -19,6 +33,7 @@ PORT=8083
 BIN="$HOME/llama.cpp/build-rocm/bin/llama-server"
 GGUF=$(find -L "$HF_HOME/hub/models--unsloth--gemma-4-12b-it-GGUF" -name 'gemma-4-12b-it-Q4_K_M.gguf' | head -1)
 LOG=/tmp/memory_update_kb.log
+PYTHON_BIN="${HARS_MEMORY_PYTHON:-python3}"
 
 note_count=$(find "$STAGING" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
 if [[ $note_count -eq 0 && $# -eq 0 ]]; then
@@ -48,6 +63,41 @@ if [[ ! -f "$STAGING/.memoryignore" ]] || ! grep -qxF 'ingested/' "$STAGING/.mem
     echo "ensured $STAGING/.memoryignore excludes ingested/"
 fi
 
+# --- GPU guard (I1) --------------------------------------------------------
+# Abort BEFORE spending any time/VRAM starting the extractor server below if
+# a GPU-exclusive workflow is already running elsewhere. Uses the SAME
+# HARS_MEMORY_GPU_GUARD_SCRIPT_PATH-driven mechanism as mcp_server.py's
+# memory_consolidate tool (C1 fix #2, hars_memory/mcp_server.py): unset means
+# this generic package/script has no opinion on GPU concurrency and
+# proceeds; set means it must point at a Python file exposing
+# `assert_gpu_free(api_base_url)`, which is called and must not raise.
+if [[ -n "${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH:-}" ]]; then
+    echo "GPU guard: checking ${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH} ..."
+    if ! "$PYTHON_BIN" - "$HARS_MEMORY_GPU_GUARD_SCRIPT_PATH" "${HARS_API_BASE_URL:-http://localhost:8765}" <<'PYEOF'
+import importlib.util
+import sys
+
+script_path, api_base_url = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("hars_memory_gpu_guard", script_path)
+if spec is None or spec.loader is None:
+    print(f"ERROR: could not load gpu_guard module from {script_path}", file=sys.stderr)
+    sys.exit(1)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.assert_gpu_free(api_base_url)
+except Exception as exc:
+    print(f"ERROR: GPU guard blocked indexing: {exc}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    then
+        echo "GPU guard blocked indexing — aborting update_kb.sh"; exit 1
+    fi
+    echo "GPU guard: GPU free, proceeding."
+else
+    echo "HARS_MEMORY_GPU_GUARD_SCRIPT_PATH not set — skipping GPU guard check (proceeding without GPU-concurrency verification)."
+fi
+
 cleanup() { pkill -9 -f "llama-server.*$PORT" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -62,15 +112,15 @@ PARALLEL=6
 # --- per-slot context sizing (fixes latent ctx-size/--parallel bug) -------
 # llama.cpp DIVIDES --ctx-size across --parallel slots — it is NOT shared.
 # This exact invariant is already documented (and was violated here) in:
-#   tools/memory/server/lightrag_init.py:270-272 ("max_total_tokens ...
+#   hars_memory/server/lightrag_init.py:270-272 ("max_total_tokens ...
 #     MUST be <= the llama-server per-slot context (-c / --parallel)")
-#   tools/memory/config/.env.example:14-16 (same invariant)
+#   config/.env.example:14-16 (same invariant)
 # We compute CTX_SIZE from the same numbers LightRAG is actually configured
 # with below, so --parallel can never again drift out of agreement with
 # --ctx-size without the arithmetic visibly changing too.
 #
 # LightRAG's max_total_tokens (HARS_MEMORY_LLM_MAX_TOKEN_SIZE) is measured with
-# this project's _ByteTokenizer (tools/memory/server/lightrag_init.py:30-44),
+# this project's _ByteTokenizer (hars_memory/server/lightrag_init.py:30-44),
 # which counts UTF-8 BYTES, not real gemma/llama.cpp tokens — despite the
 # "TOKEN" in the env var name. We must convert bytes -> real tokens before
 # comparing against the server's per-slot token budget.
@@ -142,11 +192,17 @@ PATHS=("$STAGING")
 [[ $# -gt 0 ]] && PATHS+=("$@")
 
 echo "indexing into $INDEX ..."
-cd "$ROOT"
+# Invoked as an installed module (matches mcp_server.py's memory_consolidate
+# dispatch, C1 fix #1) — NOT a constructed file path, and no `cd`/PYTHONPATH
+# monorepo-layout dance: $PYTHON_BIN (default: python3) must already have
+# hars_memory importable (e.g. this script is run via
+# `uv run --project tools/memory-config bash cortex-scripts/update_kb.sh`,
+# or after activating that project's venv).
+#
 # Config-driven, not hardcoded: default matches the deployed backend
 # (QdrantVectorDBStorage since the 2026-07-30 migration) but MUST always
 # match whatever backend the deployed index actually uses (see
-# tools/memory/config/.env.example) — export HARS_MEMORY_VECTOR_STORAGE
+# config/.env.example) — export HARS_MEMORY_VECTOR_STORAGE
 # (and, for Qdrant, HARS_MEMORY_QDRANT_URL/HARS_MEMORY_QDRANT_COLLECTION) in the
 # calling shell before running this script to override. A mismatch here
 # writes vectors to the wrong backend while graph/KV updates land correctly,
@@ -171,8 +227,7 @@ HARS_MEMORY_EMBED_MODEL=unsloth/embeddinggemma-300m \
 HARS_MEMORY_EMBED_DEVICE=cpu \
 HARS_MEMORY_EMBED_LOCAL_FILES_ONLY=1 \
 HF_HOME="$HF_HOME" \
-PYTHONPATH="$ROOT" \
-uv run --project tools/memory python tools/memory/server/index.py \
+"$PYTHON_BIN" -m hars_memory.server.index \
     --paths "${PATHS[@]}" > "$LOG" 2>&1
 
 echo "indexing done; archiving ingested notes..."

@@ -62,8 +62,7 @@ HARS_MEMORY_EXTRACTOR_MODEL=Qwen3.6-27B-Q4_K_M \
 HARS_MEMORY_QUERY_BASE_URL=http://localhost:8080/v1 \
 HARS_MEMORY_QUERY_MODEL=Qwen3.6-27B-Q4_K_M \
 uv run --project tools/memory python tools/memory/server/index.py \
-    --paths .plans docs \
-    --db-export
+    --paths .plans docs
 ```
 
 The script **automatically refuses** to run if the GPU guard detects a running training job.
@@ -95,7 +94,6 @@ All model bindings are in `config/.env` (or environment variables). No code chan
 | Vector backend | `HARS_MEMORY_VECTOR_STORAGE` | Current default: `QdrantVectorDBStorage` (since 2026-07-30); `NanoVectorDBStorage` for rollback |
 | Qdrant URL | `HARS_MEMORY_QDRANT_URL` | Dedicated `hars-memory-qdrant` compose service is `http://localhost:6335` |
 | Qdrant tenant | `HARS_MEMORY_QDRANT_COLLECTION` | NOT a collection name — the `workspace_id` tenant id in every payload/query filter |
-| Postgres DSN | `HARS_MEMORY_POSTGRES_DSN` | hars-postgres; read-only |
 
 After swapping embedder: run `index.py --full` to rebuild all vectors.
 
@@ -124,9 +122,13 @@ memory_related(entity_id="hyp:abc-123", hops=2)
 
 # Trigger incremental reindex (dry-run by default)
 memory_consolidate(paths=[".plans", "docs"], dry_run=true)
-# Actual reindex (GPU must be free):
-memory_consolidate(paths=[".plans", "docs"], db_export=true, dry_run=false)
+# Actual reindex (GPU must be free if HARS_MEMORY_GPU_GUARD_SCRIPT_PATH is configured):
+memory_consolidate(paths=[".plans", "docs"], dry_run=false)
 ```
+
+Postgres export is not part of this package — it moved to the consuming
+project's own script, which calls `hars_memory.ingest.api.ingest_documents`
+directly (see `hars_memory/ingest/api.py`).
 
 ---
 
@@ -138,10 +140,11 @@ memory_consolidate(paths=[".plans", "docs"], db_export=true, dry_run=false)
     ▼
 ingest/walker.py          — glob filter + .memoryignore
 ingest/chunker.py         — character-level overlap chunking
-ingest/postgres_export.py — stable-ID docs from hars-postgres
+ingest/api.py             — public ingest_documents() API (consuming
+                              projects call this directly for their own
+                              non-filesystem sources, e.g. Postgres export)
     │
     ▼
-server/gpu_guard.py       — refuses indexing while training runs
 server/lightrag_init.py   — LightRAG wired to embeddinggemma-300m (CPU) + vector/NetworkX + llama.cpp
 server/index.py           — CLI entrypoint (GPU-guarded)
     │
@@ -224,11 +227,17 @@ uv run --project tools/memory pytest plugins/hars-longterm-memory/tests/ -v
 
 ## GPU guard
 
-Indexing calls `tools/memory/server/gpu_guard.py::assert_gpu_free()` which
-queries the HARS backend for running experiments.  If `vea/expert/ai_tuner/
-finetune/distillation` is running, indexing exits immediately with a clear
-error message.  **Query tools never call the GPU guard** — CPU embeddings keep
-`memory_status()` and `memory_recall()` always available even mid-training.
+GPU-guarding is entirely the consuming project's concern, not something this
+generic package hardcodes. `memory_consolidate` (and `cortex-scripts/update_kb.sh`,
+Cortex's own indexing wrapper — not part of the installed package) call a
+GPU-guard script only if `HARS_MEMORY_GPU_GUARD_SCRIPT_PATH` is set, pointing
+at a Python file exposing `assert_gpu_free(api_base_url)`; if unset, no
+GPU-concurrency check is performed and indexing proceeds. Cortex's own guard
+(`tools/memory-config/scripts/gpu_guard.py`) queries the HARS backend for
+running experiments and refuses to proceed if `vea/expert/ai_tuner/
+finetune/distillation` is running. **Query tools never call the GPU guard** —
+CPU embeddings keep `memory_status()` and `memory_recall()` always available
+even mid-training.
 
 ---
 
