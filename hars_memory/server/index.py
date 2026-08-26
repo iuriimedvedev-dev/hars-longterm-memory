@@ -7,13 +7,23 @@ indexing wrapper (update_kb.sh) must call assert_gpu_free() before invoking
 this CLI; running this script directly does not protect a shared GPU.
 
 Usage:
-    python tools/memory/server/index.py \\
+    python -m hars_memory.server.index \\
         --paths .plans docs \\
         [--full]              # full reindex (ignore change detection)
         [--refresh-changed]   # opt-in: delete+reinsert docs whose content
                                # changed since last ingest (default OFF, never
                                # deletes on its own)
         [--dry-run]            # walk + count only, no LLM calls
+
+A relative --paths entry is resolved against the CURRENT WORKING DIRECTORY at
+invocation time (Path.cwd()), NOT against any file-location-derived "project
+root" — there is no such thing once this package is genuinely installed
+(no fixed depth below any particular project). Run this from the directory
+whose `.plans`/`docs` you mean, or pass absolute paths. This is what
+mcp_server.py's memory_consolidate subprocess spawn relies on implicitly (it
+does not set `cwd=` — the subprocess inherits the MCP server process's own
+cwd), and what cortex-scripts/update_kb.sh relies on when it passes relative
+extra paths (e.g. `.reports`/`.session`) without `cd`-ing anywhere first.
 
 Environment variables (see config/.env.example):
     HARS_MEMORY_EXTRACTOR_BASE_URL         - llama-server endpoint for Qwen3.6-27B
@@ -39,8 +49,6 @@ import signal
 import sys
 from pathlib import Path
 from typing import Final
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 from hars_memory.ingest.change_detection import (
     FingerprintStore,
@@ -224,7 +232,14 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # this CLI; the package itself no longer knows Cortex's GPU is a shared
     # resource. (Task 4.x's cutover updates update_kb.sh to make this call.)
 
-    project_root = _PROJECT_ROOT
+    # Relative --paths resolve against the CURRENT WORKING DIRECTORY at
+    # invocation time — see this module's docstring. There is no file-
+    # location-derived "project root" once this package is genuinely
+    # installed (this was the same class of bug as C1 in mcp_server.py,
+    # discovered via real end-to-end verification of memory_consolidate:
+    # relative default paths silently resolved to a nonsense path inside
+    # site-packages and walked zero documents, with no error at all).
+    project_root = Path.cwd()
     resolved_paths = _resolve_ingest_paths(args.paths, project_root)
 
     # -----------------------------------------------------------------------
