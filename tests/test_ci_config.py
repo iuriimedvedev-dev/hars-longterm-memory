@@ -14,7 +14,8 @@ def test_pipeline_has_blocking_quality_and_package_jobs() -> None:
     config = _config()
 
     assert config["stages"] == ["lint", "test", "package", "publish"]
-    assert config["lint"]["script"] == ["uv run ruff check ."]
+    assert config["lint"]["script"] == ["uvx --from ruff==0.14.13 ruff check ."]
+    assert "ripgrep" in config[".python-job"]["before_script"][-2]
     assert "uv run pytest -q --junitxml=reports/pytest.xml" in config["test"]["script"]
     assert config["test"]["artifacts"]["reports"]["junit"] == "reports/pytest.xml"
     assert config["package"]["artifacts"]["paths"] == ["dist/*.whl", "dist/*.tar.gz"]

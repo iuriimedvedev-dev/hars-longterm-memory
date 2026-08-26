@@ -37,13 +37,17 @@ variables:
       - .cache/uv/
     policy: pull-push
   before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends ripgrep
     - uv sync --frozen --extra dev
 
 lint:
-  extends: .python-job
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  tags:
+    - sh
   stage: lint
   script:
-    - uv run ruff check .
+    - uvx --from ruff==0.14.13 ruff check .
   timeout: 15 minutes
 
 test:

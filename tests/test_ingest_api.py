@@ -9,7 +9,9 @@ from hars_memory.ingest.api import IngestResult, ingest_documents
 from hars_memory.ingest.document import Document, SourceKind
 
 
-def test_ingest_documents_returns_result_with_counts(tmp_path: Path) -> None:
+def test_ingest_documents_returns_result_with_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     docs = [
         Document(
             doc_id="ext:1",
@@ -19,6 +21,16 @@ def test_ingest_documents_returns_result_with_counts(tmp_path: Path) -> None:
             metadata={"origin_table": "experiments", "row_id": "1"},
         ),
     ]
+    fake_rag = _make_fake_rag()
+    monkeypatch.setattr(
+        "hars_memory.server.lightrag_init.create_lightrag", lambda **kwargs: fake_rag
+    )
+
+    async def fake_insert(rag, inserted_docs, batch_size):
+        rag._known_doc_ids.update(doc.doc_id for doc in inserted_docs)
+
+    monkeypatch.setattr(api_module, "_insert_all_batches", fake_insert)
+
     result = ingest_documents(docs, index_dir=tmp_path)
     assert isinstance(result, IngestResult)
     assert result.documents_written == 1

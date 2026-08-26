@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import stat
 from pathlib import Path
 
 import pytest
@@ -80,17 +79,18 @@ class TestFileHandlerWritesAndRotates:
 
 class TestUnwritablePathDegradesGracefully:
     def test_unwritable_parent_does_not_raise(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        readonly_dir = tmp_path / "readonly"
-        readonly_dir.mkdir()
-        readonly_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)  # r-x, no write => mkdir(parents) inside fails
-
-        log_file = readonly_dir / "nested" / "hars.log"
+        log_file = tmp_path / "readonly" / "nested" / "hars.log"
         monkeypatch.setenv("HARS_MEMORY_LOG_FILE", str(log_file))
 
-        try:
-            root = ls.setup_logging()  # must not raise
-        finally:
-            readonly_dir.chmod(stat.S_IRWXU)  # restore so tmp_path cleanup can remove it
+        original_mkdir = Path.mkdir
+
+        def deny_log_parent(self: Path, *args: object, **kwargs: object) -> None:
+            if self == log_file.parent:
+                raise PermissionError("simulated read-only log parent")
+            original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", deny_log_parent)
+        root = ls.setup_logging()  # must not raise
 
         assert not log_file.exists()
         # Still functional: at least the stderr handler is present.
