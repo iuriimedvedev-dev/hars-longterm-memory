@@ -33,4 +33,5 @@ def test_container_publish_is_gated_and_uses_gitlab_credentials() -> None:
     assert "--password-stdin" in before_script
     assert "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" in script
     assert "$CI_REGISTRY_IMAGE:latest" in script
-    assert "docker push" in script
+    assert "docker buildx build" in script
+    assert "--push" in script
