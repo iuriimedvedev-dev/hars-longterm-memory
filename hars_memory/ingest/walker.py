@@ -9,7 +9,6 @@ from __future__ import annotations
 import datetime
 import fnmatch
 import logging
-import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path

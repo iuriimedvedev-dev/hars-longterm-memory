@@ -25,7 +25,14 @@ from typing import Sequence
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if (parent / "pyproject.toml").is_file() and (parent / "hars_memory").is_dir():
+            return parent
+    # Installed wheels do not include the repository's pyproject.toml. The
+    # package parent is already importable, but returning it keeps the legacy
+    # sys.path bootstrap harmless and, unlike parents[3], valid at any depth.
+    return module_path.parent.parent
 
 
 def _ensure_project_root() -> None:
@@ -182,6 +189,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_strategy_bench(args: argparse.Namespace) -> int:
+    from hars_memory.eval.strategy_bench import StrategyBenchmarkError, run_strategy_matrix
+    from hars_memory.strategies import StrategyConfigurationError, load_strategy_matrix
+
+    try:
+        matrix = load_strategy_matrix(args.config)
+        report, report_path = run_strategy_matrix(matrix, run_id=args.run_id)
+    except (StrategyConfigurationError, StrategyBenchmarkError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"Wrote strategy benchmark: {report_path}")
+    print(f"matrix_sha256={report['matrix_sha256']}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memory",
@@ -240,6 +262,14 @@ def _build_parser() -> argparse.ArgumentParser:
     status_p = sub.add_parser("status", help="Print a corpus manifest summary.")
     status_p.add_argument("--index-dir", required=True, type=Path)
     status_p.set_defaults(func=_cmd_status)
+
+    strategy_p = sub.add_parser(
+        "strategy-bench",
+        help="Build and evaluate a declarative index x search strategy matrix.",
+    )
+    strategy_p.add_argument("--config", required=True, type=Path)
+    strategy_p.add_argument("--run-id", default=None)
+    strategy_p.set_defaults(func=_cmd_strategy_bench)
 
     return parser
 

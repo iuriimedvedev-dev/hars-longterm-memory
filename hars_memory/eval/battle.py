@@ -20,10 +20,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
 from hars_memory.ingest.document import Document
 from hars_memory.ingest.walker import walk
+
+
+def _project_root() -> Path:
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if (parent / "pyproject.toml").is_file() and (parent / "hars_memory").is_dir():
+            return parent
+    return module_path.parent.parent
+
+
+_PROJECT_ROOT = _project_root()
 
 logger = logging.getLogger("memory.eval.battle")
 

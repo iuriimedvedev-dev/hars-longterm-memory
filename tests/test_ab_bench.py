@@ -40,6 +40,47 @@ from hars_memory.eval import ab_bench
 from hars_memory.retrieval import fusion
 
 
+def test_score_query_can_normalize_portable_gold_paths() -> None:
+    query = ab_bench.QuerySpec(
+        id="portable",
+        type="identifier",
+        question="where?",
+        gold_docs=frozenset({"nested/answer.md"}),
+    )
+
+    strict = ab_bench.score_query(query, ["/tmp/run/nested/answer.md"], (1,))
+    normalized = ab_bench.score_query(
+        query,
+        ["/tmp/run/nested/answer.md"],
+        (1,),
+        normalize_gold_paths=True,
+    )
+
+    assert strict.recall_at_k[1] == 0.0
+    assert normalized.recall_at_k[1] == 1.0
+
+
+def test_score_query_normalizes_supersession_paths() -> None:
+    query = ab_bench.QuerySpec(
+        id="supersession",
+        type="supersession",
+        question="current?",
+        gold_docs=frozenset(),
+        correct_docs=frozenset({"current.md"}),
+        superseded_docs=frozenset({"old.md"}),
+    )
+
+    score = ab_bench.score_query(
+        query,
+        ["upload://old.md", "upload://current.md"],
+        (1, 2),
+        normalize_gold_paths=True,
+    )
+
+    assert score.recall_at_k[2] == 1.0
+    assert score.supersession_violation is True
+
+
 # ---------------------------------------------------------------------------
 # _resolve_alpha
 # ---------------------------------------------------------------------------

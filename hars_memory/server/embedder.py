@@ -51,6 +51,10 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 

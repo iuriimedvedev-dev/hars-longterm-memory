@@ -272,6 +272,7 @@ async def lightrag_mode(
     question: str,
     mode: str,
     top_k: int,
+    chunk_top_k: int | None = None,
     *,
     max_entity_tokens: int | None = None,
     max_relation_tokens: int | None = None,
@@ -313,7 +314,7 @@ async def lightrag_mode(
         param=QueryParam(
             mode=lightrag_mode_name,
             top_k=top_k,
-            chunk_top_k=top_k,
+            chunk_top_k=chunk_top_k if chunk_top_k is not None else top_k,
             only_need_context=True,
             **kw_args,
         ),
