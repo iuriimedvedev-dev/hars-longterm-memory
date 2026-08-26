@@ -343,6 +343,7 @@ async def run_config(
     top_k: int,
     alpha: float,
     pool_multiplier: int,
+    chunk_top_k: int | None = None,
     max_entity_tokens: int | None = None,
     max_relation_tokens: int | None = None,
     max_total_tokens: int | None = None,
@@ -376,6 +377,7 @@ async def run_config(
             question,
             config,
             top_k,
+            chunk_top_k=chunk_top_k,
             max_entity_tokens=max_entity_tokens,
             max_relation_tokens=max_relation_tokens,
             max_total_tokens=max_total_tokens,
@@ -404,9 +406,18 @@ class QueryScore:
 
 
 def score_query(
-    query: QuerySpec, ranked_docs: list[str], k_values: tuple[int, ...]
+    query: QuerySpec,
+    ranked_docs: list[str],
+    k_values: tuple[int, ...],
+    *,
+    normalize_gold_paths: bool = False,
 ) -> QueryScore:
     gold = query.judged_gold
+    scored_docs = (
+        _canonicalize_ranked_docs(ranked_docs, query)
+        if normalize_gold_paths
+        else ranked_docs
+    )
     recall: dict[int, float] = {}
     ndcg: dict[int, float] = {}
     rr: float | None = None
@@ -424,11 +435,13 @@ def score_query(
                 "cannot score. Fix retrieval_queries.yaml."
             )
         for k in k_values:
-            recall[k] = recall_at_k(ranked_docs, gold, k)
-            ndcg[k] = ndcg_at_k(ranked_docs, gold, k)
-        rr = reciprocal_rank(ranked_docs, gold)
+            recall[k] = recall_at_k(scored_docs, gold, k)
+            ndcg[k] = ndcg_at_k(scored_docs, gold, k)
+        rr = reciprocal_rank(scored_docs, gold)
         if query.type == "supersession":
-            violation = supersession_violated(ranked_docs, query.correct_docs, query.superseded_docs)
+            violation = supersession_violated(
+                scored_docs, query.correct_docs, query.superseded_docs
+            )
 
     return QueryScore(
         query_id=query.id,
@@ -439,6 +452,32 @@ def score_query(
         supersession_violation=violation,
         returned_any_hit=bool(ranked_docs),
     )
+
+
+def _matches_gold(retrieved_file_path: str, gold_entry: str) -> bool:
+    retrieved_norm = retrieved_file_path.replace("\\", "/")
+    gold_norm = gold_entry.replace("\\", "/")
+    if "/" in gold_norm:
+        return retrieved_norm.endswith(gold_norm)
+    return Path(retrieved_norm).name == gold_norm
+
+
+def _canonicalize_ranked_docs(ranked_docs: list[str], query: QuerySpec) -> list[str]:
+    """Map portable gold paths onto an index's absolute/URI path form.
+
+    This normalization is opt-in so historical invocations retain their
+    exact-string scoring. Strategy matrices enable it because their indexes
+    are built in per-run directories.
+    """
+    judged_paths = query.gold_docs | query.correct_docs | query.superseded_docs
+    canonical: list[str] = []
+    for file_path in ranked_docs:
+        match = next(
+            (gold_path for gold_path in judged_paths if _matches_gold(file_path, gold_path)),
+            None,
+        )
+        canonical.append(match if match is not None else file_path)
+    return canonical
 
 
 def aggregate_scores(
@@ -542,10 +581,19 @@ async def _run_ab(args: argparse.Namespace) -> int:
                     top_k=args.top_k,
                     alpha=args.alpha,
                     pool_multiplier=args.pool_multiplier,
+                    chunk_top_k=args.chunk_top_k,
                     max_entity_tokens=args.max_entity_tokens,
                     max_relation_tokens=args.max_relation_tokens,
+                    max_total_tokens=args.max_total_tokens,
                 )
-                scores.append(score_query(query, outcome.ranked_file_paths, args.k_values))
+                scores.append(
+                    score_query(
+                        query,
+                        outcome.ranked_file_paths,
+                        args.k_values,
+                        normalize_gold_paths=args.normalize_gold_paths,
+                    )
+                )
                 latencies.append(outcome.latency_ms)
                 per_query_raw.setdefault(config, {})[query.id] = outcome.ranked_file_paths
 
@@ -579,6 +627,7 @@ async def _run_ab(args: argparse.Namespace) -> int:
         "top_k": args.top_k,
         "k_values": list(args.k_values),
         "alpha": args.alpha,
+        "normalize_gold_paths": args.normalize_gold_paths,
         "config_snapshot": config_snapshot,
         "configs": configs,
         "results": results,
@@ -649,7 +698,14 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
                     alpha=alpha,
                     pool_multiplier=args.pool_multiplier,
                 )
-                scores.append(score_query(query, outcome.ranked_file_paths, args.k_values))
+                scores.append(
+                    score_query(
+                        query,
+                        outcome.ranked_file_paths,
+                        args.k_values,
+                        normalize_gold_paths=args.normalize_gold_paths,
+                    )
+                )
             agg = aggregate_scores(scores, args.k_values)
             sweep[alpha] = agg
             logger.info(
@@ -680,6 +736,7 @@ async def _run_alpha_sweep(args: argparse.Namespace) -> int:
         "best_alpha": best_alpha,
         "best_value": sweep[best_alpha].get(metric_key),
         "sensitivity_spread": round(sensitivity, 4),
+        "normalize_gold_paths": args.normalize_gold_paths,
         "config_snapshot": config_snapshot,
         "sweep": {str(a): sweep[a] for a in sweep},
     }
@@ -740,7 +797,14 @@ async def _run_token_budget_sweep(args: argparse.Namespace) -> int:
                         max_entity_tokens=entity_tokens,
                         max_relation_tokens=relation_tokens,
                     )
-                    scores.append(score_query(query, outcome.ranked_file_paths, args.k_values))
+                    scores.append(
+                        score_query(
+                            query,
+                            outcome.ranked_file_paths,
+                            args.k_values,
+                            normalize_gold_paths=args.normalize_gold_paths,
+                        )
+                    )
                 agg = aggregate_scores(scores, args.k_values)
                 sweep[key] = agg
                 logger.info(
@@ -763,6 +827,7 @@ async def _run_token_budget_sweep(args: argparse.Namespace) -> int:
         "n_queries": len(queries),
         "modes": modes,
         "budgets": [{"max_entity_tokens": e, "max_relation_tokens": r} for e, r in budgets],
+        "normalize_gold_paths": args.normalize_gold_paths,
         "config_snapshot": config_snapshot,
         "sweep": sweep,
     }
@@ -803,6 +868,15 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
         default="/tmp/hars_memory_bm25_eval",
     )
     p.add_argument(
+        "--normalize-gold-paths",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Match returned absolute/URI paths to portable gold basenames or suffixes. "
+            "Disabled by default to preserve historical exact-string benchmark semantics."
+        ),
+    )
+    p.add_argument(
         "--strict-env",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -839,6 +913,12 @@ def main() -> None:
     p_ab.add_argument("--hf-cache-dir", type=str, default="")
     p_ab.add_argument("--dump-hits", type=Path, default=None, help="Optional: dump raw per-query ranked file_paths per config")
     p_ab.add_argument(
+        "--chunk-top-k",
+        type=int,
+        default=None,
+        help="LightRAG chunk candidate width; defaults to --top-k.",
+    )
+    p_ab.add_argument(
         "--max-entity-tokens", type=int, default=None,
         help="QueryParam.max_entity_tokens for LightRAG-mode configs (naive/local/global/hybrid) only. "
              "Default None omits the kwarg entirely, so LightRAG's own unset default (6000) applies — "
@@ -852,6 +932,12 @@ def main() -> None:
              "Default None omits the kwarg entirely, so LightRAG's own unset default (8000) applies — "
              "see --max-entity-tokens. Set to 4500 to measure what hars_longterm_memory_mcp.py actually ships "
              "(DEFAULT_MAX_RELATION_CONTEXT_BYTES).",
+    )
+    p_ab.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="QueryParam.max_total_tokens for LightRAG-mode configs only.",
     )
 
     p_alpha = sub.add_parser("alpha-sweep", help="Sweep HARS_MEMORY_HYBRID_ALPHA over the hybrid_bm25 channel")

@@ -71,6 +71,7 @@ except ImportError:
 
 
 from hars_memory.server.embedder import qdrant_collection_names
+from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
 
 setup_logging()
@@ -81,8 +82,6 @@ logger = logging.getLogger("hars-longterm-memory-mcp")
 # falling back to HARS_MEMORY_* defaults. Configured via
 # HARS_MEMORY_LEGACY_ENV_PREFIXES (comma-separated); empty/unset = no-op.
 # See tools/memory/server/legacy_env_guard.py.
-from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
-
 refuse_if_legacy_env()
 
 # ---------------------------------------------------------------------------

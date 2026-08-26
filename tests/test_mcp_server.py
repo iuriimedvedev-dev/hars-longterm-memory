@@ -2634,8 +2634,6 @@ class TestContextPriorityWiring:
     """End-to-end: memory_recall's context_priority param, default vs opt-out."""
 
     def _stub_hybrid(self, mod: object, fused_chunks: list[dict]) -> None:
-        import asyncio
-
         async def _fake_compute_hybrid_block(
             rag: object,
             question: str,

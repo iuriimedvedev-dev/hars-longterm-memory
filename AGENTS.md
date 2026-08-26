@@ -56,13 +56,17 @@ hars_memory/
                         retrieval battle test (battle.py — has the one known
                         parked bug, see below), regression gate (regression.py,
                         `memory regress`), retrieval metrics (metrics.py)
+  service/             — tenant-scoped HTTP index-job API, durable SQL jobs,
+                        artifact stores, index engines, and lease worker
+  sdk.py               — synchronous HTTP client for create/extend/poll/download
+  strategies.py        — validated index/search strategies and YAML matrices
   scripts/              — cleanup_kb.py (index-only maintenance),
                         qdrant_transplant.py (one-off migration tool)
 cortex-scripts/         — Cortex's own consumer scripts (update_kb.sh,
                         start_query_llm.sh) — NOT part of the installed
                         package; kept in-repo only as a working reference
 config/.env.example     — full env-var reference with inline rationale
-tests/                  — 532 tests, pytest
+tests/                  — 581 passing tests plus 6 opt-in/environment skips, pytest
 ```
 
 ## Consumer hook points (this package ships no defaults for these)
@@ -91,7 +95,7 @@ tests/                  — 532 tests, pytest
 ```bash
 uv sync --extra dev     # NOT `uv sync --group dev` — dev is declared under
                          # [project.optional-dependencies], not a dependency-group
-uv run pytest -q        # 532 passed, 5 skipped as of v0.1.3
+uv run pytest -q        # 581 passed, 6 skipped as of v0.2.0
 ```
 
 `.python-version` pins Python 3.13. `uv.lock` is the pinned, reproducible

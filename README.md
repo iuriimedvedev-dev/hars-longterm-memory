@@ -9,7 +9,7 @@ tool surface never names the underlying mechanism.
 
 **Stack**: LightRAG (lightrag-hku 1.4.16) · unsloth/embeddinggemma-300m (768-dim) on CPU · NanoVectorDB (file-backed, migrating to Qdrant — see `.plans/2026-07-29_graphrag-qdrant-migration.md`) · NetworkX · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
 
-**Package manager**: [UV](https://docs.astral.sh/uv/) — standalone project at `tools/memory/` with its own `pyproject.toml` + `uv.lock`. Fully isolated from the main workspace and the ROCm training venv.
+**Package manager**: [UV](https://docs.astral.sh/uv/) — this standalone repository has its own `pyproject.toml` + `uv.lock` and is fully isolated from Cortex and its ROCm training environment.
 
 ---
 
@@ -18,9 +18,133 @@ tool surface never names the underlying mechanism.
 ### 1. Install dependencies
 
 ```bash
-# From the project root — creates tools/memory/.venv automatically
-uv sync --project tools/memory --extra dev
+# From the project root — creates .venv automatically
+uv sync --extra dev
 ```
+
+## Remote indexing service and Python SDK
+
+Install the optional server surface and start a local service:
+
+```bash
+uv sync --extra server
+
+export HARS_MEMORY_API_KEYS_JSON='{"replace-with-a-secret-key":"tenant-a"}'
+export HARS_MEMORY_SERVICE_DATABASE_URL='sqlite:///./hars-memory-service.sqlite3'
+export HARS_MEMORY_ARTIFACT_STORE_URL="file://$(pwd)/hars-memory-artifacts"
+
+uv run hars-longterm-memory-server
+```
+
+The API key mapping is `API key -> tenant ID`. It is required; the server
+fails closed when it is absent or empty. Submit work through the SDK:
+
+```python
+from pathlib import Path
+
+from hars_memory.sdk import HarsMemoryClient
+
+with HarsMemoryClient("http://127.0.0.1:8787", "replace-with-a-secret-key") as client:
+    job = client.create_index(
+        [Path("docs/architecture.md"), Path("notes.txt")],
+        engine="corpus",  # CPU-only and LLM-free
+        idempotency_key="architecture-v1",
+    )
+    completed = client.wait_job(job.id)
+    version = client.get_latest_index(completed.index_id)
+    client.download_artifact(completed.index_id, Path("architecture-index.tar.gz"))
+
+    extension = client.extend_index(
+        completed.index_id,
+        {"new-facts.md": "# New facts\n\nAdditional evidence."},
+        expected_version=version.version,
+        idempotency_key="architecture-v2",
+    )
+    client.wait_job(extension.id)
+```
+
+`engine="corpus"` builds the portable sparse/fusion corpus index without an
+LLM or GPU. `engine="lightrag"` runs the existing LightRAG indexer inside the
+server worker and therefore requires the configured extractor/query services;
+deploy that server on the GPU machine. Every successful job publishes a new
+immutable index version. Extending never mutates the last good version.
+
+For cloud deployments, switch only configuration:
+
+```bash
+export HARS_MEMORY_SERVICE_DATABASE_URL='postgresql+psycopg://user:password@db/hars_memory'
+export HARS_MEMORY_ARTIFACT_STORE_URL='s3://bucket/prefix'
+export HARS_MEMORY_S3_ENDPOINT_URL='https://s3.example.com'  # optional for AWS
+export HARS_MEMORY_S3_REGION='eu-central-1'
+```
+
+Install `--extra s3` for S3-compatible artifacts. Database rows contain job
+metadata, leases, state transitions, tenant ownership, and artifact references;
+index blobs remain in filesystem/S3. A Qdrant-backed LightRAG version reports
+its external workspace in the returned manifest and `portable=false`—the
+downloaded tarball intentionally does not pretend to contain remote Qdrant
+vectors.
+
+The service image is also buildable directly:
+
+```bash
+docker build -f Dockerfile.service -t hars-memory-service .
+docker run --rm -p 8787:8787 \
+  -e HARS_MEMORY_API_KEYS_JSON='{"replace-with-a-secret-key":"tenant-a"}' \
+  -v hars-memory-data:/data \
+  hars-memory-service
+```
+
+Its HTTP surface is `/health`, `POST/GET /v1/index-jobs`, job cancellation,
+latest/version descriptors, and checksum-bearing artifact downloads under
+`/v1/indexes/{index_id}/versions/...`.
+
+## Index/search strategy evaluation and benchmarks
+
+Indexing parameters are represented by a validated `IndexStrategy`; the SDK
+sends its name/options with a job, and every published manifest records both
+the snapshot and its stable SHA-256. Only a fixed option allowlist is accepted:
+clients cannot inject arbitrary environment variables, URLs, paths, or secrets.
+
+Use a declarative matrix to compare indexing and retrieval strategies:
+
+```bash
+cp config/strategy-bench.example.yaml /tmp/my-memory-matrix.yaml
+# Edit corpus_paths, queries_path, strategies, repeats, and primary_metric.
+uv run memory strategy-bench \
+  --config /tmp/my-memory-matrix.yaml \
+  --run-id experiment-001
+```
+
+Each index strategy is built once. Matching search strategies then run with
+configured warmups/repetitions. The report includes immutable strategy hashes,
+corpus/query/index hashes, build time, index size, documents/chunks per second,
+Recall@k, NDCG@k, MRR, query latency, variance, and a primary-metric
+leaderboard. Corpus strategies are LLM/GPU-free; LightRAG strategies call the
+real indexer and the existing retrieval-only `ab_bench` in isolated processes.
+
+### Opt-in real LLM E2E
+
+The live test is skipped during every normal `pytest` run. When both model
+servers are ready:
+
+```bash
+cp config/live-llm-e2e.env.example /tmp/hars-live.env
+# Fill model aliases/cache path, then export the file without committing it.
+set -a
+source /tmp/hars-live.env
+set +a
+
+uv run pytest -q \
+  tests/e2e/test_live_llm_strategy_e2e.py \
+  -m live_llm -s
+```
+
+It preflights both `/v1/models` endpoints, starts the real index service,
+creates a portable LightRAG v1 through the SDK, extends it to v2, verifies v1
+immutability, downloads both artifacts, then runs real MCP retrieval against
+both and real query-LLM synthesis against v2. The fixture has three source
+documents plus one rollback extension and uses one concurrent extraction slot.
 
 ### 2. Start Qdrant (optional prepared backend)
 
@@ -41,7 +165,7 @@ collections are always `lightrag_vdb_{chunks,entities,relationships}`.
 ### 3. Configure
 
 ```bash
-cp tools/memory/config/.env.example tools/memory/config/.env
+cp config/.env.example config/.env
 # Edit .env: set DSN, Qdrant URL, model paths
 ```
 
@@ -61,7 +185,7 @@ HARS_MEMORY_EXTRACTOR_BASE_URL=http://localhost:8080/v1 \
 HARS_MEMORY_EXTRACTOR_MODEL=Qwen3.6-27B-Q4_K_M \
 HARS_MEMORY_QUERY_BASE_URL=http://localhost:8080/v1 \
 HARS_MEMORY_QUERY_MODEL=Qwen3.6-27B-Q4_K_M \
-uv run --project tools/memory python tools/memory/server/index.py \
+uv run python -m hars_memory.server.index \
     --paths .plans docs
 ```
 
@@ -69,7 +193,7 @@ The script **automatically refuses** to run if the GPU guard detects a running t
 
 Dry-run (no LLM, just document counts):
 ```bash
-uv run --project tools/memory python tools/memory/server/index.py \
+uv run python -m hars_memory.server.index \
     --paths .plans docs --dry-run
 ```
 
@@ -220,7 +344,7 @@ rate drops below `--min-pass-rate`.
 
 ```bash
 # From project root
-uv run --project tools/memory pytest plugins/hars-longterm-memory/tests/ -v
+uv run pytest -q
 ```
 
 ---
