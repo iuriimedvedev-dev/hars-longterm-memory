@@ -153,7 +153,9 @@ async def purge_documents(
     os.environ.setdefault("HARS_MEMORY_EMBED_MODEL", "unsloth/embeddinggemma-300m")
     os.environ.setdefault("HARS_MEMORY_EMBED_LOCAL_FILES_ONLY", "1")
     os.environ.setdefault("HARS_MEMORY_EMBED_DEVICE", "cpu")
-    os.environ.setdefault("HF_HOME", "/mnt/datasets/models/.hf_home")
+    # Deliberately NOT os.environ.setdefault("HF_HOME", ...): this package
+    # must never set another library's global cache location. If HF_HOME
+    # isn't set by the environment, huggingface_hub's own default applies.
     from hars_memory.server.lightrag_init import create_lightrag
 
     rag = create_lightrag(working_dir=str(working_dir))
@@ -190,7 +192,16 @@ def main() -> None:
     keep_res = [re.compile(p, re.IGNORECASE) for p in args.keep]
     sections = {s.strip() for s in args.sections.split(",") if s.strip()}
 
-    wdir = Path(os.environ.get("HARS_MEMORY_INDEX_DIR", "/home/user/.local/share/hars-graphrag/index_gemma_v4"))
+    # Required, no machine-specific fallback — mirrors purge_documents()'s own
+    # HARS_MEMORY_VECTOR_STORAGE required-env pattern just above in this file.
+    index_dir_raw = os.environ.get("HARS_MEMORY_INDEX_DIR", "").strip()
+    if not index_dir_raw:
+        raise RuntimeError(
+            "HARS_MEMORY_INDEX_DIR is not set. This package has no machine-specific "
+            "default index location — export it to the deployed index's working dir "
+            "before running this script (see config/.env.example)."
+        )
+    wdir = Path(index_dir_raw)
     report = find_candidates(wdir, cutoff, keep_res, sections)
 
     print(f"index: {wdir} | docs total: {report.docs_total} | cutoff: < {cutoff}")

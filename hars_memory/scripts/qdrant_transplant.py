@@ -290,8 +290,13 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "--working-dir",
-        default=os.environ.get("HARS_MEMORY_INDEX_DIR", "/home/user/.local/share/hars-graphrag/index_gemma_v4"),
-        help="Forward: source of vdb_*.json. Reverse: destination for rebuilt vdb_*.json.",
+        default=os.environ.get("HARS_MEMORY_INDEX_DIR"),
+        required="HARS_MEMORY_INDEX_DIR" not in os.environ,
+        help=(
+            "Forward: source of vdb_*.json. Reverse: destination for rebuilt vdb_*.json. "
+            "No machine-specific default (env: HARS_MEMORY_INDEX_DIR) — matches "
+            "--collection-prefix's required-config pattern below."
+        ),
     )
     ap.add_argument("--qdrant-url", default=os.environ.get("HARS_MEMORY_QDRANT_URL", "http://localhost:6335"))
     ap.add_argument(

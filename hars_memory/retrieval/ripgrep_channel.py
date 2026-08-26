@@ -232,6 +232,15 @@ _LEGACY_IGNORE_FILE: Final[str] = ".graphragignore"
 # "don't depend on another module's private name" reason as the globs.
 HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
 
+# Comma-separated list of search roots for this channel — matches the
+# comma-separated multi-value config convention already used elsewhere in
+# this codebase (see server/legacy_env_guard.py's HARS_MEMORY_LEGACY_ENV_PREFIXES).
+# There is no meaningful default: an installed package has no "project root"
+# to guess at (that was this channel's original bug — it silently searched
+# whatever a hardcoded `_PROJECT_ROOT` resolved to). Unset/empty means "not
+# configured" — see `default_roots()` and `search()`'s empty-roots handling.
+HARS_MEMORY_RIPGREP_ROOTS_ENV: Final[str] = "HARS_MEMORY_RIPGREP_ROOTS"
+
 # --- rg invocation bounds -----------------------------------------------
 _DEFAULT_MAX_COUNT_PER_FILE: Final[int] = 20  # rg's own -m cap, per file
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 2.0
@@ -437,16 +446,26 @@ def _warn_if_legacy_ignore_file(root: Path) -> None:
 
 
 def default_roots(
-    project_root: Path, *, memory_dir_env: str = HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV
+    *,
+    roots_env: str = HARS_MEMORY_RIPGREP_ROOTS_ENV,
+    memory_dir_env: str = HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV,
 ) -> list[Path]:
-    """Default search roots: the whole project tree (see module docstring
-    "Search roots and filters" for why a single whole-tree root, filtered
-    via `-g`, is preferred over multiple narrow curated roots) plus the
-    optional Claude memory dir, mirroring
+    """Default search roots: read from `roots_env` (comma-separated absolute
+    paths — see module-level `HARS_MEMORY_RIPGREP_ROOTS_ENV` docstring) plus
+    the optional Claude memory dir, mirroring
     `server/index.py::_resolve_ingest_paths`'s "append unconditionally if
     set, dedupe" behaviour.
+
+    Returns `[]` when `roots_env` is unset/empty — there is no meaningful
+    default search root for an installed package (no "project root" to guess
+    at). An empty return here is the signal `search()` uses to report the
+    channel as unavailable rather than silently falling back to whatever a
+    bare `rg` invocation with no path arguments would search (the process's
+    own cwd) — see `search()`'s empty-roots handling.
     """
-    roots = [project_root.resolve()]
+    raw = os.environ.get(roots_env, "").strip()
+    roots = [Path(p.strip()).resolve() for p in raw.split(",") if p.strip()]
+
     memory_dir_raw = os.environ.get(memory_dir_env, "").strip()
     if memory_dir_raw:
         memory_dir = Path(memory_dir_raw).resolve()
@@ -624,13 +643,31 @@ def search(
     guessing) — mirrors `bm25_index.get_or_build_index(working_dir, ...)`'s
     convention of taking paths as plain arguments, which also keeps this
     function trivially testable against a `tmp_path` fixture. Use
-    `default_roots(project_root)` to build the recommended default list
+    `default_roots()` to build the recommended default list (env-var driven)
     when wiring this into the MCP server / fusion pipeline.
 
     Never raises: binary-missing, timeout, and partial `rg` errors are all
     fail-soft (see `check_availability` / `_run_rg`).
     """
     start = time.monotonic()
+
+    if not roots:
+        # No configured search root (see `default_roots()` — this is what an
+        # unset HARS_MEMORY_RIPGREP_ROOTS resolves to) — report the channel
+        # as unavailable rather than invoking `rg` with no path arguments,
+        # which would silently fall back to searching the process's own cwd
+        # (a meaningless default, not a real fix for the missing config).
+        return RipgrepSearchResult(
+            hits=[],
+            query_terms=(),
+            available=False,
+            unavailable_reason=(
+                f"no search roots configured — set {HARS_MEMORY_RIPGREP_ROOTS_ENV} "
+                "(comma-separated absolute paths) to enable this channel."
+            ),
+            latency_seconds=time.monotonic() - start,
+            timed_out=False,
+        )
 
     terms = extract_terms(question, ll_keywords)
     if not terms:
@@ -744,6 +781,7 @@ def search(
 __all__ = [
     "RG_BINARY_NAME",
     "HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV",
+    "HARS_MEMORY_RIPGREP_ROOTS_ENV",
     "MAX_QUERY_TERMS",
     "WHOLE_TOKEN_WEIGHT",
     "SUBSTRING_WEIGHT",

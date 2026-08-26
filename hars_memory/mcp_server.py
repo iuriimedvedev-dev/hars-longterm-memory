@@ -34,11 +34,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-# Repo root — used for ripgrep default roots and subprocess dispatch to
-# index.py, NOT for import resolution (hars_memory is installed in this
-# script's own venv, so no sys.path insertion is needed for that).
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
@@ -93,7 +88,28 @@ refuse_if_legacy_env()
 # ---------------------------------------------------------------------------
 # Config (all from env — no hardcoded values)
 # ---------------------------------------------------------------------------
-HARS_MEMORY_INDEX_DIR = os.environ.get("HARS_MEMORY_INDEX_DIR", "/tmp/hars_memory_lightrag")
+
+
+def _require_env(name: str) -> str:
+    """Read a required env var, or raise a clear, actionable error.
+
+    Used for config that has no meaningful machine-agnostic default (a path
+    into this operator's own filesystem) — silently falling back to a
+    specific machine's path (e.g. `/tmp/hars_memory_lightrag`,
+    `/mnt/datasets/graphrag/staging`) is exactly the "no machine-specific
+    defaults" violation this helper exists to prevent. See
+    docs/superpowers/specs/2026-08-25-hars-longterm-memory-standalone-extraction-design.md.
+    """
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"{name} is required and has no default — this package does not assume any "
+            "particular machine's filesystem layout. Set it explicitly (see config/.env.example)."
+        )
+    return value
+
+
+HARS_MEMORY_INDEX_DIR = _require_env("HARS_MEMORY_INDEX_DIR")
 HARS_MEMORY_VECTOR_STORAGE = os.environ.get("HARS_MEMORY_VECTOR_STORAGE", "NanoVectorDBStorage")
 HARS_MEMORY_GRAPH_STORAGE = os.environ.get("HARS_MEMORY_GRAPH_STORAGE", "NetworkXStorage")
 HARS_MEMORY_QDRANT_URL = os.environ.get("HARS_MEMORY_QDRANT_URL", "http://localhost:6335")
@@ -114,29 +130,33 @@ HARS_MEMORY_EXTRACTOR_BASE_URL = os.environ.get("HARS_MEMORY_EXTRACTOR_BASE_URL"
 HARS_MEMORY_EXTRACTOR_MODEL = os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", "Qwen3.6-27B-Q4_K_M")
 HARS_MEMORY_QUERY_BASE_URL = os.environ.get("HARS_MEMORY_QUERY_BASE_URL", "http://localhost:8081/v1")
 HARS_MEMORY_QUERY_MODEL = os.environ.get("HARS_MEMORY_QUERY_MODEL", "Qwen3.5-4B-Q4_K_M")
-HARS_MEMORY_POSTGRES_DSN = os.environ.get("HARS_MEMORY_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/hars")
 # Shared with memory_remember (write path) and _staging_backlog_info (memory_status
 # read path) — a single source of truth for where staged notes accumulate before
 # the next update_kb.sh run merges them into the graph.
-HARS_MEMORY_STAGING_DIR = os.environ.get("HARS_MEMORY_STAGING_DIR", "/mnt/datasets/graphrag/staging")
+HARS_MEMORY_STAGING_DIR = _require_env("HARS_MEMORY_STAGING_DIR")
 
 # --- Hybrid (dense + BM25 sparse) retrieval config — see retrieval/ package ---
-# Cache dir defaults to /tmp (never HARS_MEMORY_INDEX_DIR itself, e.g.
-# /home/user/.local/share/hars-graphrag/index_gemma_v4, which is
-# read-only production storage): mirrors HARS_MEMORY_INDEX_DIR's own /tmp
-# default in tools/memory/server/lightrag_init.py.
-HARS_MEMORY_BM25_CACHE_DIR = os.environ.get("HARS_MEMORY_BM25_CACHE_DIR", "/tmp/hars_memory_bm25")
-# Flat dense channel (retrieval/flat_index.py) cache dir — deliberately NOT
-# /tmp, unlike HARS_MEMORY_BM25_CACHE_DIR above. See flat_index.py's own
-# module docstring ("WHY cache_dir is NOT defaulted to /tmp here"): losing
-# the BM25 cache costs seconds to rebuild; losing this one costs up to 68
-# minutes (a full re-embed of every chunk). Default is a SIBLING directory
-# of HARS_MEMORY_INDEX_DIR itself (never inside it — that path is read-only
-# production storage, same reasoning as the BM25 default above), so it
-# lives on the same persistent volume as the source `kv_store_text_chunks.
-# json` it caches and survives a reboot; e.g. HARS_MEMORY_INDEX_DIR=
-# /home/user/.local/share/hars-graphrag/index_gemma_v4 resolves this to
-# /home/user/.local/share/hars-graphrag/flat_dense_cache.
+# Default derived from HARS_MEMORY_INDEX_DIR (never a separate machine-global
+# default, and never inside HARS_MEMORY_INDEX_DIR itself — that path is
+# read-only production storage): mirrors HARS_MEMORY_FLAT_DENSE_CACHE_DIR's
+# own derivation immediately below (a SIBLING directory of
+# HARS_MEMORY_INDEX_DIR). Losing this cache only costs seconds to rebuild
+# (unlike the flat-dense cache below), so it does not need its own separate
+# required env var — deriving it keeps "no machine-specific defaults" true
+# without adding a second knob an operator has to remember to set.
+HARS_MEMORY_BM25_CACHE_DIR = os.environ.get(
+    "HARS_MEMORY_BM25_CACHE_DIR", str(Path(HARS_MEMORY_INDEX_DIR).parent / "bm25_cache")
+)
+# Flat dense channel (retrieval/flat_index.py) cache dir — same
+# derive-from-HARS_MEMORY_INDEX_DIR pattern as HARS_MEMORY_BM25_CACHE_DIR
+# above, for the same "no separate machine-global default" reason. See
+# flat_index.py's own module docstring ("WHY cache_dir is NOT defaulted to
+# /tmp here"): losing the BM25 cache costs seconds to rebuild; losing this
+# one costs up to 68 minutes (a full re-embed of every chunk) — which is why
+# this one is a SIBLING directory of HARS_MEMORY_INDEX_DIR itself (never
+# inside it — that path is read-only production storage) rather than /tmp,
+# so it lives on the same persistent volume as the source
+# `kv_store_text_chunks.json` it caches and survives a reboot.
 HARS_MEMORY_FLAT_DENSE_CACHE_DIR = os.environ.get(
     "HARS_MEMORY_FLAT_DENSE_CACHE_DIR", str(Path(HARS_MEMORY_INDEX_DIR).parent / "flat_dense_cache")
 )
@@ -576,7 +596,7 @@ def _index_status() -> dict[str, Any]:
         "message": (
             "Index ready."
             if index_exists
-            else "Index empty / not yet built. Run: python tools/memory/server/index.py --paths .plans docs --db-export"
+            else "Index empty / not yet built. Run: python -m hars_memory.server.index --paths .plans docs"
         ),
     }
 
@@ -915,7 +935,7 @@ async def _compute_hybrid_block(
         if ripgrep_channel_enabled():
             from hars_memory.retrieval import ripgrep_channel
 
-            rg_roots = ripgrep_channel.default_roots(_PROJECT_ROOT)
+            rg_roots = ripgrep_channel.default_roots()
             rg_result = await asyncio.to_thread(
                 ripgrep_channel.search,
                 question,
@@ -1772,7 +1792,9 @@ async def list_tools() -> list[Tool]:
             "memory_consolidate",
             (
                 "Trigger incremental ingest (admin). "
-                "Blocked while vea/expert/ai_tuner/finetune/distillation is running (GPU busy). "
+                "If HARS_MEMORY_GPU_GUARD_SCRIPT_PATH is configured, blocked while a "
+                "GPU-exclusive workflow the consuming project defines is running; if unset, "
+                "this generic package has no opinion on GPU concurrency and proceeds. "
                 "paths: optional list of dirs to (re)index. "
                 "since: ISO timestamp — only reindex files newer than this."
             ),
@@ -1785,11 +1807,6 @@ async def list_tools() -> list[Tool]:
                 "since": {
                     "type": "string",
                     "description": "ISO8601 timestamp — reindex only files modified after this.",
-                },
-                "db_export": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Also re-export experiments/hypotheses from Postgres.",
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -2143,7 +2160,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return json_text({
                     "ok": False,
                     "error": "Index not built yet.",
-                    "hint": "Run memory_consolidate or python tools/memory/server/index.py",
+                    "hint": "Run memory_consolidate or python -m hars_memory.server.index",
                 })
 
             try:
@@ -2296,55 +2313,67 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         if name == "memory_consolidate":
             dry_run = bool(args.get("dry_run", True))
             paths = args.get("paths") or [".plans", "docs"]
-            db_export = bool(args.get("db_export", False))
 
-            # GPU guard — reindex requires extractor LLM
-            #
-            # gpu_guard.py now lives in the separate tools/memory-config project
-            # (its own venv, not this MCP server's tools/memory venv), so it can't
-            # be reached via a normal package import — load it directly from its
-            # file path instead. This is a deliberate, temporary cross-project
-            # coupling (ruling: 2026-08-25, keep live GPU protection working
-            # through the rest of Phase 1-3) — Task 1.8 relocates this whole MCP
-            # script into the hars_memory package itself, which is the right
-            # place to design a clean config-driven pre-flight-check hook that
-            # replaces this direct import.
+            # GPU guard — reindex requires extractor LLM, and on a shared GPU
+            # machine that LLM must not compete with a training run. Whether
+            # such a concurrency check even applies is entirely the consuming
+            # project's concern, not this generic package's: the guard script
+            # path is fully configurable via HARS_MEMORY_GPU_GUARD_SCRIPT_PATH
+            # (a Python file exposing `assert_gpu_free(api_base_url)`, loaded
+            # dynamically via its file path since it lives in a separate,
+            # consumer-owned project with its own venv — no normal package
+            # import is possible across that boundary). Unset (the default for
+            # a fresh install of this package) means "no GPU guard configured"
+            # — this is logged, not treated as an error, and memory_consolidate
+            # proceeds: GPU-guarding is Cortex's own operational concern (see
+            # tools/memory-config/scripts/gpu_guard.py in the consuming repo),
+            # not something this generic package should hardcode a path for.
             if not dry_run:
-                try:
-                    import importlib.util as _importlib_util
-
-                    _gpu_guard_path = (
-                        _PROJECT_ROOT / "tools" / "memory-config" / "scripts" / "gpu_guard.py"
+                gpu_guard_script_path = os.environ.get("HARS_MEMORY_GPU_GUARD_SCRIPT_PATH", "").strip()
+                if not gpu_guard_script_path:
+                    logger.info(
+                        "HARS_MEMORY_GPU_GUARD_SCRIPT_PATH not set — no GPU guard configured, "
+                        "proceeding without a GPU-concurrency check. Set this env var to a "
+                        "Python file exposing assert_gpu_free(api_base_url) to enable one."
                     )
-                    _gpu_guard_spec = _importlib_util.spec_from_file_location(
-                        "hars_memory_config_gpu_guard", _gpu_guard_path
-                    )
-                    if _gpu_guard_spec is None or _gpu_guard_spec.loader is None:
-                        raise ImportError(f"could not load gpu_guard module from {_gpu_guard_path}")
-                    _gpu_guard_module = _importlib_util.module_from_spec(_gpu_guard_spec)
-                    _gpu_guard_spec.loader.exec_module(_gpu_guard_module)
-                    assert_gpu_free = _gpu_guard_module.assert_gpu_free
+                else:
+                    try:
+                        import importlib.util as _importlib_util
 
-                    assert_gpu_free(HARS_API_BASE_URL)
-                except Exception as exc:
-                    logger.warning("memory_consolidate blocked by GPU guard: %s", exc)
-                    log_write_event(
-                        tool="memory_consolidate",
-                        ok=False,
-                        detail={"dry_run": dry_run, "paths": [str(p) for p in paths], "db_export": db_export,
-                                "stage": "gpu_guard", "error_type": type(exc).__name__, "error": str(exc)},
-                    )
-                    return json_text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
+                        _gpu_guard_path = Path(gpu_guard_script_path)
+                        _gpu_guard_spec = _importlib_util.spec_from_file_location(
+                            "hars_memory_gpu_guard", _gpu_guard_path
+                        )
+                        if _gpu_guard_spec is None or _gpu_guard_spec.loader is None:
+                            raise ImportError(f"could not load gpu_guard module from {_gpu_guard_path}")
+                        _gpu_guard_module = _importlib_util.module_from_spec(_gpu_guard_spec)
+                        _gpu_guard_spec.loader.exec_module(_gpu_guard_module)
+                        assert_gpu_free = _gpu_guard_module.assert_gpu_free
 
-            # Build CLI args and launch in subprocess so MCP server stays responsive
+                        assert_gpu_free(HARS_API_BASE_URL)
+                    except Exception as exc:
+                        logger.warning("memory_consolidate blocked by GPU guard: %s", exc)
+                        log_write_event(
+                            tool="memory_consolidate",
+                            ok=False,
+                            detail={"dry_run": dry_run, "paths": [str(p) for p in paths],
+                                    "stage": "gpu_guard", "error_type": type(exc).__name__, "error": str(exc)},
+                        )
+                        return json_text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
+
+            # Build CLI args and launch in subprocess so MCP server stays responsive.
+            # Invoked as an installed module (`-m hars_memory.server.index`), NOT a
+            # constructed file path — this is correct whether the package is a real
+            # pip/uv install (site-packages) or a source checkout, with no
+            # "project root" path-guessing either way. Inherits this process's own
+            # environment (including sys.executable's venv), so HARS_MEMORY_* config
+            # already validated by this server applies identically to the subprocess.
             import subprocess
             cmd = [
                 sys.executable,
-                str(_PROJECT_ROOT / "tools" / "memory" / "hars_memory" / "server" / "index.py"),
+                "-m", "hars_memory.server.index",
                 "--paths", *[str(p) for p in paths],
             ]
-            if db_export:
-                cmd.append("--db-export")
             if dry_run:
                 cmd.append("--dry-run")
 
@@ -2354,12 +2383,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     capture_output=True,
                     text=True,
                     timeout=7200 if not dry_run else 60,
-                    cwd=str(_PROJECT_ROOT),
                 )
                 log_write_event(
                     tool="memory_consolidate",
                     ok=result.returncode == 0,
-                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths], "db_export": db_export,
+                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths],
                             "returncode": result.returncode},
                 )
                 return json_text({
@@ -2374,7 +2402,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 log_write_event(
                     tool="memory_consolidate",
                     ok=False,
-                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths], "db_export": db_export,
+                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths],
                             "stage": "subprocess", "error": "timeout (7200s)"},
                 )
                 return json_text({"ok": False, "error": "Indexing timed out (7200s)."})
@@ -2383,7 +2411,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 log_write_event(
                     tool="memory_consolidate",
                     ok=False,
-                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths], "db_export": db_export,
+                    detail={"dry_run": dry_run, "paths": [str(p) for p in paths],
                             "stage": "subprocess", "error_type": type(exc).__name__, "error": str(exc)},
                 )
                 return json_text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})

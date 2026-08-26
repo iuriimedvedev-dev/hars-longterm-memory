@@ -84,9 +84,14 @@ def _load_model(model_name: str, device: str, hf_cache_dir: str, local_files_onl
         hf_cache_dir,
         local_files_only,
     )
-    if hf_cache_dir:
-        os.environ.setdefault("HF_HOME", hf_cache_dir)
-        os.environ.setdefault("TRANSFORMERS_CACHE", hf_cache_dir)
+    # Deliberately NOT os.environ.setdefault("HF_HOME", ...): this package
+    # must never set another library's global cache location as a side
+    # effect of loading a model. `hf_cache_dir` is passed directly to
+    # CrossEncoder's own `cache_folder=` argument below instead — that scopes
+    # the override to this model load, without mutating process env state
+    # that could affect unrelated huggingface_hub calls elsewhere in the same
+    # process. If HF_HOME isn't set by the environment, huggingface_hub's own
+    # default behaviour applies unmodified.
 
     # Same dual-cache-root probing as embedder.py::_load_model — `hf download`
     # lands models under <HF_HOME>/hub/, legacy sentence-transformers downloads
