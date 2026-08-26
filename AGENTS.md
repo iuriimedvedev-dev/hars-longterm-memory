@@ -66,7 +66,9 @@ cortex-scripts/         — Cortex's own consumer scripts (update_kb.sh,
                         start_query_llm.sh) — NOT part of the installed
                         package; kept in-repo only as a working reference
 config/.env.example     — full env-var reference with inline rationale
-tests/                  — 581 passing tests plus 6 opt-in/environment skips, pytest
+.gitlab-ci.yml          — Ruff, pytest, package artifacts, container publishing
+Dockerfile.service      — production HTTP index-service image
+tests/                  — 583 passing tests plus 6 opt-in/environment skips, pytest
 ```
 
 ## Consumer hook points (this package ships no defaults for these)
@@ -95,7 +97,7 @@ tests/                  — 581 passing tests plus 6 opt-in/environment skips, p
 ```bash
 uv sync --extra dev     # NOT `uv sync --group dev` — dev is declared under
                          # [project.optional-dependencies], not a dependency-group
-uv run pytest -q        # 581 passed, 6 skipped as of v0.2.0
+uv run pytest -q        # 583 passed, 6 skipped as of v0.2.0
 ```
 
 `.python-version` pins Python 3.13. `uv.lock` is the pinned, reproducible
