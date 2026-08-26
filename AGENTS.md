@@ -1,0 +1,198 @@
+# AGENTS.md — hars-longterm-memory
+
+Onboarding doc for any AI coding agent picking this repo up cold. If you have
+never seen this repo before, read this file in full before touching code.
+
+## What this is
+
+`hars-longterm-memory` is a **standalone, reusable Python package**: a
+LightRAG (graph+vector) knowledge-base service exposed as both an MCP server
+and a CLI. It was extracted out of the `cortex` monorepo's `tools/memory/` on
+2026-08-25 (history preserved via `git filter-repo`) and is now published as
+an independent package to a private GitLab Package Registry
+(`code.knotgate.com`, project id `14`, path `hars/hars-longterm-memory`).
+
+**What this repo is NOT**: it is not Cortex-specific. It carries no opinion
+about which GPU-guard mechanism, entity-typing schema, or downstream export
+pipeline a consumer needs — those are consumer-supplied hook points (see
+"Consumer hook points" below). No cortex-specific code should be added here.
+`cortex-scripts/` is the one deliberate exception: it holds Cortex's own
+operational wrapper scripts, explicitly **not** part of the installed
+package (excluded from the wheel — see `[tool.hatch.build.targets.wheel]` in
+`pyproject.toml`, which lists only `packages = ["hars_memory"]`). Any other
+consuming project owns its own equivalent of these scripts; this repo does
+not ship them.
+
+## Architecture — module map
+
+```
+hars_memory/
+  cli.py             — console-script entrypoints (memory-index, memory-mcp,
+                        hars-longterm-memory-mcp, memory-eval-battle, memory)
+  mcp_server.py       — the MCP server: 7 tools (memory_recall/remember/
+                        entities/related/status/consolidate/forget), ~2600
+                        lines, the primary read surface for an AI agent
+  ingest/             — walker (.memoryignore-aware glob), chunker, change
+                        detection (content-fingerprint sidecar), and the
+                        public ingest_documents() API a consumer calls
+                        directly for non-filesystem sources (e.g. Postgres)
+  server/             — index.py (GPU-guarded CLI reindex entrypoint),
+                        lightrag_init.py (wires LightRAG to the configured
+                        embedder/extractor/query LLM/vector+graph storage),
+                        embedder.py, reranker.py, legacy_env_guard.py,
+                        logging_setup.py
+  retrieval/          — BM25 sparse index, flat-dense fallback index,
+                        ripgrep live-worktree channel, dense/sparse fusion,
+                        supersession-aware rescoring — all additive channels
+                        layered onto LightRAG's own retrieval, surfaced via
+                        memory_recall's `hybrid` response field
+  corpus/              — a second, LLM-free, CPU-only build/query pipeline
+                        (`memory build|query|status` subcommands) — separate
+                        from the LightRAG graph pipeline, no LLM calls at all
+  schema/              — entity/relation type schema loader; ships its own
+                        generic `default_schema.yaml`, overridable via
+                        HARS_MEMORY_ENTITY_SCHEMA_PATH
+  eval/                — gold-question harness (check.py), generated
+                        retrieval battle test (battle.py — has the one known
+                        parked bug, see below), regression gate (regression.py,
+                        `memory regress`), retrieval metrics (metrics.py)
+  scripts/              — cleanup_kb.py (index-only maintenance),
+                        qdrant_transplant.py (one-off migration tool)
+cortex-scripts/         — Cortex's own consumer scripts (update_kb.sh,
+                        start_query_llm.sh) — NOT part of the installed
+                        package; kept in-repo only as a working reference
+config/.env.example     — full env-var reference with inline rationale
+tests/                  — 532 tests, pytest
+```
+
+## Consumer hook points (this package ships no defaults for these)
+
+- **GPU guard** (`HARS_MEMORY_GPU_GUARD_SCRIPT_PATH`): optional. Unset (the
+  default) means `memory_consolidate` and `server/index.py` perform **no**
+  GPU-concurrency check at all and proceed unconditionally. If set, it must
+  point at a Python file exposing `assert_gpu_free(api_base_url)`, loaded
+  dynamically via `importlib.util.spec_from_file_location` (not a normal
+  package import — the guard script is expected to live in a separate,
+  consumer-owned project with its own venv). Cortex supplies its own at
+  `tools/memory-config/scripts/gpu_guard.py`.
+- **Entity schema** (`HARS_MEMORY_ENTITY_SCHEMA_PATH`): optional. This
+  package DOES ship a generic default at `hars_memory/schema/default_schema.yaml`
+  (entity types: Concept/Document/Decision/Event/Person/Tool/Task; relation
+  types: relates_to/produces/depends_on/supersedes/documented_in) and uses it
+  automatically if the env var is unset — a consumer only needs to set this
+  if it wants domain-specific entity typing.
+- **Legacy env-prefix guard** (`HARS_MEMORY_LEGACY_ENV_PREFIXES`): optional,
+  no-op when unset. A consumer that renamed its own env vars in the past can
+  list forbidden prefixes (comma-separated) here to fail closed at startup
+  instead of silently reading stale values.
+
+## Build / test locally
+
+```bash
+uv sync --extra dev     # NOT `uv sync --group dev` — dev is declared under
+                         # [project.optional-dependencies], not a dependency-group
+uv run pytest -q        # 532 passed, 5 skipped as of v0.1.3
+```
+
+`.python-version` pins Python 3.13. `uv.lock` is the pinned, reproducible
+lock file — commit it alongside any `pyproject.toml` dependency change.
+
+## Publishing a new version
+
+There is no CI pipeline in this repo (no `.gitlab-ci.yml`) — publishing is a
+manual, local operation:
+
+1. Bump `version` in `pyproject.toml` (and `uv.lock` will pick it up on the
+   next `uv sync`/`uv lock`).
+2. Run the test suite; it must pass.
+3. Build: `uv build` (produces `dist/hars_longterm_memory-<version>-py3-none-any.whl`
+   and the matching `.tar.gz` sdist).
+4. Publish via HTTP PUT to the GitLab Package Registry:
+   ```bash
+   uv publish --publish-url https://code.knotgate.com/api/v4/projects/14/packages/pypi \
+       --username __token__ --password "$GITLAB_TOKEN_WITH_write_package_registry_SCOPE"
+   ```
+   (or `twine upload --repository-url ... dist/*` with the same credentials —
+   either works against a GitLab PyPI-compatible registry endpoint). The
+   token needs the `write_package_registry` scope; get a real one from that
+   machine's own gitignored secrets file (e.g. cortex's `.env` /
+   `.env.secrets` — never hardcode one here).
+5. **Never trust the publish command's own success message.** Re-query the
+   registry directly to confirm the new version landed:
+   ```bash
+   curl -s "https://code.knotgate.com/api/v4/projects/14/packages" \
+       -H "PRIVATE-TOKEN: $TOKEN" | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
+   ```
+
+## Credential model
+
+- **Consumers** (installing/resolving the package) authenticate to the
+  registry index with a **deploy token**, supplied as
+  `UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD` env vars (uv's
+  convention for a named `[[tool.uv.index]]` — `<NAME>` is that index's
+  uppercased `name`). Store these in a gitignored secrets file on the
+  consumer's own machine, never committed.
+- **Publishers** need a personal/project access token with the
+  `write_package_registry` scope — same rule: kept in a gitignored secrets
+  file, never in this repo, never in a commit message, never in CI config
+  checked into git.
+
+## Known parked bug (do not fix casually)
+
+`hars_memory/eval/battle.py` line 23:
+```python
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+```
+This assumes a monorepo-style directory depth (`tools/memory/eval/battle.py`
+→ 3 parents up = project root) that does not exist once this package is
+genuinely `pip`/`uv`-installed into `site-packages` — a relative `--paths`
+argument to `memory-eval-battle` / `memory_eval_battle_main` will resolve
+against a nonsense path. It is **not load-bearing** for the MCP server or the
+core CLI paths (`memory_recall`, `memory_consolidate`, `memory build/query`,
+etc. never touch it) — it only affects `memory-eval-battle` invoked with
+relative `--paths`. Workaround today: always pass absolute `--paths` to
+`memory-eval-battle`. Flagged here as a known issue for a future v0.1.4, not
+fixed as part of this doc pass.
+
+Note: a near-identical instance of this exact pattern in
+`hars_memory/server/index.py` **was** fixed in v0.1.3 (commit `8f5016f6`) —
+relative `--paths` there now resolve against `Path.cwd()` at invocation time,
+which is what `memory_consolidate`'s subprocess spawn (no `cwd=` override)
+and `cortex-scripts/update_kb.sh`'s relative-extra-paths convention both rely
+on. `battle.py` was not part of that fix wave.
+
+Also worth knowing (found but out of scope to fix here): `hars_memory/cli.py`'s
+`_project_root()` / `_ensure_project_root()` (used by `index_main`,
+`eval_battle_main`, and the unified `memory` command) still computes
+`Path(__file__).resolve().parents[3]` and inserts it into `sys.path`. In
+practice this looks harmless once the package is installed (the actual
+`from hars_memory.X import Y` imports resolve via `site-packages` regardless
+of what garbage this inserts at `sys.path[0]`), but it is the same
+anti-pattern and worth cleaning up alongside `battle.py` in v0.1.4.
+
+## torch is CPU-only by design
+
+Confirmed in `pyproject.toml`:
+```toml
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+```
+`[tool.uv.sources]` does **not** propagate to a consumer through a built
+wheel — a project that depends on `hars-longterm-memory` from the registry
+must repeat this override itself (see the skill doc for the exact snippet),
+or `torch` will resolve to the full CUDA build from PyPI.
+
+## Deeper conventions
+
+- `CLAUDE.md` — Claude-Code-specific operating notes for this repo.
+- `.session/` — one file per significant work session (see `.session/README.md`).
+- `.plans/` — forward-looking implementation plans for non-trivial work (see
+  `.plans/README.md`).
+- `.claude/skills/hars-longterm-memory/SKILL.md` — the portable skill meant
+  to be copied into any OTHER project's `.claude/skills/` so an agent there
+  can install/configure/use this package without ever having seen this repo.
