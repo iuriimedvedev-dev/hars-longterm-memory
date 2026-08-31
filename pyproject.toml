@@ -53,6 +53,11 @@ dependencies = [
   # C build). See metrics.py module docstring for the conventions this
   # replaces vs keeps.
   "ir-measures>=0.4.0",
+  # BPE tokenizer (cl100k_base) backing server/lightrag_init.py::resolve_tokenizer.
+  # Without it LightRAG's "token" budgets silently degrade to UTF-8 BYTE budgets
+  # (~4x over-chunking). Declared explicitly since we import it directly; the
+  # byte tokenizer remains as a fallback for hosts without the cached BPE asset.
+  "tiktoken>=0.7.0",
 ]
 
 [project.optional-dependencies]

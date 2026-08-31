@@ -69,6 +69,49 @@ _SECTION_DEFAULT_TEXT = "docs"
 _GIT_LOG_TIMEOUT_SECONDS = 3.0
 
 
+_FRONTMATTER_FENCE = "---"
+# Bounded scan: a real YAML frontmatter block sits at the very top of the
+# file. Without a cap, a document whose body happens to contain a lone
+# `---` line would make us search to EOF for a closing fence that does not
+# exist.
+_FRONTMATTER_MAX_LINES = 200
+
+
+def split_frontmatter(content: str) -> tuple[str, str]:
+    """Split *content* into ``(frontmatter_block, body)``.
+
+    ``frontmatter_block`` includes both ``---`` fences and the trailing
+    newline, and is ``""`` when *content* does not open with a YAML
+    frontmatter block.
+
+    Why this exists: the attribution header used to be prepended ahead of
+    everything, which put a ``[Document: ...]`` line BEFORE the opening
+    ``---``. That stops the block from being frontmatter at all — every YAML
+    parser (and every downstream consumer that reads ``tags:``/``date:`` out
+    of it) then sees plain prose, and the fences leak into the indexed text
+    as body content. The header must go *after* the closing fence instead.
+    """
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != _FRONTMATTER_FENCE:
+        return "", content
+    for idx in range(1, min(len(lines), _FRONTMATTER_MAX_LINES)):
+        if lines[idx].strip() == _FRONTMATTER_FENCE:
+            block = "".join(lines[: idx + 1])
+            body = "".join(lines[idx + 1 :])
+            return block, body.lstrip("\n")
+    return "", content
+
+
+def apply_source_header(content: str, header: str) -> str:
+    """Insert *header* into *content*, after any YAML frontmatter block."""
+    frontmatter, body = split_frontmatter(content)
+    if not frontmatter:
+        return header + content
+    if not frontmatter.endswith("\n"):
+        frontmatter += "\n"
+    return f"{frontmatter}\n{header}{body}"
+
+
 def _infer_section(root: Path, kind: SourceKind) -> str:
     """Pick a ``Section`` label for the attribution header.
 
@@ -344,16 +387,16 @@ def walk(
                 mtime = 0.0
 
             if not dry_run:
-                # Frontmatter (if any) is passed through unmodified — the
-                # attribution header is prepended ahead of it. See
-                # server/index.py module docstring / task notes for the
-                # frontmatter-handling rationale.
+                # The attribution header goes AFTER any YAML frontmatter
+                # block, never ahead of it — see `apply_source_header` /
+                # `split_frontmatter` for why prepending breaks the
+                # frontmatter outright.
                 header = build_source_header(
                     document_name=file_path.name,
                     section=_infer_section(base_path, kind),
                     date=_file_date(file_path, mtime),
                 )
-                content = header + content
+                content = apply_source_header(content, header)
 
             docs.append(
                 Document(

@@ -186,3 +186,48 @@ class TestCreateLightragRerankGating:
         assert asyncio.iscoroutinefunction(rag.rerank_model_func)
         load_mock.assert_not_called()
         assert rag.min_rerank_score == pytest.approx(0.0)
+
+
+class TestRerankDoesNotBlockEventLoop:
+    """Cross-encoder inference is a blocking CPU call; `rerank()` must keep it
+    in a worker thread so concurrent coroutines stay schedulable.
+    """
+
+    _BLOCKING_SECONDS = 0.3
+    _TICK_SECONDS = 0.01
+
+    def test_concurrent_coroutine_keeps_ticking_during_inference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as _time
+
+        class _SlowCrossEncoder:
+            def predict(self, pairs, **kwargs):  # type: ignore[no-untyped-def]
+                _time.sleep(TestRerankDoesNotBlockEventLoop._BLOCKING_SECONDS)
+                return [float(len(pairs) - i) for i in range(len(pairs))]
+
+        monkeypatch.setattr(
+            "hars_memory.server.reranker._load_model",
+            lambda *args, **kwargs: _SlowCrossEncoder(),
+        )
+        rerank = make_rerank_func(model_name="fake", device="cpu")
+
+        async def scenario() -> tuple[int, list[dict]]:
+            ticks = 0
+            done = False
+
+            async def ticker() -> None:
+                nonlocal ticks
+                while not done:
+                    await asyncio.sleep(TestRerankDoesNotBlockEventLoop._TICK_SECONDS)
+                    ticks += 1
+
+            ticker_task = asyncio.create_task(ticker())
+            results = await rerank("q", ["doc a", "doc b"])
+            done = True
+            await ticker_task
+            return ticks, results
+
+        ticks, results = asyncio.run(scenario())
+        assert [r["index"] for r in results] == [0, 1]
+        assert ticks >= 10, f"event loop appeared blocked: only {ticks} ticks"

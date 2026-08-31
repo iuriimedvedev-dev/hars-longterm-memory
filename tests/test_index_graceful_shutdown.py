@@ -25,10 +25,13 @@ import pytest
 class FakeDoc:
     """Minimal stand-in for a document produced by the walker."""
 
-    def __init__(self, doc_id: str) -> None:
+    def __init__(self, doc_id: str, relative_path: str | None = None) -> None:
         self.doc_id = doc_id
         self.content = f"content of {doc_id}"
         self.source_path = f"/fake/{doc_id}.md"
+        # _insert_all_batches reads metadata["relative_path"] to build the
+        # unique per-document file key handed to LightRAG.
+        self.metadata = {"relative_path": relative_path or f"{doc_id}.md"}
 
 
 def _make_rag(ainsert_side_effect: Any = None) -> MagicMock:

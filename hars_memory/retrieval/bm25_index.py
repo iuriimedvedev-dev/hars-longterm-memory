@@ -31,8 +31,12 @@ file.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 CHUNKS_FILENAME = "kv_store_text_chunks.json"
 _CACHE_META_FILENAME = "bm25_cache_meta.json"
+_LOAD_RETRY_ATTEMPTS = 3
+_LOAD_RETRY_SLEEP_SECONDS = 0.05
 
 
 class BM25IndexUnavailableError(RuntimeError):
@@ -141,6 +147,16 @@ class BM25SparseIndex:
             )
         return hits
 
+    async def asearch(self, query: str, top_k: int) -> list[BM25SearchHit]:
+        """Async wrapper over `search()`, offloaded to a worker thread.
+
+        `retriever.retrieve()` is a synchronous numpy scan over the whole
+        term-document matrix (tens of ms at this corpus size, more as it
+        grows) — running it inline in a coroutine blocks the event loop and
+        starves concurrent queries. Async callers must use this wrapper.
+        """
+        return await asyncio.to_thread(self.search, query, top_k)
+
 
 def _chunks_file_path(working_dir: str) -> Path:
     return Path(working_dir) / CHUNKS_FILENAME
@@ -228,16 +244,41 @@ def save_index(index: BM25SparseIndex, cache_dir: str) -> None:
     `corpus.jsonl` — we already keep `chunk_meta` (content + file_path) in the
     sidecar, so persisting the chunk text a second time would double the
     on-disk footprint for no benefit.
+
+    Published atomically: bm25s writes several files (the CSC matrix parts,
+    `params.index.json`, ...) plus this module's sidecar, one after another.
+    Written straight into `cache_dir`, a concurrent reader (another MCP server
+    process calling `load_index`) can observe a half-written directory — a
+    fresh sidecar next to a stale/truncated matrix — and either crash or
+    silently mis-rank. So the whole set is staged in a sibling temp directory
+    and published with a single `os.replace` of the directory, which is atomic
+    on POSIX. The sidecar is written last *inside* the staging directory, so a
+    published `cache_dir` is never missing it.
     """
     out_dir = _require_absolute_cache_dir(cache_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index.retriever.save(str(out_dir), corpus=None, show_progress=False)
-    meta = {
-        "chunk_ids": index.chunk_ids,
-        "chunk_meta": index.chunk_meta,
-        "source_mtime": index.source_mtime,
-    }
-    _meta_path(out_dir).write_text(json.dumps(meta), encoding="utf-8")
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_parent = tempfile.mkdtemp(prefix=f".{out_dir.name}.tmp-", dir=str(out_dir.parent))
+    staging_dir = Path(staging_parent) / out_dir.name
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        index.retriever.save(str(staging_dir), corpus=None, show_progress=False)
+        meta = {
+            "chunk_ids": index.chunk_ids,
+            "chunk_meta": index.chunk_meta,
+            "source_mtime": index.source_mtime,
+        }
+        _meta_path(staging_dir).write_text(json.dumps(meta), encoding="utf-8")
+
+        if out_dir.exists():
+            # os.replace() onto an existing directory fails (non-empty
+            # destination), so swap the old one aside first, publish, then
+            # drop it — keeping the window in which `cache_dir` does not
+            # exist as short as two rename() syscalls.
+            retired_dir = Path(staging_parent) / f"{out_dir.name}.retired"
+            os.replace(str(out_dir), str(retired_dir))
+        os.replace(str(staging_dir), str(out_dir))
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
 
 
 def load_index(cache_dir: str) -> BM25SparseIndex | None:
@@ -247,9 +288,28 @@ def load_index(cache_dir: str) -> BM25SparseIndex | None:
     yet" is the expected first-run state, not an error — `get_or_build_index`
     is the caller that decides what to do about it (build).
     """
+    out_dir = _require_absolute_cache_dir(cache_dir)
+    # `save_index` publishes by renaming directories, so `cache_dir` is
+    # briefly absent (two rename() syscalls) even though each published
+    # state is complete. A reader that opened the sidecar just before the
+    # swap would otherwise hit FileNotFoundError on the matrix files; retry
+    # a couple of times so a concurrent publish degrades to a few ms of
+    # latency rather than an error.
+    last_error: OSError | None = None
+    for attempt in range(_LOAD_RETRY_ATTEMPTS):
+        try:
+            return _load_index_once(out_dir)
+        except FileNotFoundError as exc:
+            last_error = exc
+            if attempt + 1 < _LOAD_RETRY_ATTEMPTS:
+                time.sleep(_LOAD_RETRY_SLEEP_SECONDS)
+    logger.warning("BM25 cache at %s unreadable after retries: %s", out_dir, last_error)
+    return None
+
+
+def _load_index_once(out_dir: Path) -> BM25SparseIndex | None:
     import bm25s
 
-    out_dir = _require_absolute_cache_dir(cache_dir)
     meta_file = _meta_path(out_dir)
     if not meta_file.is_file():
         return None
@@ -263,6 +323,35 @@ def load_index(cache_dir: str) -> BM25SparseIndex | None:
         chunk_meta=dict(meta["chunk_meta"]),
         source_mtime=float(meta["source_mtime"]),
     )
+
+
+def invalidate_cache(cache_dir: str) -> bool:
+    """Drop the persisted BM25 cache at `cache_dir`. True iff something was removed.
+
+    `get_or_build_index` already rebuilds when the source chunk store's mtime
+    moves, which covers the normal insert path. This exists for the ONE case
+    that mtime alone does not make obvious: document garbage collection
+    (`server/index.py` deleting doc_ids whose files are gone). There the chunk
+    store shrinks, and a cache still holding the removed chunks would keep
+    serving deleted content as sparse hits until the next mtime-visible write.
+    Removing the directory outright is the fail-safe move: the worst case is
+    one extra rebuild.
+
+    Removal is itself atomic-ish: the directory is renamed aside first, so a
+    concurrent reader never walks a partially deleted cache.
+    """
+    out_dir = _require_absolute_cache_dir(cache_dir)
+    if not out_dir.exists():
+        return False
+    retired = out_dir.with_name(f".{out_dir.name}.invalidated-{os.getpid()}")
+    try:
+        os.replace(str(out_dir), str(retired))
+    except OSError as exc:
+        logger.warning("Could not invalidate BM25 cache %s: %s", out_dir, exc)
+        return False
+    shutil.rmtree(retired, ignore_errors=True)
+    logger.info("Invalidated BM25 cache at %s", out_dir)
+    return True
 
 
 def get_or_build_index(working_dir: str, cache_dir: str) -> tuple[BM25SparseIndex, BM25BuildStats]:
@@ -310,6 +399,7 @@ __all__ = [
     "BM25BuildStats",
     "BM25SparseIndex",
     "build_index",
+    "invalidate_cache",
     "save_index",
     "load_index",
     "get_or_build_index",

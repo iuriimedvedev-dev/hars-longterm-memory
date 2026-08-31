@@ -27,11 +27,52 @@ def resolve_working_dir(working_dir: str | None = None) -> str:
     return working_dir or os.environ.get("HARS_MEMORY_INDEX_DIR", DEFAULT_WORKING_DIR)
 
 
-class _ByteTokenizer:
-    """Small offline tokenizer compatible with LightRAG's Tokenizer wrapper.
+#: Encoding used by the token-based tokenizer.  cl100k_base is the BPE used by
+#: GPT-3.5/4 and is a good proxy for any modern SentencePiece/BPE model: chunk
+#: sizes expressed in "tokens" then really mean tokens (~4 chars for English
+#: prose), not bytes.
+TIKTOKEN_ENCODING: Final[str] = "cl100k_base"
 
-    It counts UTF-8 bytes instead of model tokens. That is conservative enough
-    for local smoke/indexing and avoids tiktoken's runtime asset download.
+#: Average bytes per token for English prose.  Used to rescale a token budget
+#: into a byte budget when the byte fallback tokenizer is in play, so chunk
+#: sizes stay comparable in real text length regardless of which tokenizer
+#: is active.
+BYTE_FALLBACK_TOKEN_RATIO: Final[int] = 4
+
+
+class _TiktokenTokenizer:
+    """Token-based tokenizer compatible with LightRAG's Tokenizer wrapper.
+
+    Counts real model tokens via ``tiktoken`` (``cl100k_base``), so LightRAG's
+    ``chunk_token_size`` means tokens and chunk boundaries never split a
+    multi-byte UTF-8 character (tiktoken tokens are whole byte sequences and
+    ``decode`` is byte-exact for any token slice of an encoded string).
+    """
+
+    def __init__(self, encoding_name: str = TIKTOKEN_ENCODING) -> None:
+        import tiktoken  # local import: keeps module import cheap / optional
+
+        self._encoding_name = encoding_name
+        self._encoding = tiktoken.get_encoding(encoding_name)
+
+    @property
+    def name(self) -> str:
+        return self._encoding_name
+
+    def encode(self, content: str) -> list[int]:
+        return self._encoding.encode(content or "", disallowed_special=())
+
+    def decode(self, tokens: list[int]) -> str:
+        return self._encoding.decode(list(tokens))
+
+
+class _ByteTokenizer:
+    """Offline fallback tokenizer compatible with LightRAG's Tokenizer wrapper.
+
+    It counts UTF-8 bytes instead of model tokens. Only used when ``tiktoken``
+    is unavailable (e.g. an air-gapped host without its cached BPE assets);
+    callers MUST rescale token budgets by ``BYTE_FALLBACK_TOKEN_RATIO`` so the
+    resulting chunks cover a comparable amount of text.
     """
 
     def encode(self, content: str) -> list[int]:
@@ -42,6 +83,41 @@ class _ByteTokenizer:
             "utf-8",
             errors="ignore",
         )
+
+
+def resolve_tokenizer(
+    chunk_token_size: int,
+    chunk_overlap_tokens: int,
+) -> tuple[str, object, int, int]:
+    """Pick the tokenizer and rescale the chunk budgets to its unit.
+
+    Returns ``(name, tokenizer_impl, chunk_size, chunk_overlap)`` where the two
+    sizes are expressed in the returned tokenizer's own unit:
+
+      * ``tiktoken`` available -> real model tokens, budgets pass through
+        unchanged (``chunk_token_size`` finally means tokens).
+      * fallback -> UTF-8 bytes, budgets multiplied by
+        ``BYTE_FALLBACK_TOKEN_RATIO`` so a "512 token" chunk is not silently
+        reduced to ~128 tokens' worth of text.
+    """
+    try:
+        tokenizer = _TiktokenTokenizer()
+    except Exception as exc:  # ImportError, or missing/unreachable BPE assets
+        logger.warning(
+            "tiktoken unavailable (%s) — falling back to the UTF-8 byte "
+            "tokenizer with budgets scaled x%d (chunk=%d bytes, overlap=%d bytes)",
+            exc,
+            BYTE_FALLBACK_TOKEN_RATIO,
+            chunk_token_size * BYTE_FALLBACK_TOKEN_RATIO,
+            chunk_overlap_tokens * BYTE_FALLBACK_TOKEN_RATIO,
+        )
+        return (
+            "utf8-byte",
+            _ByteTokenizer(),
+            chunk_token_size * BYTE_FALLBACK_TOKEN_RATIO,
+            chunk_overlap_tokens * BYTE_FALLBACK_TOKEN_RATIO,
+        )
+    return tokenizer.name, tokenizer, chunk_token_size, chunk_overlap_tokens
 
 
 #: Response status codes worth retrying: 429 (rate limit / server-side
@@ -459,9 +535,21 @@ def create_lightrag(
         os.environ.get("HARS_MEMORY_MIN_RERANK_SCORE", os.environ.get("MIN_RERANK_SCORE", "0.0"))
     )
 
+    # Tokenizer decides the UNIT of every "token" budget below.  With tiktoken
+    # present these are real model tokens; the byte fallback rescales them so
+    # chunks still cover a comparable amount of text.
+    # Keep the nominal (model-token) chunk size for the embedder budget below:
+    # embedding models count their own tokens, not this tokenizer's unit.
+    _nominal_chunk_token_size = _chunk_token_size
+    _tokenizer_name, _tokenizer_impl, _chunk_token_size, _chunk_overlap_tokens = (
+        resolve_tokenizer(_chunk_token_size, _chunk_overlap_tokens)
+    )
+
     logger.info(
-        "LightRAG chunking: chunk_token_size=%d, chunk_overlap_token_size=%d, "
-        "max_extract_input_tokens=%d, extractor_max_output_tokens=%d",
+        "LightRAG chunking: tokenizer=%s, chunk_token_size=%d, "
+        "chunk_overlap_token_size=%d, max_extract_input_tokens=%d, "
+        "extractor_max_output_tokens=%d",
+        _tokenizer_name,
         _chunk_token_size,
         _chunk_overlap_tokens,
         _llm_max_extract_tokens,
@@ -472,7 +560,7 @@ def create_lightrag(
         working_dir=_wdir,
         vector_storage=_vector_storage,
         graph_storage=_graph_storage,
-        tokenizer=Tokenizer("utf8-byte", _ByteTokenizer()),
+        tokenizer=Tokenizer(_tokenizer_name, _tokenizer_impl),
         llm_model_func=make_llm_func(
             base_url=_ext_url,
             model=_ext_model,
@@ -487,7 +575,9 @@ def create_lightrag(
             # Match the chunk size so LightRAG does not re-split chunks before
             # embedding.  Override explicitly with HARS_MEMORY_EMBED_MAX_TOKENS if
             # your model has a stricter limit than HARS_MEMORY_CHUNK_TOKEN_SIZE.
-            max_token_size=int(os.environ.get("HARS_MEMORY_EMBED_MAX_TOKENS", str(_chunk_token_size))),
+            max_token_size=int(
+                os.environ.get("HARS_MEMORY_EMBED_MAX_TOKENS", str(_nominal_chunk_token_size))
+            ),
             func=embed_func,
             # Lets LightRAG forward context="document" (insert) / context="query"
             # (search) into embed_func — see embedder.py's HARS_MEMORY_EMBED_QUERY_PROMPT_NAME.
@@ -535,6 +625,9 @@ def create_query_model_func() -> object:
 
 
 __all__ = [
+    "BYTE_FALLBACK_TOKEN_RATIO",
+    "TIKTOKEN_ENCODING",
+    "resolve_tokenizer",
     "create_lightrag",
     "create_query_model_func",
     "make_llm_func",

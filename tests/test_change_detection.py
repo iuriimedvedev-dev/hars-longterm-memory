@@ -206,17 +206,24 @@ class TestApplyRefreshChangedDefaultSafety:
         rag = _make_rag()
         docs = [_doc("file:x", "new content")]
 
-        async def run() -> None:
-            await _apply_refresh_changed(
+        async def run() -> FingerprintStore | None:
+            return await _apply_refresh_changed(
                 rag,
                 docs,
                 refresh_changed=True,
                 fingerprint_store_path=store_path,
             )
 
-        asyncio.run(run())
+        store = asyncio.run(run())
 
         rag.adelete_by_doc_id.assert_awaited_once_with("file:x")
+        # The helper itself must NOT persist: the caller saves only after a
+        # successful insert, otherwise an interrupted run would skip the doc.
+        assert json.loads(store_path.read_text()) == {
+            "file:x": compute_fingerprint("old content")
+        }
+        assert store is not None
+        store.save()
         persisted = json.loads(store_path.read_text())
         assert persisted["file:x"] == compute_fingerprint("new content")
 
@@ -229,18 +236,22 @@ class TestApplyRefreshChangedDefaultSafety:
         rag = _make_rag()
         docs = [_doc("file:brand_new", "content")]
 
-        async def run() -> None:
-            await _apply_refresh_changed(
+        async def run() -> FingerprintStore | None:
+            return await _apply_refresh_changed(
                 rag,
                 docs,
                 refresh_changed=True,
                 fingerprint_store_path=store_path,
             )
 
-        asyncio.run(run())
+        store = asyncio.run(run())
 
         rag.adelete_by_doc_id.assert_not_awaited()
+        # Nothing on disk yet — the caller persists after a successful insert.
+        assert not store_path.exists()
+        assert store is not None
         # Fingerprint IS recorded going forward even though nothing deleted.
+        store.save()
         persisted = json.loads(store_path.read_text())
         assert persisted["file:brand_new"] == compute_fingerprint("content")
 

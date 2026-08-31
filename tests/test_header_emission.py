@@ -92,19 +92,48 @@ class TestWalkerHeaderEmission:
 
         assert HEADER_RE.search(docs[0].content) is None
 
-    def test_frontmatter_is_passed_through_after_header(self, tmp_path: Path) -> None:
-        """Frontmatter-bearing files (as in the Claude memory dir) get the
-        header prepended AHEAD of the frontmatter, unmodified."""
+    def test_header_is_inserted_after_frontmatter_block(self, tmp_path: Path) -> None:
+        """Frontmatter-bearing files (as in the Claude memory dir) keep the
+        frontmatter block FIRST — the header goes after its closing fence.
+
+        Prepending the header ahead of the opening ``---`` stopped the block
+        from being frontmatter at all (see
+        ``ingest/walker.py::split_frontmatter``).
+        """
         root = tmp_path / "memory"
         root.mkdir()
-        original = "---\nname: Some Note\ndescription: test\n---\nBody\n"
-        (root / "note.md").write_text(original)
+        frontmatter = "---\nname: Some Note\ndescription: test\n---\n"
+        (root / "note.md").write_text(frontmatter + "Body\n")
 
         docs, _ = walk([root], dry_run=False)
 
         content = docs[0].content
+        # The document still OPENS with an intact, parseable frontmatter block.
+        assert content.startswith(frontmatter)
         m = HEADER_RE.search(content[:400])
         assert m is not None
         assert m.group("section").strip() == "memory"
-        # Frontmatter survives, unmodified, right after the header.
-        assert content.endswith(original)
+        # ... and the header sits after the closing fence, ahead of the body.
+        assert content.index(m.group(0)) > content.index("---\nname:")
+        assert content.endswith("Body\n")
+
+    def test_body_only_file_still_gets_header_first(self, tmp_path: Path) -> None:
+        root = tmp_path / "memory"
+        root.mkdir()
+        (root / "note.md").write_text("Body only\n")
+
+        docs, _ = walk([root], dry_run=False)
+
+        assert docs[0].content.startswith("[Document: note.md")
+
+    def test_unterminated_frontmatter_fence_falls_back_to_prepend(
+        self, tmp_path: Path
+    ) -> None:
+        """A lone opening ``---`` with no closing fence is not frontmatter."""
+        root = tmp_path / "memory"
+        root.mkdir()
+        (root / "note.md").write_text("---\nnot really frontmatter\n")
+
+        docs, _ = walk([root], dry_run=False)
+
+        assert docs[0].content.startswith("[Document: note.md")
