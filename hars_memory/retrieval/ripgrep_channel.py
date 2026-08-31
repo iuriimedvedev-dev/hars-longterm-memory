@@ -167,6 +167,7 @@ Latency (measured, see `test_ripgrep_channel.py` and the verification
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -396,19 +397,7 @@ def extract_terms(question: str, ll_keywords: list[str] | None = None) -> list[s
             seen.add(key)
             terms.append(keyword)
 
-    # Prefer terms carrying stronger identifier signal when the query exceeds
-    # the rg budget, while retaining first-seen order for equal specificity.
-    ranked = sorted(
-        enumerate(terms),
-        key=lambda item: (
-            -(int(any(char.isdigit() for char in item[1])) * 2
-              + int(any(char in "_-:./" for char in item[1]))
-              + min(len(item[1]), 32) / 32),
-            item[0],
-        ),
-    )
-    selected_indexes = {index for index, _term in ranked[:MAX_QUERY_TERMS]}
-    return [term for index, term in enumerate(terms) if index in selected_indexes]
+    return terms[:MAX_QUERY_TERMS]
 
 
 def _load_ignore_patterns(root: Path) -> list[str]:
@@ -794,6 +783,35 @@ def search(
     )
 
 
+async def asearch(
+    question: str,
+    *,
+    ll_keywords: list[str] | None = None,
+    roots: list[Path],
+    top_k: int = _DEFAULT_TOP_K,
+    max_count_per_file: int = _DEFAULT_MAX_COUNT_PER_FILE,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> RipgrepSearchResult:
+    """Async wrapper over `search()`, offloaded to a worker thread.
+
+    `search()` is entirely blocking — a synchronous `subprocess.run(rg, ...)`
+    (up to `timeout_seconds`, default 2s) plus per-match JSON parsing and a
+    `stat()` per matched file. Called directly from a coroutine it stalls the
+    whole event loop for that duration, which starves every other in-flight
+    `memory_recall` (and the MCP transport's own I/O). Every async caller must
+    use this wrapper instead of calling `search()` inline.
+    """
+    return await asyncio.to_thread(
+        search,
+        question,
+        ll_keywords=ll_keywords,
+        roots=roots,
+        top_k=top_k,
+        max_count_per_file=max_count_per_file,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 __all__ = [
     "RG_BINARY_NAME",
     "HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV",
@@ -813,4 +831,5 @@ __all__ = [
     "extract_terms",
     "default_roots",
     "search",
+    "asearch",
 ]

@@ -101,6 +101,18 @@ _HEADER_DATE_RE = re.compile(
 # YAML frontmatter `name:` field, e.g. "name: DEPRECATED — hi-res hypothesis...".
 _NAME_FIELD_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
 
+# YAML frontmatter `date:`/`updated:` field, e.g. "date: 2026-07-30". A
+# frontmatter date is an EXPLICIT authored statement about the document's
+# recency, so it is a legitimate second source for the same signal the
+# `[Document: ... | Date: ...]` header carries — and the only one available on
+# a chunk whose header the ingest pipeline placed after a long frontmatter
+# block. Quotes are optional in YAML and routinely present, so both forms are
+# accepted.
+_FRONTMATTER_DATE_RE = re.compile(
+    r"^(?:date|updated|last_updated):\s*['\"]?(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})",
+    re.MULTILINE,
+)
+
 # The marker must be the LEADING token of the name field (optionally after a
 # dash), not merely present anywhere in it — see module docstring for why
 # "b1-sidecar-family-falsified" (marker mid-slug, describing the topic) must
@@ -124,6 +136,16 @@ _SELF_DECLARED_RE = re.compile(
 # map was fundamentally wrong" about a DIFFERENT, already-corrected artifact,
 # which must never be read as this chunk deprecating itself.
 _SCAN_ZONE_CHARS = 1500
+
+# How far into a chunk `extract_chunk_date` looks for a date. Was 200 chars,
+# which silently lost the date on every document whose `[Document: ...]`
+# header sits behind a YAML frontmatter block (the walker now places it
+# there deliberately — see ingest/walker.py::apply_source_header) or behind
+# a long title/lead paragraph: the header was present but simply out of
+# range, so the chunk read as "date unknown" and the recency signal never
+# fired. 2000 chars comfortably clears a real frontmatter block while still
+# being a bounded prefix scan, never the whole chunk body.
+_DATE_SCAN_ZONE_CHARS = 2000
 
 # Keep 30% of the original score for a self-declared-stale chunk rather than
 # zeroing it out: a chunk can still legitimately be the best (or only) match
@@ -185,15 +207,29 @@ def extract_chunk_date(content: str) -> date | None:
     a dated document carries no date signal of its own here, and this module
     does not thread `full_doc_id` lookups to backfill it — see the module
     docstring's "not attempted" note.
+
+    Two sources, in priority order: the `[Document: ... | Date: ...]`
+    attribution header, then a YAML frontmatter `date:`/`updated:` field.
+    Both are searched within the first `_DATE_SCAN_ZONE_CHARS` characters.
     """
     if not content:
         return None
-    match = _HEADER_DATE_RE.search(content[:200])
-    if not match:
+    zone = content[:_DATE_SCAN_ZONE_CHARS]
+    match = _HEADER_DATE_RE.search(zone)
+    if match is not None:
+        raw = match.group("date")
+        # An explicit `Date: unknown` is the document stating it has no date;
+        # honour that verdict instead of falling through to frontmatter.
+        if raw == "unknown":
+            return None
+        return _parse_iso_date(raw)
+    frontmatter_match = _FRONTMATTER_DATE_RE.search(zone)
+    if frontmatter_match is None:
         return None
-    raw = match.group("date")
-    if raw == "unknown":
-        return None
+    return _parse_iso_date(frontmatter_match.group("date"))
+
+
+def _parse_iso_date(raw: str) -> date | None:
     try:
         year, month, day = (int(part) for part in raw.split("-"))
         return date(year, month, day)

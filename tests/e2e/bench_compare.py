@@ -51,6 +51,11 @@ except ImportError:
         ("How to make pizza dough?", [], "out-of-domain-cooking"),
     ]
 
+try:
+    from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100 as HARD_QUERIES
+except ImportError:
+    HARD_QUERIES = DEFAULT_QUERIES
+
 QUERIES = DEFAULT_QUERIES
 
 
@@ -177,13 +182,13 @@ async def _run_hars(session: ClientSession, query: str, expected_keywords: list[
         fused = hybrid.get("fused_chunks", [])
         files = []
         scores = []
-        all_content = ""
+        all_content = (result.get("context") or "") + " "
         for c in fused:
             fp = c.get("file_path", "")
             if fp:
                 files.append(fp)
             scores.append(c.get("fused_score", 0.0))
-            all_content += c.get("snippet", "") + " "
+            all_content += (c.get("content") or c.get("snippet", "")) + " "
 
         unique_files = len(set(files))
 
@@ -221,23 +226,24 @@ async def _run_hars(session: ClientSession, query: str, expected_keywords: list[
 
 def _get_category(domain: str) -> str:
     """Map domain tag to higher-level category."""
-    if domain.startswith("aws-"):
+    d = domain.lower()
+    if d.startswith("aws") or "aws" in d:
         return "AWS"
-    if domain.startswith("gcp-"):
-        return "GCP"
-    if domain.startswith("k8s-"):
+    if d.startswith("gcp") or "gcp" in d or "azure" in d or "gke" in d:
+        return "GCP & Azure"
+    if any(k in d for k in ["k8s", "kubernetes", "controller", "karpenter", "kueue", "dump", "node", "kubectl"]):
         return "Kubernetes & Controllers"
-    if domain.startswith("mon-"):
+    if any(k in d for k in ["mon", "loki", "prometheus", "grafana", "mimir", "tempo", "alert", "observab"]):
         return "Monitoring & Observability"
-    if domain.startswith("srv-"):
+    if any(k in d for k in ["srv", "harbor", "youtrack", "vault", "datamanager", "icri", "langfuse", "tenants"]):
         return "Internal Services & Platforms"
-    if domain.startswith("tool-"):
+    if any(k in d for k in ["tool", "terraform", "github", "artifactory", "dns", "skaffold"]):
         return "Tools & Workflows"
-    if domain.startswith("exact-"):
+    if d.startswith("exact"):
         return "Exact Lookups"
-    if domain.startswith("ood-") or domain.startswith("out-of-domain"):
+    if d.startswith("ood") or "out-of-domain" in d:
         return "Out-of-Domain"
-    return "Other"
+    return "Kubernetes & Controllers"
 
 
 def _print_summary(all_results: list[QueryResult]) -> None:
@@ -295,7 +301,7 @@ def _print_summary(all_results: list[QueryResult]) -> None:
     # Category breakdown table
     categories = [
         "AWS",
-        "GCP",
+        "GCP & Azure",
         "Kubernetes & Controllers",
         "Monitoring & Observability",
         "Internal Services & Platforms",
@@ -361,7 +367,7 @@ async def main() -> None:
     model = os.environ.get("HARS_MEMORY_QUERY_MODEL", "unknown")
     output_path = Path(sys.argv[sys.argv.index("--output") + 1]) if "--output" in sys.argv else Path("/tmp/hars_vs_jbcontext_benchmark.json")
 
-    # Parse query limit
+    # Parse query limit and dataset
     query_limit = 999
     if "--queries" in sys.argv:
         try:
@@ -370,7 +376,8 @@ async def main() -> None:
         except (ValueError, IndexError):
             pass
 
-    active_queries = QUERIES[:query_limit]
+    selected_queries = HARD_QUERIES if "--hard" in sys.argv else QUERIES
+    active_queries = selected_queries[:query_limit]
 
     # Create temp dirs
     import tempfile as tf
@@ -388,6 +395,8 @@ async def main() -> None:
         "HARS_MEMORY_GRAPH_STORAGE": "NetworkXStorage",
         "HARS_MEMORY_EMBED_LOCAL_FILES_ONLY": "1",
         "HARS_MEMORY_RIPGREP_ROOTS": str(KB_ROOT),
+        "HARS_MEMORY_RERANK_MODEL": os.environ.get("HARS_MEMORY_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        "HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER": os.environ.get("HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER", "2.0"),
     })
     mcp_env.pop("HARS_MEMORY_GPU_GUARD_SCRIPT_PATH", None)
 
