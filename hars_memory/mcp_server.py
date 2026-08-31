@@ -347,6 +347,14 @@ MAX_CHUNKS_PER_SOURCE: int = 3
 # other available retrieval channels provide no corroborating evidence.
 NO_ANSWER_DENSE_SCORE_THRESHOLD = 0.28
 
+# Generic question words add noise to live-worktree searches; keep this list
+# local because ripgrep is an additive, MCP-specific retrieval channel.
+RIPGREP_STOPWORDS = frozenset({
+    "what", "how", "when", "where", "which", "does", "procedure", "team",
+    "describe", "explain", "show", "list", "about", "standard", "used", "from",
+    "with", "for",
+})
+
 # memory_recall `context_priority` values — see _merge_context_with_fusion.
 #
 # Default flipped to CONTEXT_PRIORITY_MERGED on 2026-07-30. Measured on the
@@ -841,6 +849,29 @@ def _select_diverse_fused_chunks(
     return selected[:limit]
 
 
+def _ripgrep_term_is_specific(term: str) -> bool:
+    """Return whether a ripgrep term matches a high-specificity shape."""
+    has_upper = any(char.isupper() for char in term)
+    has_lower = any(char.islower() for char in term)
+    return (
+        (has_upper and has_lower)
+        or "_" in term
+        or any(char.isdigit() for char in term)
+        or "/" in term
+        or "." in term
+        or (term.isupper() and len(term) >= 2)
+        or len(term) > 4
+    )
+
+
+def _ripgrep_keywords(ll_keywords: list[str] | None) -> list[str]:
+    """Filter and specificity-order caller-supplied ripgrep terms."""
+    terms = [term.strip() for term in (ll_keywords or []) if term.strip()]
+    terms = [term for term in terms if term.casefold() not in RIPGREP_STOPWORDS]
+    # Python's sort is stable, so terms retain input order within each tier.
+    return sorted(terms, key=lambda term: not _ripgrep_term_is_specific(term))
+
+
 async def _compute_hybrid_block(
     rag: object,
     question: str,
@@ -951,7 +982,7 @@ async def _compute_hybrid_block(
             rg_result = await asyncio.to_thread(
                 ripgrep_channel.search,
                 question,
-                ll_keywords=ll_keywords,
+                ll_keywords=_ripgrep_keywords(ll_keywords),
                 roots=rg_roots,
                 top_k=pool_size,
             )
