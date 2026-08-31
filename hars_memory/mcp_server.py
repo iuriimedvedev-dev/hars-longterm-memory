@@ -340,23 +340,12 @@ ENTITY_DESCRIPTION_MAX_CHARS = 400
 # 30000-byte max_total_tokens ceiling. Measured 2026-07-29.
 DEFAULT_MAX_ENTITY_CONTEXT_BYTES = 500
 DEFAULT_MAX_RELATION_CONTEXT_BYTES = 4500
+MAX_FUSED_CHUNKS_PER_SOURCE = 3
 
-# No-answer confidence-marker threshold — measured via a raw (pre-fusion,
-# pre-min-max-normalization) dense cosine-similarity score distribution over
-# the same 46-query retrieval_queries.yaml set: the 36 answerable queries'
-# best-of-candidate-pool dense score ranges 0.44-0.72 (median 0.60); the 10
-# verified-absent no_answer queries range 0.23-0.53 (median 0.48). The two
-# distributions OVERLAP — 5/10 no_answer queries are "the real document
-# exists on disk but postdates this index snapshot" and score topically
-# similar to genuine answers — so there is NO threshold that perfectly
-# separates them. This is why the threshold below drives a MARKER
-# (`hybrid.confidence`, surfaced to the calling agent) and never a silent
-# filter/withhold. At threshold=0.50: 8/10 (80%) no_answer queries score
-# below it (correctly flagged low_confidence) at a cost of flagging 4/36
-# (11%) genuinely answerable queries too — an acceptable false-positive
-# rate for a marker, since a flagged result is still returned in full, not
-# hidden. Measured 2026-07-29.
-NO_ANSWER_DENSE_SCORE_THRESHOLD = 0.50
+# Low-confidence marker threshold on the raw (pre-fusion,
+# pre-min-max-normalization) dense score. A low score is only marked when the
+# other available retrieval channels provide no corroborating evidence.
+NO_ANSWER_DENSE_SCORE_THRESHOLD = 0.28
 
 # memory_recall `context_priority` values — see _merge_context_with_fusion.
 #
@@ -828,6 +817,29 @@ async def _get_flat_dense_index(rag: object) -> tuple[Any, str]:
         return _flat_dense_cache, cache_status
 
 
+def _select_diverse_fused_chunks(
+    fused: list[Any], limit: int, *, max_per_source: int = MAX_FUSED_CHUNKS_PER_SOURCE
+) -> list[Any]:
+    """Select the highest-scoring chunks while bounding per-file repetition."""
+    if limit <= 0:
+        return []
+    ranked = sorted(fused, key=lambda chunk: (-chunk.fused_score, chunk.chunk_id))
+    selected: list[Any] = []
+    deferred: list[Any] = []
+    source_counts: dict[str, int] = {}
+    for chunk in ranked:
+        source = chunk.file_path
+        if source_counts.get(source, 0) < max_per_source:
+            selected.append(chunk)
+            source_counts[source] = source_counts.get(source, 0) + 1
+        else:
+            deferred.append(chunk)
+    if len(selected) < limit:
+        selected.extend(deferred[: limit - len(selected)])
+    selected.sort(key=lambda chunk: (-chunk.fused_score, chunk.chunk_id))
+    return selected[:limit]
+
+
 async def _compute_hybrid_block(
     rag: object,
     question: str,
@@ -1026,24 +1038,9 @@ async def _compute_hybrid_block(
                 "latency_ms": round(flat_elapsed_ms, 2),
             }
 
-        # No-answer confidence marker (item 2) — uses the RAW dense score
-        # (pre-fusion, pre-min-max-normalization), not fused_chunks[].fused_score:
-        # fuse()'s per-query min-max normalization stretches the best candidate
-        # to ~1.0 for almost any query regardless of true relevance, which
-        # measurably destroys the no-answer signal (see
-        # NO_ANSWER_DENSE_SCORE_THRESHOLD's docstring above). No dense hits at
-        # all is treated as maximally low-confidence, not skipped.
-        if dense_hits:
-            top_dense_score = max(hit.score for hit in dense_hits.values())
-            low_confidence = top_dense_score < NO_ANSWER_DENSE_SCORE_THRESHOLD
-        else:
-            top_dense_score = None
-            low_confidence = True
-
         # Dedicated exact-identifier path: high-precision surfacing, not buried
         # in fusion weights. A BM25 hit only counts as an "identifier match"
-        # here if the identifier string is verbatim present in its content —
-        # sub-token matches (e.g. "a2" alone) are not enough for this list.
+        # here if the identifier string is verbatim present in its content.
         identifier_terms = extract_identifier_terms(question)
         identifier_matches: list[dict[str, Any]] = []
         if identifier_terms:
@@ -1059,6 +1056,30 @@ async def _compute_hybrid_block(
                     })
                 if len(identifier_matches) >= HYBRID_IDENTIFIER_LOOKUP_LIMIT:
                     break
+
+        # No-answer confidence marker (item 2) — uses the RAW dense score
+        # (pre-fusion, pre-min-max-normalization), not fused_chunks[].fused_score:
+        # fuse()'s per-query min-max normalization stretches the best candidate
+        # to ~1.0 for almost any query regardless of true relevance, which
+        # measurably destroys the no-answer signal (see
+        # NO_ANSWER_DENSE_SCORE_THRESHOLD's docstring above). No dense hits at
+        # all is treated as maximally low-confidence, not skipped.
+        strong_sparse_evidence = any(hit.score > 0.0 for hit in sparse_search_hits)
+        ripgrep_evidence = bool(ripgrep_report.get("available") and rg_result.hits) if ripgrep_channel_enabled() else False
+        if dense_hits:
+            top_dense_score = max(hit.score for hit in dense_hits.values())
+            low_confidence = (
+                top_dense_score < NO_ANSWER_DENSE_SCORE_THRESHOLD
+                and not strong_sparse_evidence
+                and not ripgrep_evidence
+            )
+        else:
+            top_dense_score = None
+            low_confidence = not strong_sparse_evidence and not ripgrep_evidence
+
+        # Apply diversity after both additive gates so the public result is the
+        # actual bounded, source-diverse fused selection.
+        fused = _select_diverse_fused_chunks(fused, top_k)
 
         return {
             "enabled": True,
@@ -1417,6 +1438,23 @@ def _postprocess_context(context: str) -> str:
     except Exception as exc:
         logger.debug("Context post-processing skipped (unexpected format): %s", exc)
         return context
+
+
+def _has_graph_entity_context(context: object) -> bool:
+    """Return whether LightRAG supplied at least one graph entity record."""
+    if not isinstance(context, str):
+        return False
+    block = _extract_fenced_block(context, _CONTEXT_ENTITY_SECTION_HEADER)
+    if block is None:
+        return False
+    for line in block[2].splitlines():
+        try:
+            entity = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(entity, dict) and entity.get("entity"):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2032,6 +2070,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     )
                     graph_channel_ms = (time.monotonic() - graph_start) * 1000
                     has_context = bool(context) and str(context).strip() not in ("", "[no-context]")
+                    if _has_graph_entity_context(context):
+                        hybrid_block["confidence"]["low_confidence"] = False
                     context_priority_applied = CONTEXT_PRIORITY_LIGHTRAG
                     if has_context and isinstance(context, str):
                         context_for_response = _postprocess_context(context)
@@ -2126,6 +2166,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     rag.llm_model_func = _orig_llm_func
                 graph_channel_ms = (time.monotonic() - graph_start) * 1000
                 citations = _extract_citations(result, top_k)
+                if _extract_entities_used(result, 1):
+                    hybrid_block["confidence"]["low_confidence"] = False
                 _emit_recall_event(
                     ok=result.get("status") != "failure",
                     results=[

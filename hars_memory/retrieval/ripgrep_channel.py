@@ -270,6 +270,13 @@ _DEFAULT_TOP_K: Final[int] = 10
 # takes priority over the keyword side-channel.
 MAX_QUERY_TERMS: Final[int] = 8
 
+# Natural-language scaffolding is not useful to a literal identifier search.
+RIPGREP_STOPWORDS: Final[frozenset[str]] = frozenset({
+    "a", "about", "an", "and", "are", "can", "did", "does", "for", "from",
+    "how", "in", "is", "me", "of", "on", "or", "tell", "the", "to", "what",
+    "when", "where", "which", "why", "with",
+})
+
 # --- scoring constants (see module docstring "Scoring" for the formula) -
 WHOLE_TOKEN_WEIGHT: Final[float] = 2.0
 SUBSTRING_WEIGHT: Final[float] = 1.0
@@ -376,23 +383,32 @@ def extract_terms(question: str, ll_keywords: list[str] | None = None) -> list[s
 
     for term in extract_identifier_terms(question):
         key = term.casefold()
-        if key not in seen:
+        if key not in RIPGREP_STOPWORDS and key not in seen:
             seen.add(key)
             terms.append(term)
 
     for raw_keyword in ll_keywords or ():
         keyword = raw_keyword.strip()
-        if not keyword or not looks_like_identifier(keyword):
+        if not keyword or keyword.casefold() in RIPGREP_STOPWORDS or not looks_like_identifier(keyword):
             continue
         key = keyword.casefold()
         if key not in seen:
             seen.add(key)
             terms.append(keyword)
 
-    # Bounded — see MAX_QUERY_TERMS's docstring above for why and how the
-    # value was chosen. Question-derived terms were appended first, so they
-    # always survive the truncation ahead of any keyword-side overflow.
-    return terms[:MAX_QUERY_TERMS]
+    # Prefer terms carrying stronger identifier signal when the query exceeds
+    # the rg budget, while retaining first-seen order for equal specificity.
+    ranked = sorted(
+        enumerate(terms),
+        key=lambda item: (
+            -(int(any(char.isdigit() for char in item[1])) * 2
+              + int(any(char in "_-:./" for char in item[1]))
+              + min(len(item[1]), 32) / 32),
+            item[0],
+        ),
+    )
+    selected_indexes = {index for index, _term in ranked[:MAX_QUERY_TERMS]}
+    return [term for index, term in enumerate(terms) if index in selected_indexes]
 
 
 def _load_ignore_patterns(root: Path) -> list[str]:
@@ -783,6 +799,7 @@ __all__ = [
     "HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV",
     "HARS_MEMORY_RIPGREP_ROOTS_ENV",
     "MAX_QUERY_TERMS",
+    "RIPGREP_STOPWORDS",
     "WHOLE_TOKEN_WEIGHT",
     "SUBSTRING_WEIGHT",
     "MAX_COUNTED_MATCHES_PER_TERM",
