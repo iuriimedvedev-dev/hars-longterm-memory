@@ -340,7 +340,7 @@ ENTITY_DESCRIPTION_MAX_CHARS = 400
 # 30000-byte max_total_tokens ceiling. Measured 2026-07-29.
 DEFAULT_MAX_ENTITY_CONTEXT_BYTES = 500
 DEFAULT_MAX_RELATION_CONTEXT_BYTES = 4500
-MAX_FUSED_CHUNKS_PER_SOURCE = 3
+MAX_CHUNKS_PER_SOURCE: int = 3
 
 # Low-confidence marker threshold on the raw (pre-fusion,
 # pre-min-max-normalization) dense score. A low score is only marked when the
@@ -818,7 +818,7 @@ async def _get_flat_dense_index(rag: object) -> tuple[Any, str]:
 
 
 def _select_diverse_fused_chunks(
-    fused: list[Any], limit: int, *, max_per_source: int = MAX_FUSED_CHUNKS_PER_SOURCE
+    fused: list[Any], limit: int, *, max_per_source: int = MAX_CHUNKS_PER_SOURCE
 ) -> list[Any]:
     """Select the highest-scoring chunks while bounding per-file repetition."""
     if limit <= 0:
@@ -829,12 +829,13 @@ def _select_diverse_fused_chunks(
     source_counts: dict[str, int] = {}
     for chunk in ranked:
         source = chunk.file_path
-        if source_counts.get(source, 0) < max_per_source:
+        if len(selected) < limit and source_counts.get(source, 0) < max_per_source:
             selected.append(chunk)
             source_counts[source] = source_counts.get(source, 0) + 1
         else:
             deferred.append(chunk)
     if len(selected) < limit:
+        # Backfill capped sources only after the greedy diverse pass.
         selected.extend(deferred[: limit - len(selected)])
     selected.sort(key=lambda chunk: (-chunk.fused_score, chunk.chunk_id))
     return selected[:limit]
