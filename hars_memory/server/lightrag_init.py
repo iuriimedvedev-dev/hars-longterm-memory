@@ -234,7 +234,7 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
         # model as named parameters (the pre-SDK code had no such named/extra
         # split because it built one flat httpx JSON payload dict instead).
         _JSON_PRIMITIVES = (str, int, float, bool, type(None))
-        _NAMED_PARAMS = {"max_tokens", "temperature"}
+        _NAMED_PARAMS = {"max_tokens", "temperature", "enable_cot"}
         forwarded = {k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)}
         call_max_tokens = forwarded.get("max_tokens", max_tokens)
         call_temperature = forwarded.get("temperature", temperature)
@@ -477,7 +477,9 @@ def create_lightrag(
             base_url=_ext_url,
             model=_ext_model,
             max_tokens=_ext_max_output_tokens,
-            temperature=0.1,
+            temperature=float(
+                os.environ.get("HARS_MEMORY_EXTRACTOR_TEMPERATURE", "0.1")
+            ),
         ),
         llm_model_name=_ext_model,
         embedding_func=EmbeddingFunc(
