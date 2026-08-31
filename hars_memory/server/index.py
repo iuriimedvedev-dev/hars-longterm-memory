@@ -215,15 +215,34 @@ async def _insert_all_batches(
 
     Designed to be run as a cancellable asyncio Task.  A CancelledError propagates
     naturally so the caller's finally block can still flush storages.
+
+    LightRAG deduplicates documents by the *basename* of the ``file_path``
+    (``normalize_document_file_path`` → ``Path(file_path).name``), so all
+    ``readme.md`` files from different KB subdirectories would be treated as a
+    single document.  We work around this by passing a unique file key that
+    encodes the relative directory path, e.g. ``services-litellm-readme.md``
+    instead of ``readme.md``.
     """
     total_batches = (len(all_docs) + batch_size - 1) // batch_size
     for i in range(0, len(all_docs), batch_size):
         batch = all_docs[i : i + batch_size]
         texts = [doc.content for doc in batch]
         ids = [doc.doc_id for doc in batch]
-        file_paths = [doc.source_path for doc in batch]
+        # Build a unique file key per document: use the relative path with
+        # path separators replaced by hyphens, so the basename is unique.
+        file_paths = []
+        for doc in batch:
+            rel = doc.metadata.get("relative_path", "") if doc.metadata else ""
+            if rel:
+                unique = rel.replace("/", "-")
+            else:
+                # Fallback: use the last 3 path components joined by hyphens
+                path = Path(doc.source_path)
+                parts = path.parts
+                unique = "-".join(parts[-3:]) if len(parts) >= 3 else path.name
+            file_paths.append(unique)
         await rag.ainsert(texts, ids=ids, file_paths=file_paths)  # type: ignore[attr-defined]
-        logger.info("Inserted batch %d/%d", i // batch_size + 1, total_batches)
+        logger.info("Inserted batch %d/%d (last file: %s)", i // batch_size + 1, total_batches, file_paths[-1])
 
 
 async def _run_indexing(args: argparse.Namespace) -> None:
@@ -274,6 +293,19 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # LightRAG insertion (requires GPU-free extractor LLM)
     # -----------------------------------------------------------------------
     from hars_memory.server.lightrag_init import create_lightrag, resolve_working_dir
+
+    # --full: wipe the working directory before starting, so every document
+    # is treated as new and fully reindexed.  LightRAG's ainsert() switches
+    # to "skip duplicate" mode once a doc_id exists in the KV store, so
+    # without the wipe, a second run with --full still skips everything.
+    if args.full:
+        import shutil
+
+        _wdir = Path(resolve_working_dir())
+        if _wdir.exists():
+            logger.info("--full: wiping working directory %s", _wdir)
+            shutil.rmtree(_wdir)
+            logger.info("--full: working directory cleared")
 
     rag = create_lightrag()
     await rag.initialize_storages()

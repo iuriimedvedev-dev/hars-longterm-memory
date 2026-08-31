@@ -1289,6 +1289,34 @@ def _truncate_on_word_boundary(text: str, max_chars: int) -> str:
     return cut.rstrip() + "…"
 
 
+def _sanitize_for_json(obj: Any, max_depth: int = 5, _depth: int = 0) -> Any:
+    """Recursively sanitize a LightRAG result dict for JSON serialization.
+    
+    Converts non-serializable types (bytes, sets, numpy types, etc.) to strings,
+    truncates oversized strings, and limits recursion depth.
+    """
+    if _depth >= max_depth:
+        return str(obj)[:500]
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v, max_depth, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v, max_depth, _depth + 1) for v in obj[:200]]
+    if isinstance(obj, (str, int, float, bool)):
+        return str(obj)[:5000] if isinstance(obj, str) else obj
+    if obj is None:
+        return None
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")[:5000]
+    if isinstance(obj, set):
+        return sorted(str(v) for v in obj)
+    try:
+        if isinstance(obj, (datetime.datetime, datetime.date)):
+            return obj.isoformat()
+    except NameError:
+        pass
+    return str(obj)[:5000]
+
+
 def _dedupe_description(description: str) -> str:
     """Split a <SEP>-joined entity description into unique parts, then re-truncate cleanly."""
     if CONTEXT_DESCRIPTION_SEP not in description:
@@ -1734,6 +1762,14 @@ async def list_tools() -> list[Tool]:
                         "`context_priority_applied` in the response) for the answer-generation path."
                     ),
                 },
+                "debug": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Return debug data: fused_chunks at top level, latency_breakdown "
+                                   "(total_ms, graph_channel_ms, hybrid_channels), llm_usage (token "
+                                   "counts), and raw_result (raw LightRAG output). Use for benchmarking "
+                                   "and comparison with other retrieval systems (other systems).",
+                },
             },
             ["question"],
         ),
@@ -1892,6 +1928,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         # memory_recall                                                        #
         # ------------------------------------------------------------------ #
         if name == "memory_recall":
+            request_start = time.monotonic()
             question = str(args.get("question", ""))
             if not question:
                 return json_text({"ok": False, "error": "question is required"})
@@ -1903,6 +1940,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if fetch_top_k is None:
                 return json_text({"ok": False, "error": fetch_top_k_source})
             context_only = bool(args.get("context_only", True))
+            debug = bool(args.get("debug", False))
             context_priority = str(args.get("context_priority", DEFAULT_CONTEXT_PRIORITY))
             ll_keywords = [str(k) for k in (args.get("ll_keywords") or [])]
             hl_keywords = [str(k) for k in (args.get("hl_keywords") or [])]
@@ -2028,7 +2066,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         graph_channel_ms=graph_channel_ms,
                         context_priority_applied=context_priority_applied,
                     )
-                    return json_text({
+                    response = {
                         "ok": has_context,
                         "context": context_for_response,
                         "error": None if has_context else "no context retrieved for this question",
@@ -2044,25 +2082,48 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         "context_priority_applied": context_priority_applied,
                         "hybrid": hybrid_block,
                         **staleness_fields,
-                    })
+                    }
+                    if debug:
+                        fused = hybrid_block.get("fused_chunks") or []
+                        response["debug"] = {
+                            "fused_chunks_count": len(fused),
+                            "fused_chunks": fused,
+                            "latency_breakdown": {
+                                "total_ms": round((time.monotonic() - request_start) * 1000, 2),
+                                "graph_channel_ms": graph_channel_ms,
+                                "hybrid_channels": {
+                                    "bm25_ms": hybrid_block.get("bm25_cache", {}).get("build_ms"),
+                                    "ripgrep_ms": hybrid_block.get("ripgrep", {}).get("latency_ms"),
+                                    "flat_dense_ms": hybrid_block.get("flat_dense", {}).get("latency_ms"),
+                                },
+                            },
+                        }
+                    return json_text(response)
                 graph_start = time.monotonic()
-                result = await asyncio.wait_for(
-                    rag.aquery_llm(  # type: ignore[attr-defined]
-                        question,
-                        param=QueryParam(
-                            mode=rag_mode,
-                            top_k=top_k,
-                            chunk_top_k=fetch_top_k,
-                            response_type=LLM_RESPONSE_TYPE,
-                            model_func=create_query_model_func(),
-                            include_references=True,
-                            max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
-                            max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
-                            **kw_args,
+                # LightRAG 1.5.6 does not support QueryParam.model_func.
+                # Temporarily swap the instance-level llm_model_func so the
+                # query LLM (rather than the extractor) is used for synthesis.
+                _orig_llm_func = getattr(rag, "llm_model_func", None)
+                try:
+                    rag.llm_model_func = create_query_model_func()
+                    result = await asyncio.wait_for(
+                        rag.aquery_llm(  # type: ignore[attr-defined]
+                            question,
+                            param=QueryParam(
+                                mode=rag_mode,
+                                top_k=top_k,
+                                chunk_top_k=fetch_top_k,
+                                response_type=LLM_RESPONSE_TYPE,
+                                include_references=True,
+                                max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                                max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                                **kw_args,
+                            ),
                         ),
-                    ),
-                    timeout=query_timeout,
-                )
+                        timeout=query_timeout,
+                    )
+                finally:
+                    rag.llm_model_func = _orig_llm_func
                 graph_channel_ms = (time.monotonic() - graph_start) * 1000
                 citations = _extract_citations(result, top_k)
                 _emit_recall_event(
@@ -2074,7 +2135,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     graph_channel_ms=graph_channel_ms,
                     context_priority_applied=None,  # context_priority only applies to the context_only path
                 )
-                return json_text({
+                response = {
                     "ok": result.get("status") != "failure",
                     "answer": _extract_answer(result),
                     "citations": citations,
@@ -2089,7 +2150,28 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "message": result.get("message"),
                     "hybrid": hybrid_block,
                     **staleness_fields,
-                })
+                }
+                if debug:
+                    fused = hybrid_block.get("fused_chunks") or []
+                    response["debug"] = {
+                        "fused_chunks_count": len(fused),
+                        "fused_chunks": fused,
+                        "latency_breakdown": {
+                            "total_ms": round((time.monotonic() - request_start) * 1000, 2),
+                            "graph_channel_ms": graph_channel_ms,
+                            "hybrid_channels": {
+                                "bm25_ms": hybrid_block.get("bm25_cache", {}).get("build_ms"),
+                                "ripgrep_ms": hybrid_block.get("ripgrep", {}).get("latency_ms"),
+                                "flat_dense_ms": hybrid_block.get("flat_dense", {}).get("latency_ms"),
+                            },
+                        },
+                        "llm_usage": {
+                            "input_tokens": result.get("input_tokens") or result.get("usage", {}).get("input_tokens"),
+                            "output_tokens": result.get("output_tokens") or result.get("usage", {}).get("output_tokens"),
+                        },
+                        "raw_lightrag_result": _sanitize_for_json(result),
+                    }
+                return json_text(response)
             except Exception as exc:
                 logger.warning(
                     "memory_recall failed (mode=%s, context_only=%s, question=%r): %s",
