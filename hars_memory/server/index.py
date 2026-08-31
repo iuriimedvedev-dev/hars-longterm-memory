@@ -68,6 +68,12 @@ logger = logging.getLogger("memory.index")
 # is user/machine-specific.
 _MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
 
+# Sparse-channel cache directory. Same env var and same derive-from-working-dir
+# fallback as mcp_server.py's HARS_MEMORY_BM25_CACHE_DIR, so the indexer
+# invalidates exactly the cache the query server will read.
+_BM25_CACHE_DIR_ENV: Final[str] = "HARS_MEMORY_BM25_CACHE_DIR"
+_BM25_CACHE_DIR_NAME: Final[str] = "bm25_cache"
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -175,8 +181,15 @@ async def _apply_refresh_changed(
     *,
     refresh_changed: bool,
     fingerprint_store_path: Path,
-) -> None:
-    """Detect content-changed documents and delete+reinsert them — IF opted in.
+) -> FingerprintStore | None:
+    """Detect content-changed documents and delete their stale content — IF opted in.
+
+    Returns the loaded (in-memory, refreshed) fingerprint store so the CALLER
+    can persist it *after* a successful insert, or ``None`` when opted out.
+    Deliberately does NOT call ``store.save()`` itself: a fingerprint written
+    before insertion would mark a document as up to date even though the
+    insert was interrupted or failed, permanently skipping it on the next run
+    (its stale content having already been deleted below).
 
     Safety contract: when *refresh_changed* is False (the default), this is a
     strict no-op — the fingerprint sidecar is never read or written, and
@@ -188,7 +201,7 @@ async def _apply_refresh_changed(
             "--refresh-changed not set: skipping content-change detection "
             "(no deletes issued)."
         )
-        return
+        return None
 
     store = FingerprintStore.load(fingerprint_store_path)
     report = detect_changed_documents(all_docs, store)
@@ -203,7 +216,46 @@ async def _apply_refresh_changed(
     for doc_id in report.changed_doc_ids:
         logger.info("Deleting stale content for doc_id=%s before reinsert", doc_id)
         await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
-    store.save()
+
+    # Garbage collection: doc_ids we fingerprinted before but that no longer
+    # appear in ANY ingest root -- their source file was deleted or moved out.
+    # Nothing reinserts them, so without this their entities, chunks and
+    # vectors survive in the graph indefinitely and keep surfacing as
+    # retrieval hits for content that does not exist any more.
+    if report.deleted_doc_ids:
+        logger.info(
+            "Garbage-collecting %d deleted document(s) from the index",
+            len(report.deleted_doc_ids),
+        )
+        for doc_id in report.deleted_doc_ids:
+            logger.info("Deleting removed document doc_id=%s (no reinsert)", doc_id)
+            await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
+        _invalidate_bm25_cache()
+
+    return store
+
+
+def _invalidate_bm25_cache() -> None:
+    """Drop the persisted BM25 cache after documents were garbage-collected.
+
+    The sparse channel caches its term-document matrix separately from the
+    LightRAG working dir and only rebuilds when the chunk store's mtime moves.
+    A GC pass shrinks that store, so the stale cache would keep serving the
+    deleted chunks as sparse hits. Best-effort by design: a missing or
+    unconfigured cache is not an indexing failure.
+    """
+    cache_dir = os.environ.get(_BM25_CACHE_DIR_ENV, "").strip()
+    try:
+        from hars_memory.retrieval.bm25_index import invalidate_cache
+        from hars_memory.server.lightrag_init import resolve_working_dir
+
+        if not cache_dir:
+            cache_dir = str(
+                Path(resolve_working_dir()).parent / _BM25_CACHE_DIR_NAME
+            )
+        invalidate_cache(cache_dir)
+    except Exception as exc:  # noqa: BLE001 - never fail indexing over a cache
+        logger.warning("BM25 cache invalidation skipped (%s): %s", cache_dir, exc)
 
 
 async def _insert_all_batches(
@@ -320,7 +372,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
             str(default_fingerprint_store_path(resolve_working_dir())),
         )
     )
-    await _apply_refresh_changed(
+    fingerprint_store = await _apply_refresh_changed(
         rag,
         all_docs,
         refresh_changed=args.refresh_changed,
@@ -362,6 +414,14 @@ async def _run_indexing(args: argparse.Namespace) -> None:
             logger.info("LightRAG storages flushed to disk successfully.")
         except Exception as exc:
             logger.warning("LightRAG storage finalization failed: %s", exc)
+
+    # Fingerprints are persisted ONLY after a fully successful insert: an
+    # exception re-raises above and a cancellation lands in `interrupted`,
+    # both of which leave the sidecar untouched so the next run re-detects
+    # the changed documents and reinserts them.
+    if fingerprint_store is not None and not interrupted:
+        fingerprint_store.save()
+        logger.info("Fingerprints saved to %s after successful insert", fingerprint_store_path)
 
     if interrupted:
         logger.info(

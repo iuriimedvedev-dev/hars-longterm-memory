@@ -325,19 +325,18 @@ ENTITY_DESCRIPTION_MAX_CHARS = 400
 # ceiling before entity/relation text crowds them out, which is exactly what
 # recall@10 tracks.
 #
-# NOTE ON UNITS: the installed tokenizer is `_ByteTokenizer`
-# (tools/memory/server/lightrag_init.py) — it counts UTF-8 BYTES, not
-# model tokens. These two constants are therefore BYTE budgets (~1 byte per
-# ASCII char in this corpus' English text), not the ~4 chars/token a real
-# tokenizer would imply. This changes the interpretation, not the
-# conclusion: LightRAG's nominal "6000/8000 token" default was already only
-# a ~6000/8000-BYTE budget in this deployment (about 1500/2000 real tokens,
-# not 6000/8000) — i.e. smaller in real terms than its name suggests, yet
-# STILL oversized enough to crowd out chunk text at byte granularity. An
-# entity budget of 500 bytes (roughly 2-4 short entity descriptions) is
-# enough because at byte-level granularity, a handful of verbose
-# entity/relation lines can already consume a large fraction of the shared
-# 30000-byte max_total_tokens ceiling. Measured 2026-07-29.
+# NOTE ON UNITS: these numbers were tuned on 2026-07-29 while the installed
+# tokenizer was `_ByteTokenizer` — i.e. they were UTF-8 BYTE budgets (~1 byte
+# per ASCII char in this corpus' English text). Since the switch to the
+# tiktoken-backed tokenizer (server/lightrag_init.py::resolve_tokenizer) the
+# very same numbers are interpreted by LightRAG as real MODEL TOKENS, so in
+# terms of actual text they are now ~4x LARGER (500 tokens ≈ 2000 chars of
+# entity text). The *names* keep the _BYTES suffix on purpose: they document
+# the unit the tuning was performed in. Values are deliberately left as-is
+# and are to be re-tuned against the reindexed corpus — the whole
+# entity/relation-vs-chunk trade-off (how much chunk text survives under the
+# shared max_total_tokens ceiling) shifts once chunks themselves are token-
+# sized rather than byte-sized.
 DEFAULT_MAX_ENTITY_CONTEXT_BYTES = 500
 DEFAULT_MAX_RELATION_CONTEXT_BYTES = 4500
 MAX_CHUNKS_PER_SOURCE: int = 3
@@ -420,6 +419,15 @@ app = Server("hars-longterm-memory")
 # Lazy-initialised LightRAG instance (only for actual queries, not status).
 _rag_instance: object | None = None
 _rag_lock = asyncio.Lock()
+
+# Serialises the instance-level `rag.llm_model_func` swap in memory_recall's
+# synthesis path (LightRAG 1.5.6 has no QueryParam.model_func, so the shared
+# instance attribute is the only lever). Without this, two concurrent recalls
+# race: the first one's `finally` restores the ORIGINAL extractor func while
+# the second is still mid-query, so the second silently synthesises with the
+# extractor model — and whichever finishes last can leave the query model
+# permanently installed on the shared instance.
+_QUERY_MODEL_LOCK = asyncio.Lock()
 
 
 def json_text(data: Any) -> list[TextContent]:
@@ -934,7 +942,7 @@ async def _compute_hybrid_block(
 
         bm25_index, bm25_cache_status = await _get_bm25_index()
         sparse_start = time.monotonic()
-        sparse_search_hits = await asyncio.to_thread(bm25_index.search, question, pool_size)
+        sparse_search_hits = await bm25_index.asearch(question, pool_size)
         sparse_elapsed_ms = (time.monotonic() - sparse_start) * 1000
 
         dense_start = time.monotonic()
@@ -979,8 +987,7 @@ async def _compute_hybrid_block(
             from hars_memory.retrieval import ripgrep_channel
 
             rg_roots = ripgrep_channel.default_roots()
-            rg_result = await asyncio.to_thread(
-                ripgrep_channel.search,
+            rg_result = await ripgrep_channel.asearch(
                 question,
                 ll_keywords=_ripgrep_keywords(ll_keywords),
                 roots=rg_roots,
@@ -1111,7 +1118,33 @@ async def _compute_hybrid_block(
 
         # Apply diversity after both additive gates so the public result is the
         # actual bounded, source-diverse fused selection.
-        fused = _select_diverse_fused_chunks(fused, top_k)
+        fused = _select_diverse_fused_chunks(fused, len(fused))
+
+        # Cross-encoder Reranking if configured (e.g. HARS_MEMORY_RERANK_MODEL)
+        rerank_func = getattr(rag, "rerank_model_func", None)
+        rerank_elapsed_ms = None
+        if rerank_func and fused:
+            rerank_start = time.monotonic()
+            try:
+                pool_to_rerank = fused[:pool_size]
+                docs = [c.content for c in pool_to_rerank]
+                scored = await rerank_func(question, docs, top_n=top_k)
+                rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
+                if scored:
+                    reranked_pool: list[Any] = []
+                    seen_cids: set[str] = set()
+                    for item in scored:
+                        idx = int(item["index"])
+                        if 0 <= idx < len(pool_to_rerank):
+                            candidate = pool_to_rerank[idx]
+                            reranked_pool.append(candidate)
+                            seen_cids.add(candidate.chunk_id)
+                    for candidate in fused:
+                        if candidate.chunk_id not in seen_cids:
+                            reranked_pool.append(candidate)
+                    fused = reranked_pool
+            except Exception as exc:
+                logger.warning("Reranking candidate pool failed: %s", exc)
 
         return {
             "enabled": True,
@@ -1131,6 +1164,7 @@ async def _compute_hybrid_block(
                 "dense_channel": round(dense_elapsed_ms, 2),
                 "ripgrep_channel": ripgrep_report.get("latency_ms"),
                 "flat_dense_channel": flat_report.get("latency_ms"),
+                "rerank_channel": round(rerank_elapsed_ms, 2) if rerank_elapsed_ms is not None else None,
             },
             "ripgrep": ripgrep_report,
             "flat_dense": flat_report,
@@ -1159,6 +1193,7 @@ async def _compute_hybrid_block(
                     "dense_score": chunk.dense_score,
                     "sparse_score": chunk.sparse_score,
                     "file_path": chunk.file_path,
+                    "content": chunk.content,
                     "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
                 }
                 for chunk in fused
@@ -1578,6 +1613,47 @@ def _parse_reference_block(raw: str) -> dict[str, str]:
     return mapping
 
 
+def _chunk_dedup_key(chunk: dict[str, Any]) -> str:
+    """Stable per-chunk identity WITHIN one document, used as the second half
+    of the (file_path, chunk_id) dedup key. Prefers an explicit chunk_id
+    (hybrid channel always carries one); LightRAG's own context block has no
+    chunk_id field, so its chunks fall back to their content."""
+    chunk_id = chunk.get("chunk_id") or chunk.get("id")
+    if chunk_id:
+        return str(chunk_id)
+    return str(chunk.get("content") or chunk.get("snippet") or "")
+
+
+def _content_covered(candidate: str, existing: str) -> bool:
+    """True when `candidate` adds nothing over `existing` — the hybrid
+    channel's snippet is a truncated prefix of the same chunk LightRAG
+    already emitted, so it must not be injected a second time."""
+    candidate_norm = " ".join(candidate.split())
+    existing_norm = " ".join(existing.split())
+    if not candidate_norm:
+        return True
+    return candidate_norm in existing_norm
+
+
+def _representative_content(
+    path: str,
+    chunks_by_path: dict[str, list[dict[str, Any]]],
+    fusion_by_path: dict[str, list[dict[str, Any]]],
+) -> str:
+    """Content used to score a DOCUMENT (supersession rescoring operates on
+    documents, not chunks). Prefers LightRAG's own (fuller) chunks, joining
+    all of them so a marker in any chunk of the document is seen; falls back
+    to the fusion channel's content/snippet for fusion-exclusive documents."""
+    lightrag = chunks_by_path.get(path) or []
+    if lightrag:
+        return "\n".join(str(chunk.get("content", "")) for chunk in lightrag)
+    for fused_chunk in fusion_by_path.get(path) or []:
+        content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
+        if content:
+            return content
+    return ""
+
+
 def _merge_context_with_fusion(
     context: str, fused_chunks: list[dict[str, Any]], limit: int
 ) -> tuple[str, bool]:
@@ -1600,24 +1676,44 @@ def _merge_context_with_fusion(
     if not lightrag_chunks or not ref_id_to_path:
         return context, False
 
+    # Multi-chunk per document: a single file legitimately contributes SEVERAL
+    # ranked chunks (different sections of the same markdown document). Keying
+    # by path alone dropped every chunk after the first, silently losing
+    # relevant content. Chunks are deduped by (file_path, chunk_id) instead,
+    # while DOCUMENT order (and therefore `limit`, which counts documents)
+    # stays exactly as the round-robin merge produced it.
     lightrag_order: list[str] = []
-    chunk_by_path: dict[str, dict[str, Any]] = {}
+    chunks_by_path: dict[str, list[dict[str, Any]]] = {}
+    seen_lightrag_keys: set[tuple[str, str]] = set()
     for chunk in lightrag_chunks:
         ref_id = str(chunk.get("reference_id", ""))
         path = ref_id_to_path.get(ref_id, "")
-        if not path or path in chunk_by_path:
+        if not path:
             continue
-        lightrag_order.append(path)
-        chunk_by_path[path] = chunk
+        key = (path, _chunk_dedup_key(chunk))
+        if key in seen_lightrag_keys:
+            continue
+        seen_lightrag_keys.add(key)
+        if path not in chunks_by_path:
+            lightrag_order.append(path)
+            chunks_by_path[path] = []
+        chunks_by_path[path].append(chunk)
 
     fusion_order: list[str] = []
-    fusion_by_path: dict[str, dict[str, Any]] = {}
+    fusion_by_path: dict[str, list[dict[str, Any]]] = {}
+    seen_fusion_keys: set[tuple[str, str]] = set()
     for fused_chunk in fused_chunks:
         path = str(fused_chunk.get("file_path", ""))
-        if not path or path in fusion_by_path:
+        if not path:
             continue
-        fusion_order.append(path)
-        fusion_by_path[path] = fused_chunk
+        key = (path, _chunk_dedup_key(fused_chunk))
+        if key in seen_fusion_keys:
+            continue
+        seen_fusion_keys.add(key)
+        if path not in fusion_by_path:
+            fusion_order.append(path)
+            fusion_by_path[path] = []
+        fusion_by_path[path].append(fused_chunk)
 
     merged_order = _round_robin_merge(fusion_order, lightrag_order, limit)
     if not merged_order:
@@ -1651,35 +1747,67 @@ def _merge_context_with_fusion(
         from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
 
         ranked_with_content = [
-            (
-                path,
-                str(chunk_by_path[path].get("content", ""))
-                if path in chunk_by_path
-                else str(fusion_by_path.get(path, {}).get("snippet", "")),
-            )
+            (path, _representative_content(path, chunks_by_path, fusion_by_path))
             for path in merged_order
         ]
         merged_order = apply_marker_penalty_to_ranked_list(ranked_with_content)
 
     existing_ref_ids = {int(rid) for rid in ref_id_to_path if rid.isdigit()}
     next_ref_id = (max(existing_ref_ids) + 1) if existing_ref_ids else 1
-    path_to_ref_id = {path: rid for rid, path in ref_id_to_path.items()}
+
+    used_ref_ids: set[str] = set(ref_id_to_path)
+    # Every EMITTED chunk gets its own reference_id: LightRAG's original id is
+    # kept for the first chunk of a document (stable citations), any further
+    # chunk of the same document (and every fusion-exclusive injection) gets a
+    # freshly allocated one, so no two emitted chunks ever share an id.
+    emitted_ref_ids: set[str] = set()
+
+    def _allocate_ref_id() -> str:
+        nonlocal next_ref_id
+        while str(next_ref_id) in used_ref_ids:
+            next_ref_id += 1
+        ref_id = str(next_ref_id)
+        next_ref_id += 1
+        used_ref_ids.add(ref_id)
+        return ref_id
 
     new_chunk_lines: list[str] = []
     new_ref_lines: list[str] = []
     for path in merged_order:
-        if path in chunk_by_path:
-            new_chunk_lines.append(json.dumps(chunk_by_path[path], ensure_ascii=False))
-            new_ref_lines.append(f"[{path_to_ref_id[path]}] {path}")
-        else:
-            # Fusion-exclusive document: LightRAG's own context never surfaced
-            # it. Inject a new chunk entry — content is the hybrid channel's
-            # truncated snippet, not full chunk text; see the module comment.
-            ref_id = str(next_ref_id)
-            next_ref_id += 1
-            content = str(fusion_by_path[path].get("snippet", ""))
+        emitted_contents: list[str] = []
+        for chunk in chunks_by_path.get(path, []):
+            own_ref_id = str(chunk.get("reference_id", ""))
+            if own_ref_id and own_ref_id not in emitted_ref_ids:
+                ref_id = own_ref_id
+            else:
+                ref_id = _allocate_ref_id()
+            emitted_ref_ids.add(ref_id)
+            emitted = dict(chunk)
+            emitted["reference_id"] = ref_id
+            emitted_contents.append(str(emitted.get("content", "")))
+            new_chunk_lines.append(json.dumps(emitted, ensure_ascii=False))
+            new_ref_lines.append(f"[{ref_id}] {path}")
+        # Fusion-exclusive document: LightRAG's own context never surfaced it,
+        # so every one of its fusion chunks is injected — full chunk content
+        # when the hybrid channel provides it, snippet otherwise. Documents
+        # LightRAG already emitted keep LightRAG's own (fuller) chunks only,
+        # exactly as before, to avoid duplicating the same content twice.
+        if chunks_by_path.get(path):
+            continue
+        for fused_chunk in fusion_by_path.get(path, []):
+            content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
+            if not content.strip():
+                continue
+            if any(_content_covered(content, existing) for existing in emitted_contents):
+                continue
+            ref_id = _allocate_ref_id()
+            emitted_ref_ids.add(ref_id)
+            emitted_contents.append(content)
             new_chunk_lines.append(json.dumps({"reference_id": ref_id, "content": content}, ensure_ascii=False))
             new_ref_lines.append(f"[{ref_id}] {path}")
+
+    if not new_chunk_lines:
+        return context, False
 
     result = context
     # Splice the chunks block, then re-locate the reference block on the
@@ -2175,27 +2303,28 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 # LightRAG 1.5.6 does not support QueryParam.model_func.
                 # Temporarily swap the instance-level llm_model_func so the
                 # query LLM (rather than the extractor) is used for synthesis.
-                _orig_llm_func = getattr(rag, "llm_model_func", None)
-                try:
-                    rag.llm_model_func = create_query_model_func()
-                    result = await asyncio.wait_for(
-                        rag.aquery_llm(  # type: ignore[attr-defined]
-                            question,
-                            param=QueryParam(
-                                mode=rag_mode,
-                                top_k=top_k,
-                                chunk_top_k=fetch_top_k,
-                                response_type=LLM_RESPONSE_TYPE,
-                                include_references=True,
-                                max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
-                                max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
-                                **kw_args,
+                async with _QUERY_MODEL_LOCK:
+                    _orig_llm_func = getattr(rag, "llm_model_func", None)
+                    try:
+                        rag.llm_model_func = create_query_model_func()
+                        result = await asyncio.wait_for(
+                            rag.aquery_llm(  # type: ignore[attr-defined]
+                                question,
+                                param=QueryParam(
+                                    mode=rag_mode,
+                                    top_k=top_k,
+                                    chunk_top_k=fetch_top_k,
+                                    response_type=LLM_RESPONSE_TYPE,
+                                    include_references=True,
+                                    max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                                    max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                                    **kw_args,
+                                ),
                             ),
-                        ),
-                        timeout=query_timeout,
-                    )
-                finally:
-                    rag.llm_model_func = _orig_llm_func
+                            timeout=query_timeout,
+                        )
+                    finally:
+                        rag.llm_model_func = _orig_llm_func
                 graph_channel_ms = (time.monotonic() - graph_start) * 1000
                 citations = _extract_citations(result, top_k)
                 if _extract_entities_used(result, 1):

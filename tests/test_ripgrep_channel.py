@@ -10,6 +10,7 @@ the real system binary happens to be installed.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -522,3 +523,55 @@ class TestSearchUnavailableWithoutConfiguredRoots:
         result = search("A2S32", roots=roots)
         assert result.available is True
         assert any("note.md" in hit.file_path for hit in result.hits)
+
+
+class TestAsearchDoesNotBlockEventLoop:
+    """`asearch()` must offload the blocking `rg` subprocess to a worker
+    thread: while it runs, other coroutines on the same loop must keep being
+    scheduled. Regression guard for calling `search()` inline in a coroutine.
+    """
+
+    _BLOCKING_SECONDS = 0.3
+    _TICK_SECONDS = 0.01
+
+    def test_concurrent_coroutine_keeps_ticking_during_search(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rgc, "check_availability", lambda: rgc.RipgrepAvailability(
+            available=True, reason=None, binary_path="/usr/bin/rg"
+        ))
+
+        def _blocking_run_rg(cmd: list[str], *, timeout_seconds: float) -> tuple[str, bool]:
+            time.sleep(self._BLOCKING_SECONDS)  # stands in for a slow `rg`
+            return "", False
+
+        monkeypatch.setattr(rgc, "_run_rg", _blocking_run_rg)
+
+        async def scenario() -> tuple[int, object]:
+            ticks = 0
+            done = False
+
+            async def ticker() -> int:
+                nonlocal ticks
+                while not done:
+                    await asyncio.sleep(self._TICK_SECONDS)
+                    ticks += 1
+                return ticks
+
+            ticker_task = asyncio.create_task(ticker())
+            result = await rgc.asearch("A2S32", roots=[tmp_path])
+            done = True
+            await ticker_task
+            return ticks, result
+
+        ticks, result = asyncio.run(scenario())
+        assert result.available is True
+        # A blocked loop yields ~0 ticks; a free one yields ~30 at 10ms.
+        assert ticks >= 10, f"event loop appeared blocked: only {ticks} ticks"
+
+    def test_asearch_matches_search_result(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
+        _write(tmp_path / "docs" / "note.md", "A2S32 is the identifier under test.\n")
+        sync_result = search("A2S32", roots=[tmp_path])
+        async_result = asyncio.run(rgc.asearch("A2S32", roots=[tmp_path]))
+        assert [h.file_path for h in async_result.hits] == [h.file_path for h in sync_result.hits]

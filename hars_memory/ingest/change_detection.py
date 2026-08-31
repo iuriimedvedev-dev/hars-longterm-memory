@@ -95,6 +95,15 @@ class FingerprintStore:
     def get(self, doc_id: str) -> str | None:
         return self._data.get(doc_id)
 
+    def keys(self) -> frozenset[str]:
+        """Every doc_id with a recorded fingerprint (i.e. previously ingested).
+
+        This is the only record of "what we have indexed before" that does not
+        depend on LightRAG's private on-disk schema, so it is what deleted-
+        document detection diffs the current walk against.
+        """
+        return frozenset(self._data)
+
     def set(self, doc_id: str, fingerprint: str) -> None:
         self._data[doc_id] = fingerprint
 
@@ -128,6 +137,10 @@ class ChangeReport:
     unchanged_doc_ids: tuple[str, ...]  # byte-identical to the stored fingerprint
     unchanged_count: int
     no_fingerprint_count: int  # never deleted — fingerprint recorded going forward
+    # Previously fingerprinted doc_ids absent from this walk: the source file
+    # was deleted or moved out of every ingest root. Their entities, chunks and
+    # vectors otherwise stay in the graph forever and keep being retrieved.
+    deleted_doc_ids: tuple[str, ...] = ()
 
 
 def detect_changed_documents(
@@ -147,6 +160,18 @@ def detect_changed_documents(
       * stored == current      -> unchanged, no-op.
       * stored != current      -> changed: caller must ``adelete_by_doc_id``
         then reinsert.
+
+    Additionally, any doc_id that HAS a stored fingerprint but is absent from
+    *docs* is reported in ``deleted_doc_ids`` and dropped from the store: its
+    source file is gone, so the caller must ``adelete_by_doc_id`` it with no
+    reinsert. Dropping the fingerprint (rather than keeping it) means a file
+    that later comes back is treated as "no fingerprint on record" — the safe
+    do-not-touch class — instead of spuriously "changed".
+
+    Note this diff is only as sound as the walk it is handed: it must be the
+    FULL document set for every ingest root, never a filtered subset, or
+    every unwalked document looks deleted. That is why the caller gates it
+    behind the same opt-in ``--refresh-changed`` flag.
     """
     changed: list[str] = []
     unchanged: list[str] = []
@@ -166,11 +191,22 @@ def detect_changed_documents(
         else:
             unchanged.append(doc.doc_id)
         store.set(doc.doc_id, current)
+
+    current_doc_ids = {doc.doc_id for doc in docs}
+    deleted = sorted(store.keys() - current_doc_ids)
+    for doc_id in deleted:
+        store.discard(doc_id)
+        logger.info(
+            "Document gone from all ingest roots: doc_id=%s — will delete from index",
+            doc_id,
+        )
+
     return ChangeReport(
         changed_doc_ids=tuple(changed),
         unchanged_doc_ids=tuple(unchanged),
         unchanged_count=len(unchanged),
         no_fingerprint_count=no_fingerprint,
+        deleted_doc_ids=tuple(deleted),
     )
 
 

@@ -42,6 +42,70 @@ class TestExtractChunkDate:
 
         assert extract_chunk_date("") is None
 
+    def test_header_behind_a_long_frontmatter_block_is_still_found(self) -> None:
+        """The walker places the header AFTER the frontmatter block, so on a
+        frontmatter-heavy document the header sits well past the old 200-char
+        scan window and the date signal was silently lost."""
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        frontmatter_lines = "\n".join(f"tag_{i}: value_{i}" for i in range(40))
+        content = (
+            f"---\nname: Long note\n{frontmatter_lines}\n---\n\n"
+            "[Document: long.md | Section: memory | Date: 2026-06-05]\n\nBody."
+        )
+        assert len(content.split("[Document:")[0]) > 200
+        assert extract_chunk_date(content) == date(2026, 6, 5)
+
+    def test_date_beyond_the_scan_window_is_not_found(self) -> None:
+        """The scan stays a bounded prefix scan, never the whole chunk."""
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        content = (
+            "x" * 2100
+            + "\n[Document: far.md | Section: memory | Date: 2026-06-05]\n"
+        )
+        assert extract_chunk_date(content) is None
+
+    def test_frontmatter_date_is_used_when_no_header_is_present(self) -> None:
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        content = "---\nname: Note\ndate: 2026-03-14\n---\n\nBody text."
+        assert extract_chunk_date(content) == date(2026, 3, 14)
+
+    def test_frontmatter_quoted_and_alternate_field_names(self) -> None:
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        assert extract_chunk_date('---\nupdated: "2026-01-02"\n---\n') == date(
+            2026, 1, 2
+        )
+        assert extract_chunk_date("---\nlast_updated: 2026-01-03\n---\n") == date(
+            2026, 1, 3
+        )
+
+    def test_header_wins_over_frontmatter_date(self) -> None:
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        content = (
+            "---\ndate: 2020-01-01\n---\n\n"
+            "[Document: n.md | Section: memory | Date: 2026-05-05]\n\nBody."
+        )
+        assert extract_chunk_date(content) == date(2026, 5, 5)
+
+    def test_explicit_unknown_header_is_not_overridden_by_frontmatter(self) -> None:
+        """`Date: unknown` is the document's own verdict — honour it."""
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        content = (
+            "---\ndate: 2020-01-01\n---\n\n"
+            "[Document: n.md | Section: memory | Date: unknown]\n\nBody."
+        )
+        assert extract_chunk_date(content) is None
+
+    def test_impossible_frontmatter_date_returns_none(self) -> None:
+        from hars_memory.retrieval.supersession import extract_chunk_date
+
+        assert extract_chunk_date("---\ndate: 2026-13-45\n---\n") is None
+
 
 class TestMarkerPenalty:
     def test_deprecated_name_field_triggers_penalty(self) -> None:
