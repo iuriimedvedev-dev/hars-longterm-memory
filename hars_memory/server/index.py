@@ -32,6 +32,10 @@ Environment variables (see config/.env.example):
     HARS_MEMORY_VECTOR_STORAGE             - LightRAG vector backend
     HARS_MEMORY_CLAUDE_MEMORY_DIR                 - optional extra ingest root (e.g. the
                                             Claude Code project-memory dir)
+    HARS_MEMORY_SOURCES_MANIFEST           - YAML manifest listing the
+                                            knowledge directories to ingest
+                                            (used when --paths is omitted);
+                                            see ingest/sources.py
     HARS_MEMORY_FINGERPRINT_STORE          - sidecar JSON path for
                                             --refresh-changed content
                                             fingerprints (default: alongside
@@ -50,6 +54,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
+from hars_memory.ingest import sources
 from hars_memory.ingest.change_detection import (
     FingerprintStore,
     default_fingerprint_store_path,
@@ -67,6 +72,11 @@ logger = logging.getLogger("memory.index")
 # this at their own path; never hardcoded since it lives outside the repo and
 # is user/machine-specific.
 _MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
+
+# Fallback ingest roots for a bare invocation with neither --paths nor a
+# knowledge-source manifest. Kept only for backwards compatibility — the
+# manifest is the maintained list, see ingest/sources.py.
+_LEGACY_DEFAULT_PATHS: Final[tuple[str, ...]] = (".plans", "docs")
 
 # Sparse-channel cache directory. Same env var and same derive-from-working-dir
 # fallback as mcp_server.py's HARS_MEMORY_BM25_CACHE_DIR, so the indexer
@@ -86,8 +96,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--paths",
         nargs="+",
-        default=[".plans", "docs"],
-        help="Directories or files to ingest (relative to project root).",
+        default=None,
+        help=(
+            "Directories or files to ingest (relative to project root). "
+            "Omit to use the knowledge-source manifest "
+            "(HARS_MEMORY_SOURCES_MANIFEST); without a manifest the legacy "
+            "default '.plans docs' applies."
+        ),
     )
     parser.add_argument(
         "--full",
@@ -156,18 +171,36 @@ def _install_signal_handlers(
         loop.add_signal_handler(sig, _handle_signal, sig)
 
 
-def _resolve_ingest_paths(cli_paths: list[str], project_root: Path) -> list[Path]:
-    """Resolve --paths CLI values to absolute Paths, plus the optional
+def _resolve_ingest_paths(cli_paths: list[str] | None, project_root: Path) -> list[Path]:
+    """Resolve the ingest roots to absolute Paths, plus the optional
     Claude memory directory (HARS_MEMORY_CLAUDE_MEMORY_DIR), if configured.
+
+    Roots come from, in precedence order: an explicit --paths (the caller knows
+    exactly what they want, so the manifest is not consulted), the
+    knowledge-source manifest's `index: true` entries (see
+    ``ingest/sources.py``), or the legacy `.plans docs` default. Knowledge is
+    spread over many directories, so the manifest — not this CLI's default — is
+    the maintained list.
 
     The memory dir is appended unconditionally when the env var is set —
     independent of whatever --paths override the caller passed — since it is
     a standing ingest root (~90 curated knowledge files), not an ephemeral one.
     """
-    resolved = [
-        project_root / p if not Path(p).is_absolute() else Path(p)
-        for p in cli_paths
-    ]
+    if cli_paths:
+        resolved = [
+            project_root / p if not Path(p).is_absolute() else Path(p)
+            for p in cli_paths
+        ]
+    else:
+        resolved = list(sources.ingest_roots())
+        if resolved:
+            logger.info(
+                "Ingest roots from knowledge-source manifest %s: %d path(s)",
+                sources.manifest_path(),
+                len(resolved),
+            )
+        else:
+            resolved = [project_root / p for p in _LEGACY_DEFAULT_PATHS]
     memory_dir_raw = os.environ.get(_MEMORY_DIR_ENV, "").strip()
     if memory_dir_raw:
         memory_dir = Path(memory_dir_raw)
