@@ -14,6 +14,7 @@ and CPU-only embeddings.
 | [Integration guide](integration-guide.md) | How to consume this package from another project — install from GitLab registry, set up MCP server, configure Qdrant, use the skill |
 | [Release process](release-process.md) | How to publish a new version — PyPI package, container image, CI/CD |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
+| [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
 
 ## Quick start
 
@@ -38,10 +39,11 @@ hars_memory/              # Python package
   eval/                   # gold-question harness, battle test, metrics
   service/                # HTTP index-job API, artifact stores, SDK
   sdk.py                  # synchronous HTTP client
+  grpc/                   # gRPC server, client, generated proto stubs
   strategies.py           # validated index/search strategies
   scripts/                # maintenance tools
 cortex-scripts/           # Cortex consumer scripts (not part of installed package)
 docs/                     # this documentation
 config/.env.example       # full env-var reference
-tests/                    # 583+ passing tests
+tests/                    # 742+ passing tests
 ```
