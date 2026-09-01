@@ -7,6 +7,8 @@ Serves the `hars-longterm-memory` MCP server (`memory_recall`, `memory_remember`
 retrieval channel among several (see `retrieval/` for BM25 fusion) — the public
 tool surface never names the underlying mechanism.
 
+**Documentation**: see `docs/` for the MCP tool reference, configuration reference, architecture, integration guide, and release/distribution process.
+
 **Stack**: LightRAG (lightrag-hku 1.4.16) · unsloth/embeddinggemma-300m (768-dim) on CPU · NanoVectorDB (file-backed, migrating to Qdrant — see `.plans/2026-07-29_graphrag-qdrant-migration.md`) · NetworkX · Qwen3.6-27B extractor · Qwen3.5-4B query LLM.
 
 **Package manager**: [UV](https://docs.astral.sh/uv/) — this standalone repository has its own `pyproject.toml` + `uv.lock` and is fully isolated from Cortex and its ROCm training environment.

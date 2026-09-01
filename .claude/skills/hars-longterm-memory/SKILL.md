@@ -23,6 +23,11 @@ Published to a private GitLab Package Registry — package name
 `hars-longterm-memory`, GitLab project id `14`
 (`https://registry.example.com/hars/hars-longterm-memory`).
 
+**Full documentation** is available in the `docs/` directory of the source
+repo: MCP tool reference, configuration reference, architecture, integration
+guide, and release/distribution process. This skill is a quick-start; the
+docs are the canonical source.
+
 ## Installing into a new project
 
 Create a small companion config project (its own directory, its own
