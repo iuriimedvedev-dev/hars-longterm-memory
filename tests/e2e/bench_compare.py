@@ -30,7 +30,14 @@ import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-KB_INDEX_DIR = Path("/tmp/hars_memory_lightrag")
+
+# Which HARS index the benchmark queries. Overridable so the same query set can
+# be replayed against two indexes for an A/B comparison (e.g. the pre-fix
+# baseline vs a rebuilt index) without editing this file; the default keeps the
+# historical baseline path so existing invocations are unchanged.
+KB_INDEX_DIR = Path(
+    os.environ.get("HARS_BENCH_INDEX_DIR", "/tmp/hars_memory_lightrag")
+)
 KB_ROOT = Path("/Users/iurii.medvedev/Work/sre-support-pier")
 JB_CONTEXT_PROJECT = str(KB_ROOT)
 
