@@ -61,6 +61,13 @@ def eval_battle_main() -> None:
     main()
 
 
+def grpc_main() -> None:
+    """Start the gRPC server."""
+    from hars_memory.grpc.server import main
+
+    main()
+
+
 # ---------------------------------------------------------------------------
 # `memory` unified subcommand CLI (corpus build/query/eval/regress/status)
 # ---------------------------------------------------------------------------
