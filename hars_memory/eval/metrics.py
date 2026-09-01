@@ -267,8 +267,82 @@ def no_answer_hit_rate(returned_any_hits: list[bool]) -> float:
     return sum(1 for r in returned_any_hits if r) / len(returned_any_hits)
 
 
+def file_recall_at_k(ranked_files: list[str], expected_files: set[str], k: int) -> float:
+    """Fraction of expected files found in top-k ranked files.
+
+    Wraps recall_at_k for file-level IR evaluation: same trec_eval backend,
+    same convention (ir_measures' Recall@k via _synthetic_run), same empty-
+    gold-doc guard.  Separated from recall_at_k only so the caller can
+    express "these are the expected *documents*, not chunk-level hits" in
+    the benchmark report without confusion.
+    """
+    return recall_at_k(ranked_files, expected_files, k)
+
+
+def chunk_coverage(
+    found_chunks: list[dict],
+    expected_files: set[str] | None = None,
+    expected_chunks: set[str] | None = None,
+) -> float | None:
+    """Fraction of expected chunks found among retrieved fused chunks.
+
+    Parameters
+    ----------
+    found_chunks : list[dict]
+        Retrieved fused chunks, each with at least ``"file_path"`` and
+        ``"chunk_id"`` keys.
+    expected_files : set[str] | None
+        Set of file paths expected to be retrieved.  May be ``None`` when
+        no file-level ground truth is available for the query.
+    expected_chunks : set[str] | None
+        Set of chunk IDs expected to be retrieved.  May be ``None`` when
+        no chunk-level ground truth is available.
+
+    Returns
+    -------
+    float or None
+        - If both `expected_files` and `expected_chunks` are non-empty:
+          fraction of ``(file_path, chunk_id)`` pairs from the Cartesian
+          product that appear in `found_chunks`.
+        - If only `expected_files` is non-empty (no chunk-level ground
+          truth): fraction of expected files that have **at least one**
+          chunk in `found_chunks`.
+        - If both are empty/None: ``None`` (no ground truth to measure).
+        - If only `expected_chunks` is non-empty without `expected_files`:
+          ``None`` (chunks without file-path context are not meaningful).
+    """
+    found_pairs: set[tuple[str, str]] = set()
+    for c in found_chunks:
+        fp = c.get("file_path", "")
+        cid = c.get("chunk_id", "")
+        if fp and cid:
+            found_pairs.add((fp, cid))
+
+    has_files = expected_files is not None and len(expected_files) > 0
+    has_chunks = expected_chunks is not None and len(expected_chunks) > 0
+
+    if has_files and has_chunks:
+        # Both dimensions available: score by (file, chunk_id) pair matches.
+        expected_pairs = {(fp, cid) for fp in expected_files for cid in expected_chunks}  # type: ignore[union-attr]
+        if not expected_pairs:
+            return None
+        return sum(1 for p in expected_pairs if p in found_pairs) / len(expected_pairs)
+
+    if has_files:
+        # Only file-level ground truth: count how many expected files have at
+        # least one retrieved chunk.
+        found_files = {fp for fp, _ in found_pairs}
+        matched = len(expected_files & found_files)  # type: ignore[arg-type]
+        return matched / len(expected_files)  # type: ignore[arg-type]
+
+    # No meaningful ground truth to measure against.
+    return None
+
+
 __all__ = [
+    "chunk_coverage",
     "dedupe_preserve_order",
+    "file_recall_at_k",
     "recall_at_k",
     "ndcg_at_k",
     "first_rank",

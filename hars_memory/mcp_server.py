@@ -1195,6 +1195,7 @@ async def _compute_hybrid_block(
                     "file_path": chunk.file_path,
                     "content": chunk.content,
                     "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
+                    "section": _extract_breadcrumb_from_content(chunk.content),
                 }
                 for chunk in fused
             ],
@@ -1279,6 +1280,37 @@ def _extract_answer(result: dict[str, Any]) -> str:
     return str(llm_response.get("content") or "")
 
 
+_SECTION_BREADCRUMB_RE = re.compile(r"^#{1,6}\s")
+
+def _extract_breadcrumb_from_content(content: str) -> str:
+    """Extract the section breadcrumb from chunk content.
+
+    The breadcrumb is the first line before a blank line — a heading chain
+    joined by `` > ``, e.g. ``# Kubernetes Networking > ## GKE Ingress``,
+    produced by the markdown-aware chunker (``chunker._chunk_markdown``).
+
+    Returns the breadcrumb text, or empty string when the content doesn't
+    start with a heading breadcrumb (plain character-window chunks, ripgrep
+    hits, or any chunk whose first line isn't a heading).
+    """
+    if not content:
+        return ""
+    blank = content.find("\n\n")
+    if blank == -1:
+        return ""
+    first_line = content[:blank].strip()
+    # A breadcrumb is a heading line (starts with # followed by a space)
+    # — matches the chunker's _HEADING_RE pattern, e.g. #, ##, ###, etc.
+    # Single-level breadcrumbs (e.g. "## Some Heading") and multi-level
+    # breadcrumbs (e.g. "# A > ## B > ### C") are both captured.
+    if _SECTION_BREADCRUMB_RE.match(first_line):
+        return first_line
+    return ""
+    # Note: content without a blank line separator, or whose first line
+    # isn't a heading, yields empty string — no false positive for regular
+    # prose or ripgrep channel content.
+
+
 def _extract_citations(result: dict[str, Any], limit: int) -> list[dict[str, Any]]:
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     refs_by_id = {
@@ -1292,12 +1324,14 @@ def _extract_citations(result: dict[str, Any], limit: int) -> list[dict[str, Any
             continue
         ref_id = str(chunk.get("reference_id", ""))
         ref = refs_by_id.get(ref_id, {})
+        content = str(chunk.get("content", ""))
         citations.append(
             {
                 "node_id": str(chunk.get("chunk_id") or ref_id),
                 "source_path": str(chunk.get("file_path") or ref.get("file_path") or ""),
-                "snippet": str(chunk.get("content", ""))[:300],
+                "snippet": content[:300],
                 "score": chunk.get("score") or chunk.get("distance"),
+                "section": _extract_breadcrumb_from_content(content),
             }
         )
         if len(citations) >= limit:
@@ -1784,6 +1818,9 @@ def _merge_context_with_fusion(
             emitted_ref_ids.add(ref_id)
             emitted = dict(chunk)
             emitted["reference_id"] = ref_id
+            emitted["section"] = _extract_breadcrumb_from_content(
+                str(emitted.get("content", ""))
+            )
             emitted_contents.append(str(emitted.get("content", "")))
             new_chunk_lines.append(json.dumps(emitted, ensure_ascii=False))
             new_ref_lines.append(f"[{ref_id}] {path}")
@@ -1803,7 +1840,16 @@ def _merge_context_with_fusion(
             ref_id = _allocate_ref_id()
             emitted_ref_ids.add(ref_id)
             emitted_contents.append(content)
-            new_chunk_lines.append(json.dumps({"reference_id": ref_id, "content": content}, ensure_ascii=False))
+            new_chunk_lines.append(
+                json.dumps(
+                    {
+                        "reference_id": ref_id,
+                        "content": content,
+                        "section": _extract_breadcrumb_from_content(content),
+                    },
+                    ensure_ascii=False,
+                )
+            )
             new_ref_lines.append(f"[{ref_id}] {path}")
 
     if not new_chunk_lines:
