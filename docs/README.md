@@ -16,6 +16,42 @@ and CPU-only embeddings.
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
 | [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
 
+### CLI Reference
+
+The `memory` command provides a unified interface for all subsystems:
+
+| Subcommand | Description |
+|---|---|
+| `memory recall <question>` | Query the LightRAG knowledge graph |
+| `memory mcp` | Start MCP server (stdio) |
+| `memory server` | Start HTTP index-job service |
+| `memory grpc` | Start gRPC server |
+| `memory build` | Build / incrementally re-index a corpus |
+| `memory query` | Search a corpus-built index |
+| `memory eval` | Run retrieval metrics against a corpus |
+| `memory regress` | Compare two eval reports |
+| `memory status` | Print corpus manifest summary |
+| `memory consolidate` | Trigger incremental reindex |
+| `memory strategy-bench` | Run strategy matrix benchmark |
+
+Examples:
+
+```bash
+# Quick query
+memory recall "What is Kubernetes?" --mode hybrid
+
+# Start servers
+memory mcp
+memory server --port 8787
+memory grpc --port 8788
+
+# Corpus management
+memory build --paths kb/ --index-dir /tmp/my-index
+memory query --index-dir /tmp/my-index --question "how to deploy?"
+```
+
+Legacy entrypoints (`memory-index`, `memory-mcp`, `memory-grpc`, `hars-longterm-memory-server`, etc.) remain available for backward compatibility.
+
 ## Quick start
 
 ```bash
