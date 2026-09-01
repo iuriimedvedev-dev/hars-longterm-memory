@@ -15,7 +15,9 @@ import math
 import pytest
 
 from hars_memory.eval.metrics import (
+    chunk_coverage,
     dedupe_preserve_order,
+    file_recall_at_k,
     first_rank,
     mean_reciprocal_rank,
     ndcg_at_k,
@@ -210,3 +212,206 @@ class TestNoAnswerHitRate:
 
     def test_empty_list_is_zero(self) -> None:
         assert no_answer_hit_rate([]) == 0.0
+
+
+class TestFileRecallAtK:
+    def test_delegates_to_recall_at_k_with_same_contract(self) -> None:
+        # gold doc "b" at rank 2, k=3 -> full recall (1.0)
+        assert file_recall_at_k(["a", "b", "c"], {"b"}, k=3) == 1.0
+
+    def test_single_gold_file_miss_outside_k(self) -> None:
+        assert file_recall_at_k(["a", "b", "c"], {"b"}, k=1) == 0.0
+
+    def test_multi_gold_partial_hit_is_fraction(self) -> None:
+        # gold = {b, d}; top-3 = {a, b, c} -> only "b" found -> 1/2 = 0.5
+        assert file_recall_at_k(["a", "b", "c", "d"], {"b", "d"}, k=3) == pytest.approx(0.5)
+
+    def test_empty_gold_docs_raises(self) -> None:
+        with pytest.raises(ValueError, match="gold_docs"):
+            file_recall_at_k(["a"], set(), k=1)
+
+    def test_k_less_than_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="k must be"):
+            file_recall_at_k(["a"], {"a"}, k=0)
+
+
+class TestChunkCoverage:
+    """Chunk coverage is the fraction of expected (file, chunk_id) pairs that
+    appear among the retrieved fused chunks.  It can also be computed at the
+    file-only level when no chunk-level ground truth is available."""
+
+    def test_all_chunks_found(self) -> None:
+        found = [
+            {"file_path": "a.md", "chunk_id": "chunk-1"},
+            {"file_path": "a.md", "chunk_id": "chunk-2"},
+            {"file_path": "b.md", "chunk_id": "chunk-1"},
+        ]
+        # both specified: expected_pairs = { (a.md,chunk-1), (a.md,chunk-2) }
+        assert chunk_coverage(found, {"a.md"}, {"chunk-1", "chunk-2"}) == pytest.approx(1.0)
+
+    def test_half_chunks_found(self) -> None:
+        found = [
+            {"file_path": "a.md", "chunk_id": "chunk-1"},
+            {"file_path": "b.md", "chunk_id": "chunk-1"},
+        ]
+        # expected_pairs = { (a.md,chunk-1), (a.md,chunk-2) }
+        # found_pairs = { (a.md,chunk-1), (b.md,chunk-1) }
+        # intersection = { (a.md,chunk-1) } -> 1/2 = 0.5
+        assert chunk_coverage(found, {"a.md"}, {"chunk-1", "chunk-2"}) == pytest.approx(0.5)
+
+    def test_no_chunks_found(self) -> None:
+        found = [{"file_path": "c.md", "chunk_id": "chunk-9"}]
+        assert chunk_coverage(found, {"a.md"}, {"chunk-1"}) == pytest.approx(0.0)
+
+    def test_empty_found_returns_zero(self) -> None:
+        assert chunk_coverage([], {"a.md"}, {"chunk-1"}) == pytest.approx(0.0)
+
+    def test_file_only_coverage_all_files_found(self) -> None:
+        found = [
+            {"file_path": "a.md", "chunk_id": "chunk-1"},
+            {"file_path": "b.md", "chunk_id": "chunk-2"},
+        ]
+        # Only expected_files provided (no expected_chunks): count fraction of
+        # expected files that have at least one chunk in found.
+        assert chunk_coverage(found, {"a.md", "b.md"}) == pytest.approx(1.0)
+
+    def test_file_only_coverage_half_files_found(self) -> None:
+        found = [{"file_path": "a.md", "chunk_id": "chunk-1"}]
+        assert chunk_coverage(found, {"a.md", "b.md"}) == pytest.approx(0.5)
+
+    def test_no_ground_truth_returns_none(self) -> None:
+        # Both expected_files and expected_chunks are None/empty
+        found = [{"file_path": "a.md", "chunk_id": "chunk-1"}]
+        assert chunk_coverage(found) is None
+
+    def test_chunks_without_files_returns_none(self) -> None:
+        # Only expected_chunks, no expected_files -> None
+        found = [{"file_path": "a.md", "chunk_id": "chunk-1"}]
+        assert chunk_coverage(found, expected_chunks={"chunk-1"}) is None
+
+    def test_skips_chunks_without_file_path_or_chunk_id(self) -> None:
+        found = [
+            {"file_path": "", "chunk_id": "chunk-1"},  # empty file_path
+            {"file_path": "a.md", "chunk_id": ""},  # empty chunk_id
+            {"file_path": "a.md", "chunk_id": "chunk-2"},  # valid
+        ]
+        # Only (a.md, chunk-2) is a valid pair; expected_pairs = {(a.md, chunk-1), (a.md, chunk-2)}
+        # -> 1/2 = 0.5
+        assert chunk_coverage(found, {"a.md"}, {"chunk-1", "chunk-2"}) == pytest.approx(0.5)
+
+
+class TestHardQueryFixture:
+    """Validates the hard-100 fixture data integrity and backward
+    compatibility — ensures the ground-truth contract is practically usable,
+    not just syntactically valid."""
+
+    # ------------------------------------------------------------------ #
+    # Dataset size and shape
+    # ------------------------------------------------------------------ #
+
+    def test_exactly_100_entries(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        assert len(KB_QUERIES_HARD_100) == 100
+
+    def test_all_entries_are_3tuple_or_4tuple(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        for raw in KB_QUERIES_HARD_100:
+            assert len(raw) in (3, 4), f"Unexpected tuple length {len(raw)}"
+
+    def test_98_entries_are_3tuple_2_entries_are_4tuple(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        count_3 = sum(1 for q in KB_QUERIES_HARD_100 if len(q) == 3)
+        count_4 = sum(1 for q in KB_QUERIES_HARD_100 if len(q) == 4)
+        assert count_3 == 98
+        assert count_4 == 2
+
+    def test_no_duplicate_ood_entries(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        domains = [q[2] for q in KB_QUERIES_HARD_100]
+        assert domains.count("ood-biology-crispr") == 1
+
+    # ------------------------------------------------------------------ #
+    # Ground-truth paths point to real files
+    # ------------------------------------------------------------------ #
+
+    def test_expected_docs_paths_exist_on_disk(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        import os
+        KB_ROOT = "/Users/iurii.medvedev/Work/sre-support-pier"
+        for raw in KB_QUERIES_HARD_100:
+            if len(raw) == 4:
+                _, _, _, docs = raw
+                for d in docs:
+                    assert os.path.isfile(os.path.join(KB_ROOT, d)), (
+                        f"Ground-truth path does not exist: {d}"
+                    )
+
+    def test_expected_docs_paths_are_kb_relative(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        for raw in KB_QUERIES_HARD_100:
+            if len(raw) == 4:
+                _, _, _, docs = raw
+                for d in docs:
+                    assert d.startswith("kb/"), (
+                        f"Expected doc path should start with kb/: {d}"
+                    )
+
+    # ------------------------------------------------------------------ #
+    # Path canonicalization
+    # ------------------------------------------------------------------ #
+
+    def test_canonicalize_strips_project_root(self) -> None:
+        from tests.e2e.bench_compare import _canonicalize_retrieved_path
+        result = _canonicalize_retrieved_path(
+            "/Users/iurii.medvedev/Work/sre-support-pier/kb/k8s/credential-rotation-controller/readme.md"
+        )
+        assert result == "kb/k8s/credential-rotation-controller/readme.md"
+
+    def test_canonicalize_passes_flat_name_through(self) -> None:
+        from tests.e2e.bench_compare import _canonicalize_retrieved_path
+        result = _canonicalize_retrieved_path(
+            "k8s-credential-rotation-controller-readme.md"
+        )
+        assert result == "k8s-credential-rotation-controller-readme.md"
+
+    def test_canonicalize_matches_fixture_path(self) -> None:
+        """After canonicalization, a retrieved absolute path should match
+        the fixture's kb/-relative expected_doc path."""
+        from tests.e2e.bench_compare import _canonicalize_retrieved_path
+        fixture_path = "kb/k8s/credential-rotation-controller/readme.md"
+        retrieved_path = "/Users/iurii.medvedev/Work/sre-support-pier/kb/k8s/credential-rotation-controller/readme.md"
+        assert _canonicalize_retrieved_path(retrieved_path) == fixture_path
+
+    # ------------------------------------------------------------------ #
+    # normalize_query backward compatibility
+    # ------------------------------------------------------------------ #
+
+    def test_normalize_query_3tuple(self) -> None:
+        from tests.e2e.bench_compare import normalize_query
+        q = normalize_query(("question", ["kw"], "domain"))
+        assert q.question == "question"
+        assert q.expected_keywords == ["kw"]
+        assert q.domain == "domain"
+        assert q.expected_docs is None
+
+    def test_normalize_query_4tuple(self) -> None:
+        from tests.e2e.bench_compare import normalize_query
+        q = normalize_query(("question", ["kw"], "domain", ["kb/doc.md"]))
+        assert q.question == "question"
+        assert q.expected_docs == ["kb/doc.md"]
+
+    def test_normalize_query_4tuple_with_empty_docs(self) -> None:
+        from tests.e2e.bench_compare import normalize_query
+        q = normalize_query(("question", ["kw"], "domain", []))
+        assert q.expected_docs == []
+
+    def test_normalize_query_all_100_entries(self) -> None:
+        from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+        from tests.e2e.bench_compare import normalize_query
+        for raw in KB_QUERIES_HARD_100:
+            q = normalize_query(raw)
+            assert q.question
+            assert isinstance(q.expected_keywords, list)
+            assert q.domain
+            if len(raw) == 4:
+                assert q.expected_docs is not None

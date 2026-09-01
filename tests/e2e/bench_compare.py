@@ -26,6 +26,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+from hars_memory.eval.metrics import ndcg_at_k, reciprocal_rank
+
 import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -39,6 +41,9 @@ KB_INDEX_DIR = Path(
     os.environ.get("HARS_BENCH_INDEX_DIR", "/tmp/hars_memory_lightrag")
 )
 KB_ROOT = Path("/Users/iurii.medvedev/Work/sre-support-pier")
+# Path prefix to strip from absolute retrieved paths during canonicalization.
+# The same value as KB_ROOT, expressed as a string for fast prefix matching.
+_KB_ROOT_PREFIX = str(KB_ROOT) + "/"
 JB_CONTEXT_PROJECT = str(KB_ROOT)
 
 # Try importing full 100-query dataset, fallback to basic 10 queries
@@ -64,6 +69,40 @@ except ImportError:
     HARD_QUERIES = DEFAULT_QUERIES
 
 QUERIES = DEFAULT_QUERIES
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible ground-truth contract
+# ---------------------------------------------------------------------------
+
+# A query fixture entry can be a 3-tuple (question, keywords, domain) — the
+# original format — or a 5-tuple that adds expected_docs (list of file paths)
+# and expected_chunks (list of chunk IDs).  Every entry with fewer than 5
+# elements is treated as "no file/chunk ground truth available" for that
+# query; the benchmark will simply skip the corresponding coverage metrics.
+#
+# Type alias for the union.
+KbQueryRaw = tuple[str, list[str], str] | tuple[str, list[str], str, list[str]]
+
+
+@dataclass
+class KbQuery:
+    """Normalized query specification with optional file/chunk ground truth."""
+    question: str
+    expected_keywords: list[str]
+    domain: str
+    expected_docs: list[str] | None = None
+    expected_chunks: list[str] | None = None
+
+
+def normalize_query(raw: KbQueryRaw) -> KbQuery:
+    """Convert old 3-tuple or new 5-tuple to ``KbQuery``, keeping the
+    existing fixture format unchanged."""
+    if len(raw) == 3:
+        return KbQuery(question=raw[0], expected_keywords=raw[1], domain=raw[2])
+    if len(raw) == 4:
+        return KbQuery(question=raw[0], expected_keywords=raw[1], domain=raw[2], expected_docs=raw[3])
+    raise ValueError(f"Unexpected query tuple length: {len(raw)}")
 
 
 @dataclass
@@ -92,6 +131,59 @@ class QueryResult:
     hars_total_ms: float | None = None
     # jbcontext-specific fields
     jbcontext_similarity: float | None = None
+    # Ground truth (optional — per KbQuery contract)
+    expected_files: list[str] | None = None
+    expected_chunks: list[str] | None = None
+    # File-level retrieval metrics
+    file_recall_at_k: float | None = None
+    file_ndcg: float | None = None
+    file_mrr: float | None = None
+    # Chunk-coverage metrics (only meaningful when ground truth is available)
+    chunk_coverage: float | None = None
+
+
+def _canonicalize_retrieved_path(path: str) -> str:
+    """Canonicalize a retrieved file path to a project-root-relative form.
+
+    Handles two formats observed in retrieval output:
+    - Full absolute path: ``/Users/.../sre-support-pier/kb/k8s/.../file.md``
+      -> ``kb/k8s/.../file.md``
+    - Flattened dash-basename: ``k8s-credential-rotation-controller-readme.md``
+      -> returned as-is (cannot be mapped losslessly to a ``kb/...`` path)
+
+    The fixture stores expected paths as ``kb/...`` relative paths, so after
+    canonicalization they can be compared directly.
+    """
+    if path.startswith(_KB_ROOT_PREFIX):
+        return path[len(_KB_ROOT_PREFIX):]
+    return path
+
+
+def _path_matches_expected(retrieved: str, expected: str) -> bool:
+    """Check whether a retrieved file path corresponds to an expected file.
+
+    Supports three formats:
+    - Exact match: ``kb/k8s/foo.md`` == ``kb/k8s/foo.md``
+    - Full absolute path: ``/Users/.../kb/k8s/foo.md`` -> ``kb/k8s/foo.md``
+    - Flattened indexer key: ``k8s-foo.md`` -> ``k8s/foo.md`` (strip ``kb/``
+      prefix, replace ``/`` with ``-``)
+
+    Matching is per-expected-file, so one expected file matching one retrieved
+    file counts as a single hit regardless of how many format variants
+    succeed.
+    """
+    if retrieved == expected:
+        return True
+    # Absolute path with KB_ROOT prefix
+    if retrieved.startswith(_KB_ROOT_PREFIX) and retrieved[len(_KB_ROOT_PREFIX):] == expected:
+        return True
+    # Flattened indexer key: strip ``kb/`` prefix, replace ``/`` with ``-``
+    for prefix in ["kb/", ""]:
+        if expected.startswith(prefix):
+            flattened = expected[len(prefix):].replace("/", "-")
+            if retrieved == flattened:
+                return True
+    return False
 
 
 def _keyword_recall(content: str, expected_keywords: list[str]) -> float:
@@ -162,8 +254,12 @@ def _run_jbcontext(query: str, expected_keywords: list[str], domain: str, limit:
         )
 
 
-async def _run_hars(session: ClientSession, query: str, expected_keywords: list[str],
-                     domain: str, mode: str = "hybrid") -> QueryResult:
+async def _run_hars(
+    session: ClientSession, query: str, expected_keywords: list[str],
+    domain: str, mode: str = "hybrid",
+    expected_files: list[str] | None = None,
+    expected_chunks: list[str] | None = None,
+) -> QueryResult:
     """Run a single query against HARS MCP with debug=True."""
     start = time.monotonic()
     try:
@@ -202,6 +298,44 @@ async def _run_hars(session: ClientSession, query: str, expected_keywords: list[
         dbg = result.get("debug", {})
         lb = dbg.get("latency_breakdown", {})
 
+        # File-level metrics from ground truth.
+        # Use per-file matching (``_path_matches_expected``) so that the
+        # comparison works across three path formats: exact ``kb/...``
+        # relative, full absolute (project-root-relative), and the flattened
+        # key emitted by the indexer (see ``index.py:_insert_all_batches``).
+        # Each expected file is counted at most once, regardless of how many
+        # format variants match.
+        exp_files = expected_files or []
+        exp_chunks_set = set(expected_chunks) if expected_chunks else set()
+        deduped_files = list(dict.fromkeys(files))  # preserve order, remove dupes
+        # Count how many expected files have at least one match in the top-k
+        # retrieved files.
+        matched_expected = sum(
+            1 for ef in exp_files
+            if any(_path_matches_expected(rf, ef) for rf in deduped_files[:10])
+        )
+        fl_recall = matched_expected / len(exp_files) if exp_files else None
+        # NDCG and MRR: for each ranked file, determine if it matches any
+        # expected file.  Map matched files to their canonicalized name so
+        # the set-based metrics work correctly.
+        exp_expanded = set(exp_files)
+        for ef in exp_files:
+            for prefix in ["kb/", ""]:
+                if ef.startswith(prefix):
+                    exp_expanded.add(ef[len(prefix):].replace("/", "-"))
+        canonicalized = [_canonicalize_retrieved_path(fp) for fp in deduped_files]
+        fl_ndcg = ndcg_at_k(canonicalized, exp_expanded, k=10) if exp_files else None
+        fl_mrr = reciprocal_rank(canonicalized, exp_expanded) if exp_files else None
+        # Chunk coverage: per-file matching using ``_path_matches_expected``.
+        # Count how many expected files have at least one chunk in the fused
+        # pool, regardless of path format (kb-relative, absolute, flattened).
+        fused_file_paths = {c.get("file_path", "") for c in fused}
+        matched_files_cov = sum(
+            1 for ef in exp_files
+            if any(_path_matches_expected(ffp, ef) for ffp in fused_file_paths)
+        )
+        cov = matched_files_cov / len(exp_files) if exp_files else None
+
         return QueryResult(
             system="hars",
             query=query[:80],
@@ -222,6 +356,13 @@ async def _run_hars(session: ClientSession, query: str, expected_keywords: list[
             hars_bm25_ms=lb.get("hybrid_channels", {}).get("bm25_ms"),
             hars_low_confidence=hybrid.get("confidence", {}).get("low_confidence"),
             hars_total_ms=lb.get("total_ms"),
+            # Ground truth & derived metrics
+            expected_files=expected_files,
+            expected_chunks=expected_chunks,
+            file_recall_at_k=fl_recall,
+            file_ndcg=fl_ndcg,
+            file_mrr=fl_mrr,
+            chunk_coverage=cov,
         )
     except Exception as e:
         latency_s = time.monotonic() - start
@@ -304,6 +445,22 @@ def _print_summary(all_results: list[QueryResult]) -> None:
         jb_avg_recall = sum(r.keyword_recall for r in jb_ok) / len(jb_ok) if jb_ok else 0
         delta = hars_avg_recall - jb_avg_recall
         print(f"  {'Avg keyword recall':<40} {hars_avg_recall:<18.3f} {jb_avg_recall:<18.3f} {delta:<+18.3f}")
+
+    # File-level retrieval metrics (queries with ground truth)
+    hars_gt = [r for r in hars_ok if r.expected_files]
+    if hars_gt:
+        avg_file_recall = sum(r.file_recall_at_k for r in hars_gt if r.file_recall_at_k is not None) / len(hars_gt)
+        avg_file_ndcg = sum(r.file_ndcg for r in hars_gt if r.file_ndcg is not None) / len(hars_gt)
+        avg_file_mrr = sum(r.file_mrr for r in hars_gt if r.file_mrr is not None) / len(hars_gt)
+        print(f"  {'File recall@10 (GT queries)':<40} {avg_file_recall:<18.3f} {'N/A':>18} {'':<18}")
+        print(f"  {'File NDCG@10 (GT queries)':<40} {avg_file_ndcg:<18.3f} {'N/A':>18} {'':<18}")
+        print(f"  {'File MRR (GT queries)':<40} {avg_file_mrr:<18.3f} {'N/A':>18} {'':<18}")
+
+    # Chunk coverage (queries with both file and chunk ground truth)
+    hars_cov = [r for r in hars_gt if r.chunk_coverage is not None]
+    if hars_cov:
+        avg_cov = sum(r.chunk_coverage for r in hars_cov) / len(hars_cov)
+        print(f"  {'Chunk coverage (GT queries)':<40} {avg_cov:<18.3f} {'N/A':>18} {'':<18}")
 
     # Category breakdown table
     categories = [
@@ -437,19 +594,24 @@ async def main() -> None:
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            for i, (question, expected_keywords, domain) in enumerate(active_queries):
-                label = f"[{i+1}/{len(active_queries)}] {domain}"
+            for i, raw in enumerate(active_queries):
+                q = normalize_query(raw)
+                label = f"[{i+1}/{len(active_queries)}] {q.domain}"
                 print(f"\n  {label}")
 
                 # HARS
                 print(f"    HARS (hybrid) ... ", end="", flush=True)
-                hars_result = await _run_hars(session, question, expected_keywords, domain)
+                hars_result = await _run_hars(
+                    session, q.question, q.expected_keywords, q.domain,
+                    expected_files=q.expected_docs,
+                    expected_chunks=q.expected_chunks,
+                )
                 print(f"{'OK' if hars_result.ok else 'FAIL'} ({hars_result.latency_s:.1f}s, {hars_result.result_count} results)")
                 all_results.append(hars_result)
 
                 # jbcontext
                 print(f"    jbcontext  ... ", end="", flush=True)
-                jb_result = _run_jbcontext(question, expected_keywords, domain)
+                jb_result = _run_jbcontext(q.question, q.expected_keywords, q.domain)
                 print(f"{'OK' if jb_result.ok else 'FAIL'} ({jb_result.latency_s:.1f}s, {jb_result.result_count} results)")
                 all_results.append(jb_result)
 
