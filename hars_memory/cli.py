@@ -5,13 +5,11 @@ entry points (``memory-index`` / ``memory-mcp`` / ``memory-eval-battle`` in
 ``pyproject.toml``) — unchanged, kept working exactly as before (``memory-mcp``
 in particular: the MCP server is live and other agents depend on it).
 
-``main`` is the new unified ``memory`` console script (``memory <subcommand>``),
-covering the LLM-free ``tools/memory/corpus`` build/query/eval/regress
-pipeline. It imports every heavier dependency (corpus/eval/regression
-modules) lazily, INSIDE each subcommand handler, not at module scope — so
-`memory --help`, `memory-mcp`, `memory-index` etc. never pay an import cost
-for subsystems they don't use, mirroring the existing lazy-import pattern
-already used by ``mcp_main`` below.
+``main`` is the unified ``memory`` console script (``memory <subcommand>``),
+covering servers (MCP, HTTP, gRPC), LightRAG knowledge graph recall, corpus
+build/query/eval/regress, and incremental reindex. It imports every heavier
+dependency lazily, INSIDE each subcommand handler, not at module scope — so
+`memory --help` never pays an import cost for subsystems it doesn't use.
 """
 
 from __future__ import annotations
@@ -211,10 +209,147 @@ def _cmd_strategy_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_recall(args: argparse.Namespace) -> int:
+    """Query the LightRAG knowledge graph via CLI."""
+    import asyncio
+
+    from hars_memory.mcp_server import (
+        DEFAULT_QUERY_TOP_K,
+        _compute_hybrid_block,
+        _get_rag,
+        _lightrag_mode,
+        _resolve_fetch_top_k,
+        _resolve_query_mode,
+        _staleness_info,
+        STALE_INDEX_WARNING_DAYS,
+    )
+
+    question = args.question
+    mode = args.mode or "hybrid"
+    rag_mode = _lightrag_mode(mode)
+    top_k = args.top_k or DEFAULT_QUERY_TOP_K
+    ll_keywords = list(args.ll_keywords) if args.ll_keywords else []
+    hl_keywords = list(args.hl_keywords) if args.hl_keywords else []
+    kw_args = {"ll_keywords": ll_keywords, "hl_keywords": hl_keywords} if (ll_keywords or hl_keywords) else {}
+    rag_mode, mode_fallback = _resolve_query_mode(rag_mode, ll_keywords, hl_keywords)
+
+    async def _run() -> dict:
+        rag = await _get_rag()
+        hybrid_block = await _compute_hybrid_block(rag, question, top_k, ll_keywords)
+        if args.context_only:
+            result = await rag.aquery(question, mode=rag_mode, top_k=top_k, **kw_args)
+        else:
+            result = await rag.aquery_llm(question, mode=rag_mode, top_k=top_k, **kw_args)
+        return {
+            "result": result,
+            "hybrid": hybrid_block,
+            "mode": rag_mode,
+            "mode_fallback": mode_fallback,
+        }
+
+    try:
+        data = asyncio.run(_run())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    last_ingest, stale_days = _staleness_info()
+    staleness_warning = None
+    if stale_days is not None and stale_days > STALE_INDEX_WARNING_DAYS:
+        staleness_warning = (
+            f"Knowledge graph last ingested {last_ingest} ({stale_days} days ago); "
+            "anything added or changed after that date is absent from this response."
+        )
+
+    if args.json:
+        payload = {
+            "ok": True,
+            "mode": data["mode"],
+            "mode_fallback": data["mode_fallback"],
+            "question": question,
+            "top_k": top_k,
+            "last_ingest": last_ingest,
+            "stale_days": stale_days,
+            "staleness_warning": staleness_warning,
+            "hybrid": data["hybrid"],
+            "result": str(data["result"]) if not isinstance(data["result"], dict) else data["result"],
+        }
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(f"mode: {data['mode']}")
+        if data["mode_fallback"]:
+            print(f"mode_fallback: {data['mode_fallback']}")
+        if staleness_warning:
+            print(f"WARNING: {staleness_warning}")
+        hybrid = data["hybrid"]
+        if hybrid.get("enabled", True):
+            chunks = hybrid.get("fused_chunks", [])
+            print(f"hybrid: {len(chunks)} fused chunks, {len(hybrid.get('identifier_matches', []))} identifier matches")
+        raw = data["result"]
+        if isinstance(raw, str):
+            print(raw)
+        elif isinstance(raw, dict):
+            print(raw.get("response", json.dumps(raw, default=str)))
+        else:
+            print(str(raw))
+
+    return 0
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Start the MCP server (stdio)."""
+    mcp_main()
+    return 0
+
+
+def _cmd_server(args: argparse.Namespace) -> int:
+    """Start the HTTP index-job service."""
+    host = args.host or "127.0.0.1"
+    port = args.port or 8787
+    import os
+
+    os.environ.setdefault("HARS_MEMORY_SERVICE_HOST", host)
+    os.environ.setdefault("HARS_MEMORY_SERVICE_PORT", str(port))
+    from hars_memory.service.server import main as server_main
+
+    server_main()
+    return 0
+
+
+def _cmd_grpc(args: argparse.Namespace) -> int:
+    """Start the gRPC server."""
+    host = args.host
+    port = args.port
+    if host:
+        import os as _os
+
+        _os.environ["HARS_MEMORY_GRPC_HOST"] = host
+    if port:
+        import os as _os
+
+        _os.environ["HARS_MEMORY_GRPC_PORT"] = str(port)
+    grpc_main()
+    return 0
+
+
+def _cmd_consolidate(args: argparse.Namespace) -> int:
+    """Trigger incremental reindex."""
+    if args.paths:
+        import os as _os
+
+        _os.environ["HARS_MEMORY_INDEX_PATHS"] = " ".join(args.paths)
+    if args.dry_run:
+        import os as _os
+
+        _os.environ["HARS_MEMORY_INDEX_DRY_RUN"] = "1"
+    index_main()
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memory",
-        description="LLM-free, CPU-only corpus build/query/eval subsystem for tools/memory.",
+        description="Unified CLI for hars-longterm-memory: query, servers, corpus management, evaluation.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -277,6 +412,35 @@ def _build_parser() -> argparse.ArgumentParser:
     strategy_p.add_argument("--config", required=True, type=Path)
     strategy_p.add_argument("--run-id", default=None)
     strategy_p.set_defaults(func=_cmd_strategy_bench)
+
+    # -- Servers --
+    recall_p = sub.add_parser("recall", help="Query the LightRAG knowledge graph.")
+    recall_p.add_argument("question", help="Natural language query")
+    recall_p.add_argument("--mode", choices=("local", "global", "hybrid", "naive"), default="hybrid")
+    recall_p.add_argument("--top-k", type=int, default=20)
+    recall_p.add_argument("--context-only", action="store_true", default=True)
+    recall_p.add_argument("--json", action="store_true", help="Output raw JSON")
+    recall_p.add_argument("--ll-keywords", nargs="*", default=None)
+    recall_p.add_argument("--hl-keywords", nargs="*", default=None)
+    recall_p.set_defaults(func=_cmd_recall)
+
+    mcp_p = sub.add_parser("mcp", help="Start the MCP server (stdio).")
+    mcp_p.set_defaults(func=_cmd_mcp)
+
+    server_p = sub.add_parser("server", help="Start the HTTP index-job service.")
+    server_p.add_argument("--host", default="127.0.0.1")
+    server_p.add_argument("--port", type=int, default=8787)
+    server_p.set_defaults(func=_cmd_server)
+
+    grpc_p = sub.add_parser("grpc", help="Start the gRPC server.")
+    grpc_p.add_argument("--host", default=None)
+    grpc_p.add_argument("--port", type=int, default=None)
+    grpc_p.set_defaults(func=_cmd_grpc)
+
+    consolidate_p = sub.add_parser("consolidate", help="Trigger incremental reindex.")
+    consolidate_p.add_argument("--paths", nargs="*", default=[".plans", "docs"])
+    consolidate_p.add_argument("--dry-run", action="store_true", default=True)
+    consolidate_p.set_defaults(func=_cmd_consolidate)
 
     return parser
 
