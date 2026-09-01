@@ -119,6 +119,56 @@ class TestDetectDeletedDocuments:
 
 
 class TestApplyRefreshChangedGarbageCollection:
+    def test_partial_walk_skips_gc_and_preserves_fingerprints(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        fp_path = tmp_path / "fp.json"
+        seed = FingerprintStore(path=fp_path)
+        for i in range(10):
+            seed.set(f"file:{i}", compute_fingerprint(f"body {i}"))
+        seed.save()
+
+        rag = _FakeRag()
+        store = asyncio.run(
+            index_module._apply_refresh_changed(
+                rag,
+                [_doc("file:0", "body 0")],
+                refresh_changed=True,
+                fingerprint_store_path=fp_path,
+            )
+        )
+
+        assert rag.deleted == []
+        assert store is not None
+        assert store.keys() == frozenset(f"file:{i}" for i in range(10))
+        assert "Skipping deleted-document GC" in caplog.text
+        assert "--paths may be narrowed" in caplog.text
+
+    def test_partial_walk_still_refreshes_changed_documents(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        fp_path = tmp_path / "fp.json"
+        seed = FingerprintStore(path=fp_path)
+        seed.set("file:changed", compute_fingerprint("old"))
+        for i in range(9):
+            seed.set(f"file:omitted-{i}", compute_fingerprint(f"body {i}"))
+        seed.save()
+
+        rag = _FakeRag()
+        store = asyncio.run(
+            index_module._apply_refresh_changed(
+                rag,
+                [_doc("file:changed", "new")],
+                refresh_changed=True,
+                fingerprint_store_path=fp_path,
+            )
+        )
+
+        assert rag.deleted == ["file:changed"]
+        assert store is not None
+        assert store.get("file:omitted-0") == compute_fingerprint("body 0")
+        assert "Skipping deleted-document GC" in caplog.text
+
     def test_deleted_docs_are_deleted_from_the_index(self, tmp_path: Path) -> None:
         fp_path = tmp_path / "fp.json"
         seed = FingerprintStore(path=fp_path)
@@ -186,6 +236,7 @@ class TestApplyRefreshChangedGarbageCollection:
         fp_path = tmp_path / "fp.json"
         seed = FingerprintStore(path=fp_path)
         seed.set("file:gone", compute_fingerprint("gone"))
+        seed.set("file:kept", compute_fingerprint("kept"))
         seed.save()
 
         cache_dir = tmp_path / "bm25_cache"
@@ -196,7 +247,7 @@ class TestApplyRefreshChangedGarbageCollection:
         asyncio.run(
             index_module._apply_refresh_changed(
                 _FakeRag(),
-                [],
+                [_doc("file:kept", "kept")],
                 refresh_changed=True,
                 fingerprint_store_path=fp_path,
             )
@@ -210,6 +261,7 @@ class TestApplyRefreshChangedGarbageCollection:
         fp_path = tmp_path / "fp.json"
         seed = FingerprintStore(path=fp_path)
         seed.set("file:gone", compute_fingerprint("gone"))
+        seed.set("file:kept", compute_fingerprint("kept"))
         seed.save()
 
         # Relative path -> BM25CacheDirNotAbsoluteError inside invalidate_cache.
@@ -219,7 +271,7 @@ class TestApplyRefreshChangedGarbageCollection:
         asyncio.run(
             index_module._apply_refresh_changed(
                 rag,
-                [],
+                [_doc("file:kept", "kept")],
                 refresh_changed=True,
                 fingerprint_store_path=fp_path,
             )

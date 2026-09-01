@@ -73,6 +73,10 @@ _MEMORY_DIR_ENV: Final[str] = "HARS_MEMORY_CLAUDE_MEMORY_DIR"
 # invalidates exactly the cache the query server will read.
 _BM25_CACHE_DIR_ENV: Final[str] = "HARS_MEMORY_BM25_CACHE_DIR"
 _BM25_CACHE_DIR_NAME: Final[str] = "bm25_cache"
+# A walk containing less than half of the previously fingerprinted corpus is
+# more likely to be a narrowed --paths refresh than a complete scan. In that
+# case deletion GC is fail-safe disabled; changed-document refresh still runs.
+_DELETION_GC_MIN_CURRENT_RATIO: Final[float] = 0.5
 
 
 def _parse_args() -> argparse.Namespace:
@@ -194,7 +198,10 @@ async def _apply_refresh_changed(
     Safety contract: when *refresh_changed* is False (the default), this is a
     strict no-op — the fingerprint sidecar is never read or written, and
     ``rag.adelete_by_doc_id`` is never called. A normal `index.py` run can
-    never trigger a delete via this path.
+    never trigger a delete via this path. When the current walk contains less
+    than half of the previously fingerprinted document ids, deletion GC is
+    skipped as a likely narrowed ``--paths`` invocation; changed-document
+    refresh is still performed.
     """
     if not refresh_changed:
         logger.info(
@@ -204,6 +211,18 @@ async def _apply_refresh_changed(
         return None
 
     store = FingerprintStore.load(fingerprint_store_path)
+    # ``detect_changed_documents`` removes absent ids from the in-memory
+    # store. Keep their values so a suspicious partial walk can put them back
+    # before the caller persists the store.
+    previous_fingerprints = {
+        doc_id: store.get(doc_id) for doc_id in store.keys()
+    }
+    previous_doc_count = len(previous_fingerprints)
+    current_doc_ids = {doc.doc_id for doc in all_docs}
+    partial_walk = (
+        previous_doc_count > 0
+        and len(current_doc_ids) < previous_doc_count * _DELETION_GC_MIN_CURRENT_RATIO
+    )
     report = detect_changed_documents(all_docs, store)
     logger.info(
         "Fingerprint check (%s): %d changed, %d unchanged, %d with no stored "
@@ -222,12 +241,31 @@ async def _apply_refresh_changed(
     # Nothing reinserts them, so without this their entities, chunks and
     # vectors survive in the graph indefinitely and keep surfacing as
     # retrieval hits for content that does not exist any more.
-    if report.deleted_doc_ids:
+    deleted_doc_ids = report.deleted_doc_ids
+    if partial_walk and deleted_doc_ids:
+        logger.warning(
+            "Skipping deleted-document GC: current walk contains %d unique "
+            "document(s), below %.0f%% of %d fingerprinted document(s). "
+            "--paths may be narrowed; run a full walk before enabling deletion GC.",
+            len(current_doc_ids),
+            _DELETION_GC_MIN_CURRENT_RATIO * 100,
+            previous_doc_count,
+        )
+        # Preserve the omitted documents in the sidecar. Otherwise the normal
+        # post-insert save would turn a safe GC skip into permanent data loss
+        # in the fingerprint store.
+        for doc_id in deleted_doc_ids:
+            fingerprint = previous_fingerprints.get(doc_id)
+            if fingerprint is not None:
+                store.set(doc_id, fingerprint)
+        deleted_doc_ids = ()
+
+    if deleted_doc_ids:
         logger.info(
             "Garbage-collecting %d deleted document(s) from the index",
-            len(report.deleted_doc_ids),
+            len(deleted_doc_ids),
         )
-        for doc_id in report.deleted_doc_ids:
+        for doc_id in deleted_doc_ids:
             logger.info("Deleting removed document doc_id=%s (no reinsert)", doc_id)
             await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
         _invalidate_bm25_cache()
