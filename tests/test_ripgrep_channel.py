@@ -390,14 +390,29 @@ class TestScoreFormula:
             code_file, roots
         )
 
-    def test_path_type_weight_for_memory_dir_root(self, tmp_path: Path) -> None:
+    def test_path_type_weight_for_memory_dir_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         project_root = tmp_path / "project"
         memory_dir = tmp_path / "claude_memory"
         memory_file = memory_dir / "note.md"
         roots = [project_root, memory_dir]
+        monkeypatch.setenv(rgc.HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, str(memory_dir))
         assert rgc._path_type_weight(memory_file, roots) == pytest.approx(
             rgc._MEMORY_DIR_PATH_WEIGHT
         )
+
+    def test_extra_manifest_roots_do_not_get_the_memory_dir_bonus(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a knowledge-source manifest `roots` holds many curated roots;
+        only the configured memory dir may claim the memory-dir weight."""
+        kb_root = tmp_path / "kb"
+        learning_root = tmp_path / "learning"
+        monkeypatch.delenv(rgc.HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, raising=False)
+        assert rgc._path_type_weight(
+            learning_root / "note.md", [kb_root, learning_root]
+        ) == pytest.approx(rgc._DEFAULT_PATH_WEIGHT)
 
 
 class TestGlobConventionsMatchWalker:

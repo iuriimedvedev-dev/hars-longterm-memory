@@ -401,11 +401,19 @@ async def main() -> None:
         "HARS_MEMORY_VECTOR_STORAGE": "NanoVectorDBStorage",
         "HARS_MEMORY_GRAPH_STORAGE": "NetworkXStorage",
         "HARS_MEMORY_EMBED_LOCAL_FILES_ONLY": "1",
-        "HARS_MEMORY_RIPGREP_ROOTS": str(KB_ROOT),
+        # Search roots come from the knowledge repository's own manifest, not
+        # from a blanket "the whole checkout" root: the latter walked repos/
+        # (912M) and node_modules/, costing ~0.7s per rg invocation while
+        # covering less curated knowledge than the manifest's grep roots do.
+        "HARS_MEMORY_SOURCES_MANIFEST": os.environ.get(
+            "HARS_MEMORY_SOURCES_MANIFEST", str(KB_ROOT / "knowledge-sources.yaml")
+        ),
         "HARS_MEMORY_RERANK_MODEL": os.environ.get("HARS_MEMORY_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
         "HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER": os.environ.get("HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER", "2.0"),
     })
     mcp_env.pop("HARS_MEMORY_GPU_GUARD_SCRIPT_PATH", None)
+    # An inherited explicit roots list would override the manifest set above.
+    mcp_env.pop("HARS_MEMORY_RIPGREP_ROOTS", None)
 
     executable = Path(sys.executable).parent / "hars-longterm-memory-mcp"
     if not executable.exists():

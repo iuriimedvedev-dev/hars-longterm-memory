@@ -456,20 +456,25 @@ def default_roots(
     memory_dir_env: str = HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV,
 ) -> list[Path]:
     """Default search roots: read from `roots_env` (comma-separated absolute
-    paths — see module-level `HARS_MEMORY_RIPGREP_ROOTS_ENV` docstring) plus
-    the optional Claude memory dir, mirroring
-    `server/index.py::_resolve_ingest_paths`'s "append unconditionally if
-    set, dedupe" behaviour.
+    paths — see module-level `HARS_MEMORY_RIPGREP_ROOTS_ENV` docstring), or,
+    when that is unset, from the knowledge-source manifest's `grep: true`
+    entries (`ingest/sources.py`) — the same maintained list the indexer reads,
+    so a newly added knowledge directory is searchable without configuring it
+    twice. The optional Claude memory dir is appended on top either way,
+    mirroring `server/index.py::_resolve_ingest_paths`'s "append
+    unconditionally if set, dedupe" behaviour.
 
-    Returns `[]` when `roots_env` is unset/empty — there is no meaningful
-    default search root for an installed package (no "project root" to guess
-    at). An empty return here is the signal `search()` uses to report the
-    channel as unavailable rather than silently falling back to whatever a
-    bare `rg` invocation with no path arguments would search (the process's
-    own cwd) — see `search()`'s empty-roots handling.
+    Returns `[]` when neither is configured — there is no meaningful default
+    search root for an installed package (no "project root" to guess at). An
+    empty return here is the signal `search()` uses to report the channel as
+    unavailable rather than silently falling back to whatever a bare `rg`
+    invocation with no path arguments would search (the process's own cwd) —
+    see `search()`'s empty-roots handling.
     """
     raw = os.environ.get(roots_env, "").strip()
     roots = [Path(p.strip()).resolve() for p in raw.split(",") if p.strip()]
+    if not roots:
+        roots = _manifest_grep_roots()
 
     memory_dir_raw = os.environ.get(memory_dir_env, "").strip()
     if memory_dir_raw:
@@ -477,6 +482,22 @@ def default_roots(
         if memory_dir not in roots:
             roots.append(memory_dir)
     return roots
+
+
+def _manifest_grep_roots() -> list[Path]:
+    """`grep: true` roots from the knowledge-source manifest, or `[]`.
+
+    Imported lazily and failure-tolerantly: this channel is one optional
+    retrieval input, and a malformed manifest must degrade it to "no roots"
+    (channel reported unavailable) rather than break query serving.
+    """
+    try:
+        from hars_memory.ingest.sources import grep_roots
+
+        return grep_roots()
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning("ripgrep_channel: knowledge-source manifest unusable: %s", exc)
+        return []
 
 
 def _build_rg_command(
@@ -539,15 +560,20 @@ def _is_whole_token_match(line_text: str, start: int, end: int) -> bool:
 
 def _path_type_weight(file_path: Path, roots: list[Path]) -> float:
     """Mild score multiplier by which search root / section the file lives
-    under — see module docstring "Scoring". `roots[1:]` (anything appended
-    beyond the project root, i.e. the memory dir) gets the memory-dir
-    weight; otherwise checked by matching a path component name against
-    `_PATH_TYPE_WEIGHTS`.
+    under — see module docstring "Scoring". A file under the configured Claude
+    memory dir gets the memory-dir weight; otherwise checked by matching a path
+    component name against `_PATH_TYPE_WEIGHTS`.
+
+    The memory dir is identified by its env var rather than by position in
+    `roots`: with a knowledge-source manifest `roots` legitimately holds many
+    curated roots, and treating every non-first one as "the memory dir" would
+    hand the memory-dir bonus to almost the whole corpus.
     """
-    if len(roots) > 1 and any(
-        _is_relative_to(file_path, extra_root) for extra_root in roots[1:]
-    ):
-        return _MEMORY_DIR_PATH_WEIGHT
+    memory_dir_raw = os.environ.get(HARS_MEMORY_CLAUDE_MEMORY_DIR_ENV, "").strip()
+    if memory_dir_raw:
+        memory_dir = Path(memory_dir_raw).resolve()
+        if memory_dir in roots and _is_relative_to(file_path, memory_dir):
+            return _MEMORY_DIR_PATH_WEIGHT
     for part in file_path.parts:
         if part in _PATH_TYPE_WEIGHTS:
             return _PATH_TYPE_WEIGHTS[part]
