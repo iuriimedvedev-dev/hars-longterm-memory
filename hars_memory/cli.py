@@ -346,6 +346,125 @@ def _cmd_consolidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_size(num_bytes: int) -> str:
+    """Human-readable byte size, e.g. 1536 -> '1.5 KB'."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+
+def _resolve_index_dir(cli_value: str | None) -> Path:
+    """Resolve the index directory from --index-dir or $HARS_MEMORY_INDEX_DIR."""
+    import os
+
+    raw = cli_value or os.environ.get("HARS_MEMORY_INDEX_DIR")
+    if not raw:
+        raise SystemExit(
+            "error: no index directory specified "
+            "(use --index-dir or set HARS_MEMORY_INDEX_DIR)"
+        )
+    return Path(raw).expanduser()
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    """Pack the LightRAG index directory into a tar.gz archive."""
+    import io
+    import json
+    import tarfile
+    from datetime import datetime, timezone
+
+    index_dir = _resolve_index_dir(args.index_dir)
+    if not index_dir.is_dir():
+        print(f"error: index directory not found: {index_dir}", file=sys.stderr)
+        return 1
+
+    output = Path(args.output).expanduser()
+    if output.is_dir():
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output = output / f"hars-index-{timestamp}.tar.gz"
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(p for p in index_dir.rglob("*") if p.is_file())
+    total_bytes = sum(p.stat().st_size for p in files)
+    meta = {
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_dir": str(index_dir),
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+    }
+
+    with tarfile.open(output, "w:gz") as tar:
+        for path in files:
+            arcname = path.relative_to(index_dir)
+            tar.add(path, arcname=str(arcname))
+
+        meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+        meta_info = tarfile.TarInfo(name=".export_meta.json")
+        meta_info.size = len(meta_bytes)
+        tar.addfile(meta_info, io.BytesIO(meta_bytes))
+
+    size = output.stat().st_size
+    print(f"Exported: {output} ({_format_size(size)})")
+    return 0
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    """Unpack a tar.gz archive into the target LightRAG index directory."""
+    import shutil
+    import tarfile
+
+    archive = Path(args.archive).expanduser()
+    if not archive.is_file():
+        print(f"error: archive not found: {archive}", file=sys.stderr)
+        return 1
+
+    index_dir = _resolve_index_dir(args.index_dir)
+
+    if index_dir.exists() and any(index_dir.iterdir()) and not args.force:
+        print(
+            f"error: target index directory is not empty: {index_dir} "
+            "(use --force to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        tar = tarfile.open(archive, "r:gz")
+    except (tarfile.ReadError, tarfile.CompressionError, OSError) as exc:
+        print(f"error: cannot read archive (not a valid tar.gz): {exc}", file=sys.stderr)
+        return 1
+
+    with tar:
+        names = tar.getnames()
+        has_meta = ".export_meta.json" in names
+        has_kv = any(n.startswith("kv_store_") for n in names)
+        if not has_meta and not has_kv:
+            print(
+                "error: archive does not look like a valid hars-memory index export "
+                "(missing .export_meta.json and kv_store_* files)",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.force and index_dir.exists():
+            shutil.rmtree(index_dir)
+        index_dir.mkdir(parents=True, exist_ok=True)
+
+        tar.extractall(path=index_dir)
+
+    extracted_meta = index_dir / ".export_meta.json"
+    if extracted_meta.exists():
+        extracted_meta.unlink()
+
+    file_count = sum(1 for p in index_dir.rglob("*") if p.is_file())
+    print(f"Imported: {archive} -> {index_dir} ({file_count} files)")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memory",
@@ -441,6 +560,24 @@ def _build_parser() -> argparse.ArgumentParser:
     consolidate_p.add_argument("--paths", nargs="*", default=[".plans", "docs"])
     consolidate_p.add_argument("--dry-run", action="store_true", default=True)
     consolidate_p.set_defaults(func=_cmd_consolidate)
+
+    # -- Export/Import --
+    export_p = sub.add_parser("export", help="Export index to a tar.gz archive.")
+    export_p.add_argument("output", help="Output archive path (or directory)")
+    export_p.add_argument(
+        "--index-dir", default=None,
+        help="Index directory to export (default: $HARS_MEMORY_INDEX_DIR)",
+    )
+    export_p.set_defaults(func=_cmd_export)
+
+    import_p = sub.add_parser("import", help="Import index from a tar.gz archive.")
+    import_p.add_argument("archive", help="Archive file to import")
+    import_p.add_argument(
+        "--index-dir", default=None,
+        help="Target index directory (default: $HARS_MEMORY_INDEX_DIR)",
+    )
+    import_p.add_argument("--force", action="store_true", help="Overwrite existing index")
+    import_p.set_defaults(func=_cmd_import)
 
     return parser
 

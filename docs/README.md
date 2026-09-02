@@ -32,6 +32,8 @@ The `memory` command provides a unified interface for all subsystems:
 | `memory regress` | Compare two eval reports |
 | `memory status` | Print corpus manifest summary |
 | `memory consolidate` | Trigger incremental reindex |
+| `memory export <output>` | Export index to a tar.gz archive |
+| `memory import <archive>` | Import index from a tar.gz archive |
 | `memory strategy-bench` | Run strategy matrix benchmark |
 
 Examples:
@@ -48,6 +50,10 @@ memory grpc --port 8788
 # Corpus management
 memory build --paths kb/ --index-dir /tmp/my-index
 memory query --index-dir /tmp/my-index --question "how to deploy?"
+
+# Export/import index
+memory export /tmp/hars-index-backup.tar.gz
+memory import /tmp/hars-index-backup.tar.gz --index-dir /tmp/new-index
 ```
 
 Legacy entrypoints (`memory-index`, `memory-mcp`, `memory-grpc`, `hars-longterm-memory-server`, etc.) remain available for backward compatibility.
