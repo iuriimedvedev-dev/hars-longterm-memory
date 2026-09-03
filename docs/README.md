@@ -34,6 +34,7 @@ The `memory` command provides a unified interface for all subsystems:
 | `memory consolidate` | Trigger incremental reindex |
 | `memory export <output>` | Export index to a tar.gz archive |
 | `memory import <archive>` | Import index from a tar.gz archive |
+| `memory estimate-cost <paths>` | Estimate indexing cost before running (dry-run, no API calls) |
 | `memory strategy-bench` | Run strategy matrix benchmark |
 
 Examples:
@@ -54,6 +55,10 @@ memory query --index-dir /tmp/my-index --question "how to deploy?"
 # Export/import index
 memory export /tmp/hars-index-backup.tar.gz
 memory import /tmp/hars-index-backup.tar.gz --index-dir /tmp/new-index
+
+# Estimate cost before indexing
+memory estimate-cost kb/ --model gpt-5.6-luna --chunk-size 2048 --batch-size 256
+memory estimate-cost kb/ --model deepseek-v3.2 --max-gleaning 1
 ```
 
 Legacy entrypoints (`memory-index`, `memory-mcp`, `memory-grpc`, `hars-longterm-memory-server`, etc.) remain available for backward compatibility.
