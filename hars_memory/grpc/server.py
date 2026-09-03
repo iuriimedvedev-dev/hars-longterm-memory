@@ -37,7 +37,6 @@ from hars_memory.mcp_server import (  # noqa: PLC2701
     _get_graph,
     _get_rag,
     _graph_file_path,
-    _has_graph_entity_context,
     _index_status,
     _lightrag_mode,
     _normalize_entity_text,
@@ -57,8 +56,6 @@ from hars_memory.mcp_server import (  # noqa: PLC2701
     HARS_MEMORY_INDEX_DIR,
     HARS_MEMORY_STAGING_DIR,
     LLM_RESPONSE_TYPE,
-    NAIVE_FALLBACK_MODE,
-    STALE_INDEX_WARNING_DAYS,
     SUBGRAPH_MAX_HOPS,
     _QUERY_MODEL_LOCK,
     _merge_context_with_fusion,
@@ -123,9 +120,6 @@ class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
             query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
 
             if context_only:
-                import time as _time  # noqa: PLC0415
-
-                graph_start = _time.monotonic()
                 context_str = await asyncio.wait_for(
                     rag.aquery(  # type: ignore[attr-defined]
                         question,
@@ -640,7 +634,7 @@ async def _serve() -> None:
 
     # Add the standard gRPC health checking service
     grpc_health = _HealthServicer()
-    from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: PLC0415
+    from grpc_health.v1 import health_pb2_grpc  # noqa: PLC0415
 
     health_pb2_grpc.add_HealthServicer_to_server(grpc_health, server)  # type: ignore[attr-defined]
 

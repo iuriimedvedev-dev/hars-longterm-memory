@@ -5,13 +5,10 @@ from __future__ import annotations
 import json
 import os
 import socket
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import anyio
-import httpx
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client

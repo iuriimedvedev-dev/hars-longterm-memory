@@ -117,13 +117,13 @@ def test_out_of_domain_low_confidence(question: str, domain: str, tmp_path: Path
     else:
         # Hallucination — memory answered confidently but shouldn't have
         citations = result.get("citations", [])
-        print(f"  ⚠️  Memory answered confidently — possible hallucination:")
+        print("  ⚠️  Memory answered confidently — possible hallucination:")
         print(f"  Answer: {answer_text[:200]}")
         print(f"  Citations: {len(citations)}")
         # Soft fail — log but don't assert (the LLM may still give a reasonable answer
         # from its own knowledge, which is not necessarily a memory problem)
         if len(citations) == 0:
-            print(f"  (No citations — answer is from LLM knowledge, not memory)")
+            print("  (No citations — answer is from LLM knowledge, not memory)")
         pytest.fail(
             f"Memory did not refuse or flag as low-confidence for out-of-domain query "
             f"'{domain}'. Answer: {answer_text[:200]}"

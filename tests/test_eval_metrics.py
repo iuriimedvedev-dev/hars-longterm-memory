@@ -311,15 +311,18 @@ class TestHardQueryFixture:
 
     def test_exactly_100_entries(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+
         assert len(KB_QUERIES_HARD_100) == 100
 
     def test_all_entries_are_3tuple_or_4tuple(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+
         for raw in KB_QUERIES_HARD_100:
             assert len(raw) in (3, 4), f"Unexpected tuple length {len(raw)}"
 
     def test_98_entries_are_3tuple_2_entries_are_4tuple(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+
         count_3 = sum(1 for q in KB_QUERIES_HARD_100 if len(q) == 3)
         count_4 = sum(1 for q in KB_QUERIES_HARD_100 if len(q) == 4)
         assert count_3 == 98
@@ -327,6 +330,7 @@ class TestHardQueryFixture:
 
     def test_no_duplicate_ood_entries(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+
         domains = [q[2] for q in KB_QUERIES_HARD_100]
         assert domains.count("ood-biology-crispr") == 1
 
@@ -337,24 +341,26 @@ class TestHardQueryFixture:
     def test_expected_docs_paths_exist_on_disk(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
         import os
-        KB_ROOT = "/Users/iurii.medvedev/Work/sre-support-pier"
+
+        kb_root = os.environ.get("HARS_MEMORY_EVAL_KB_ROOT")
+        if not kb_root:
+            pytest.skip("HARS_MEMORY_EVAL_KB_ROOT is not configured")
         for raw in KB_QUERIES_HARD_100:
             if len(raw) == 4:
                 _, _, _, docs = raw
                 for d in docs:
-                    assert os.path.isfile(os.path.join(KB_ROOT, d)), (
+                    assert os.path.isfile(os.path.join(kb_root, d)), (
                         f"Ground-truth path does not exist: {d}"
                     )
 
     def test_expected_docs_paths_are_kb_relative(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
+
         for raw in KB_QUERIES_HARD_100:
             if len(raw) == 4:
                 _, _, _, docs = raw
                 for d in docs:
-                    assert d.startswith("kb/"), (
-                        f"Expected doc path should start with kb/: {d}"
-                    )
+                    assert d.startswith("kb/"), f"Expected doc path should start with kb/: {d}"
 
     # ------------------------------------------------------------------ #
     # Path canonicalization
@@ -362,6 +368,7 @@ class TestHardQueryFixture:
 
     def test_canonicalize_strips_project_root(self) -> None:
         from tests.e2e.bench_compare import _canonicalize_retrieved_path
+
         result = _canonicalize_retrieved_path(
             "/Users/iurii.medvedev/Work/sre-support-pier/kb/k8s/credential-rotation-controller/readme.md"
         )
@@ -369,15 +376,15 @@ class TestHardQueryFixture:
 
     def test_canonicalize_passes_flat_name_through(self) -> None:
         from tests.e2e.bench_compare import _canonicalize_retrieved_path
-        result = _canonicalize_retrieved_path(
-            "k8s-credential-rotation-controller-readme.md"
-        )
+
+        result = _canonicalize_retrieved_path("k8s-credential-rotation-controller-readme.md")
         assert result == "k8s-credential-rotation-controller-readme.md"
 
     def test_canonicalize_matches_fixture_path(self) -> None:
         """After canonicalization, a retrieved absolute path should match
         the fixture's kb/-relative expected_doc path."""
         from tests.e2e.bench_compare import _canonicalize_retrieved_path
+
         fixture_path = "kb/k8s/credential-rotation-controller/readme.md"
         retrieved_path = "/Users/iurii.medvedev/Work/sre-support-pier/kb/k8s/credential-rotation-controller/readme.md"
         assert _canonicalize_retrieved_path(retrieved_path) == fixture_path
@@ -388,6 +395,7 @@ class TestHardQueryFixture:
 
     def test_normalize_query_3tuple(self) -> None:
         from tests.e2e.bench_compare import normalize_query
+
         q = normalize_query(("question", ["kw"], "domain"))
         assert q.question == "question"
         assert q.expected_keywords == ["kw"]
@@ -396,18 +404,21 @@ class TestHardQueryFixture:
 
     def test_normalize_query_4tuple(self) -> None:
         from tests.e2e.bench_compare import normalize_query
+
         q = normalize_query(("question", ["kw"], "domain", ["kb/doc.md"]))
         assert q.question == "question"
         assert q.expected_docs == ["kb/doc.md"]
 
     def test_normalize_query_4tuple_with_empty_docs(self) -> None:
         from tests.e2e.bench_compare import normalize_query
+
         q = normalize_query(("question", ["kw"], "domain", []))
         assert q.expected_docs == []
 
     def test_normalize_query_all_100_entries(self) -> None:
         from tests.e2e.fixtures.kb_queries_hard_100 import KB_QUERIES_HARD_100
         from tests.e2e.bench_compare import normalize_query
+
         for raw in KB_QUERIES_HARD_100:
             q = normalize_query(raw)
             assert q.question

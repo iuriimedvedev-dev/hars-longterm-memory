@@ -13,7 +13,7 @@ import json
 from typing import Any
 
 import grpc
-from google.protobuf import empty_pb2, json_format, struct_pb2
+from google.protobuf import empty_pb2, struct_pb2
 
 from hars_memory.grpc import hars_memory_pb2 as pb2
 from hars_memory.grpc import hars_memory_pb2_grpc as pb2_grpc

@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from hars_memory.ingest.change_detection import FingerprintStore, compute_fingerprint
+from hars_memory.ingest.change_detection import FingerprintStore
 
 
 # ---------------------------------------------------------------------------
