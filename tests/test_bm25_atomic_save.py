@@ -67,7 +67,10 @@ class TestAtomicSave:
         save_index(index, str(cache_dir))
         save_index(index, str(cache_dir))  # overwrite an existing published dir
 
-        assert [p.name for p in cache_parent.iterdir()] == ["bm25_cache"]
+        assert sorted(p.name for p in cache_parent.iterdir()) == [
+            ".bm25_cache.lock",
+            "bm25_cache",
+        ]
         assert load_index(str(cache_dir)) is not None
 
     def test_failed_save_leaves_previous_index_intact(
@@ -98,9 +101,7 @@ class TestAtomicSave:
         assert reloaded is not None
         assert reloaded.chunk_ids == first.chunk_ids
 
-    def test_reader_never_sees_partial_publication(
-        self, working_dir: Path, tmp_path: Path
-    ) -> None:
+    def test_reader_never_sees_partial_publication(self, working_dir: Path, tmp_path: Path) -> None:
         """Concurrent `load_index` during a `save_index` must observe either
         the old complete index or the new complete one — never a mix.
         """

@@ -20,11 +20,9 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
 
 from hars_memory.eval.metrics import ndcg_at_k, reciprocal_rank
 
@@ -306,7 +304,6 @@ async def _run_hars(
         # Each expected file is counted at most once, regardless of how many
         # format variants match.
         exp_files = expected_files or []
-        exp_chunks_set = set(expected_chunks) if expected_chunks else set()
         deduped_files = list(dict.fromkeys(files))  # preserve order, remove dupes
         # Count how many expected files have at least one match in the top-k
         # retrieved files.
@@ -501,7 +498,7 @@ def _print_summary(all_results: list[QueryResult]) -> None:
             avg_rg_hits = sum(r.hars_ripgrep_hits or 0 for r in hars_with_rg) / len(hars_with_rg)
             avg_rg_inj = sum(r.hars_ripgrep_injected or 0 for r in hars_with_rg) / len(hars_with_rg)
             avg_rg_ms = sum(r.hars_ripgrep_ms or 0 for r in hars_with_rg) / len(hars_with_rg)
-            print(f"\n  HARS ripgrep channel:")
+            print("\n  HARS ripgrep channel:")
             print(f"    Avg hits: {avg_rg_hits:.1f} | Avg injected: {avg_rg_inj:.1f} | Avg latency: {avg_rg_ms:.0f}ms")
         print(f"  HARS low confidence queries: {sum(1 for r in hars_ok if r.hars_low_confidence)}/{len(hars_ok)}")
 
@@ -581,7 +578,7 @@ async def main() -> None:
         command=str(executable), env=mcp_env, cwd=str(KB_INDEX_DIR.parent),
     )
 
-    print(f"\n  HARS vs jbcontext Comparison Benchmark")
+    print("\n  HARS vs jbcontext Comparison Benchmark")
     print(f"  Model: {model}")
     print(f"  Queries: {len(active_queries)}")
     print(f"  HARS index: {KB_INDEX_DIR}")
@@ -600,7 +597,7 @@ async def main() -> None:
                 print(f"\n  {label}")
 
                 # HARS
-                print(f"    HARS (hybrid) ... ", end="", flush=True)
+                print("    HARS (hybrid) ... ", end="", flush=True)
                 hars_result = await _run_hars(
                     session, q.question, q.expected_keywords, q.domain,
                     expected_files=q.expected_docs,
@@ -610,7 +607,7 @@ async def main() -> None:
                 all_results.append(hars_result)
 
                 # jbcontext
-                print(f"    jbcontext  ... ", end="", flush=True)
+                print("    jbcontext  ... ", end="", flush=True)
                 jb_result = _run_jbcontext(q.question, q.expected_keywords, q.domain)
                 print(f"{'OK' if jb_result.ok else 'FAIL'} ({jb_result.latency_s:.1f}s, {jb_result.result_count} results)")
                 all_results.append(jb_result)

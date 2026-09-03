@@ -5,12 +5,9 @@ Uses a mocked MCP server to avoid requiring a running LightRAG instance.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import sys
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import AsyncGenerator, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -317,8 +314,6 @@ class TestGrpcServerCapture:
 
     async def test_status_returns_ok(self, mock_env: None, mock_mcp_server: None) -> None:
         """Status RPC returns ok=True with index data."""
-        from hars_memory.grpc import hars_memory_pb2_grpc as pb2_grpc
-        from hars_memory.grpc import hars_memory_pb2 as pb2
         from google.protobuf import empty_pb2
         from hars_memory.grpc.server import LongTermMemoryServicer
 

@@ -20,7 +20,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import anyio
 from mcp import ClientSession, StdioServerParameters

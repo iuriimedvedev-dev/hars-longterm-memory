@@ -119,7 +119,9 @@ def _cmd_query(args: argparse.Namespace) -> int:
         print("No hits.")
         return 0
     for i, hit in enumerate(hits, start=1):
-        print(f"{i}. [{hit.score:.4f}] {hit.file_path}  (chunk={hit.chunk_id}, channel={hit.channel})")
+        print(
+            f"{i}. [{hit.score:.4f}] {hit.file_path}  (chunk={hit.chunk_id}, channel={hit.channel})"
+        )
         print(f"   {hit.snippet}")
     return 0
 
@@ -215,6 +217,7 @@ def _cmd_recall(args: argparse.Namespace) -> int:
 
     from hars_memory.mcp_server import (
         DEFAULT_QUERY_TOP_K,
+        _QUERY_MODEL_LOCK,
         _compute_hybrid_block,
         _get_rag,
         _lightrag_mode,
@@ -230,16 +233,46 @@ def _cmd_recall(args: argparse.Namespace) -> int:
     top_k = args.top_k or DEFAULT_QUERY_TOP_K
     ll_keywords = list(args.ll_keywords) if args.ll_keywords else []
     hl_keywords = list(args.hl_keywords) if args.hl_keywords else []
-    kw_args = {"ll_keywords": ll_keywords, "hl_keywords": hl_keywords} if (ll_keywords or hl_keywords) else {}
+    kw_args = (
+        {"ll_keywords": ll_keywords, "hl_keywords": hl_keywords}
+        if (ll_keywords or hl_keywords)
+        else {}
+    )
     rag_mode, mode_fallback = _resolve_query_mode(rag_mode, ll_keywords, hl_keywords)
 
     async def _run() -> dict:
+        from lightrag import QueryParam  # type: ignore[import-not-found]
+
         rag = await _get_rag()
-        hybrid_block = await _compute_hybrid_block(rag, question, top_k, ll_keywords)
+        fetch_top_k, fetch_top_k_source = _resolve_fetch_top_k(top_k, None)
+        if fetch_top_k is None:
+            raise ValueError(fetch_top_k_source)
+        hybrid_block = await _compute_hybrid_block(
+            rag,
+            question,
+            top_k,
+            ll_keywords,
+            fetch_top_k=fetch_top_k,
+        )
+        query_param = QueryParam(
+            mode=rag_mode,
+            top_k=top_k,
+            chunk_top_k=fetch_top_k,
+            only_need_context=args.context_only,
+            **kw_args,
+        )
         if args.context_only:
-            result = await rag.aquery(question, mode=rag_mode, top_k=top_k, **kw_args)
+            result = await rag.aquery(question, param=query_param)
         else:
-            result = await rag.aquery_llm(question, mode=rag_mode, top_k=top_k, **kw_args)
+            from hars_memory.server.lightrag_init import create_query_model_func
+
+            async with _QUERY_MODEL_LOCK:
+                original_llm_func = getattr(rag, "llm_model_func", None)
+                try:
+                    rag.llm_model_func = create_query_model_func()
+                    result = await rag.aquery_llm(question, param=query_param)
+                finally:
+                    rag.llm_model_func = original_llm_func
         return {
             "result": result,
             "hybrid": hybrid_block,
@@ -272,7 +305,9 @@ def _cmd_recall(args: argparse.Namespace) -> int:
             "stale_days": stale_days,
             "staleness_warning": staleness_warning,
             "hybrid": data["hybrid"],
-            "result": str(data["result"]) if not isinstance(data["result"], dict) else data["result"],
+            "result": str(data["result"])
+            if not isinstance(data["result"], dict)
+            else data["result"],
         }
         print(json.dumps(payload, indent=2, default=str))
     else:
@@ -284,7 +319,9 @@ def _cmd_recall(args: argparse.Namespace) -> int:
         hybrid = data["hybrid"]
         if hybrid.get("enabled", True):
             chunks = hybrid.get("fused_chunks", [])
-            print(f"hybrid: {len(chunks)} fused chunks, {len(hybrid.get('identifier_matches', []))} identifier matches")
+            print(
+                f"hybrid: {len(chunks)} fused chunks, {len(hybrid.get('identifier_matches', []))} identifier matches"
+            )
         raw = data["result"]
         if isinstance(raw, str):
             print(raw)
@@ -363,8 +400,7 @@ def _resolve_index_dir(cli_value: str | None) -> Path:
     raw = cli_value or os.environ.get("HARS_MEMORY_INDEX_DIR")
     if not raw:
         raise SystemExit(
-            "error: no index directory specified "
-            "(use --index-dir or set HARS_MEMORY_INDEX_DIR)"
+            "error: no index directory specified (use --index-dir or set HARS_MEMORY_INDEX_DIR)"
         )
     return Path(raw).expanduser()
 
@@ -414,8 +450,6 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 def _cmd_estimate_cost(args: argparse.Namespace) -> int:
     """Estimate indexing cost before running."""
-    import os
-    import math
 
     # -- Model pricing table (per 1M tokens) --
     MODEL_PRICES: dict[str, tuple[float, float]] = {
@@ -543,48 +577,51 @@ def _cmd_estimate_cost(args: argparse.Namespace) -> int:
 
     print(f"Model: {model} ({input_price}/{output_price} per 1M tok)")
     print()
-    print(f"Corpus:")
+    print("Corpus:")
     print(f"  Files:          {file_count}")
     print(f"  Total size:     {total_bytes / 1024:.1f} KB")
     print(f"  Est. tokens:    {_fmt_tok(total_tokens_est)}")
     print(f"  By extension:   {', '.join(f'{k}: {v}' for k, v in sorted(by_ext.items()))}")
     print()
-    print(f"Parameters:")
+    print("Parameters:")
     print(f"  Chunk size:     {chunk_size} (overlap {chunk_overlap})")
     print(f"  Batch size:     {batch_size}")
     print(f"  Max gleaning:   {max_gleaning}")
     print(f"  Est. chunks:    {estimated_chunks}")
     print()
-    print(f"LLM calls:")
+    print("LLM calls:")
     print(f"  Extract:        {extract_calls}")
     print(f"  Merge:          {merge_calls}")
     print(f"  Gleaning:       {gleaning_calls}")
     print(f"  Total:          {total_llm_calls}")
     print()
-    print(f"Tokens:")
+    print("Tokens:")
     print(f"  Input:          {_fmt_tok(total_input_tok)}")
     print(f"  Output:         {_fmt_tok(total_output_tok)}")
     print()
-    print(f"Estimated cost:")
+    print("Estimated cost:")
     print(f"  Input:          {_fmt_cost(input_cost)}")
     print(f"  Output:         {_fmt_cost(output_cost)}")
     print(f"  Total:          {_fmt_cost(total_cost)}")
     print(f"  Range:          {_fmt_cost(lower_cost)} – {_fmt_cost(upper_cost)}")
     print()
-    print(f"Notes:")
-    print(f"  - Actual cost depends on retry rate, gleaning cycles, and output")
-    print(f"  - LLM cache (LightRAG built-in) can reduce cost by 10-30%")
-    print(f"  - Large files produce more chunks and increase extract calls")
-    print(f"  - Use --max-gleaning=0 to disable expensive retry cycles")
-    print(f"  - Higher batch_size = fewer merge calls (but more per merge)")
+    print("Notes:")
+    print("  - Actual cost depends on retry rate, gleaning cycles, and output")
+    print("  - LLM cache (LightRAG built-in) can reduce cost by 10-30%")
+    print("  - Large files produce more chunks and increase extract calls")
+    print("  - Use --max-gleaning=0 to disable expensive retry cycles")
+    print("  - Higher batch_size = fewer merge calls (but more per merge)")
 
     return 0
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
     """Unpack a tar.gz archive into the target LightRAG index directory."""
+    import os
     import shutil
     import tarfile
+    import tempfile
+    from pathlib import PurePosixPath
 
     archive = Path(args.archive).expanduser()
     if not archive.is_file():
@@ -593,10 +630,13 @@ def _cmd_import(args: argparse.Namespace) -> int:
 
     index_dir = _resolve_index_dir(args.index_dir)
 
+    if index_dir.exists() and not index_dir.is_dir():
+        print(f"error: target index path is not a directory: {index_dir}", file=sys.stderr)
+        return 1
+
     if index_dir.exists() and any(index_dir.iterdir()) and not args.force:
         print(
-            f"error: target index directory is not empty: {index_dir} "
-            "(use --force to overwrite)",
+            f"error: target index directory is not empty: {index_dir} (use --force to overwrite)",
             file=sys.stderr,
         )
         return 1
@@ -607,29 +647,67 @@ def _cmd_import(args: argparse.Namespace) -> int:
         print(f"error: cannot read archive (not a valid tar.gz): {exc}", file=sys.stderr)
         return 1
 
+    temp_dir: Path | None = None
+    backup_dir: Path | None = None
     with tar:
-        names = tar.getnames()
-        has_meta = ".export_meta.json" in names
-        has_kv = any(n.startswith("kv_store_") for n in names)
-        if not has_meta and not has_kv:
+        members = tar.getmembers()
+        names = [member.name for member in members]
+        has_kv = any(
+            PurePosixPath(name).parent == PurePosixPath(".")
+            and PurePosixPath(name).name.startswith("kv_store_")
+            for name in names
+        )
+        if not has_kv:
             print(
                 "error: archive does not look like a valid hars-memory index export "
-                "(missing .export_meta.json and kv_store_* files)",
+                "(missing root-level kv_store_* files)",
                 file=sys.stderr,
             )
             return 1
 
-        if args.force and index_dir.exists():
-            shutil.rmtree(index_dir)
-        index_dir.mkdir(parents=True, exist_ok=True)
+        seen: set[PurePosixPath] = set()
+        for member in members:
+            path = PurePosixPath(member.name)
+            unsafe_path = path.is_absolute() or ".." in path.parts
+            unsafe_type = not (member.isfile() or member.isdir())
+            if unsafe_path or unsafe_type or path in seen:
+                print(
+                    f"error: unsafe archive member rejected: {member.name}",
+                    file=sys.stderr,
+                )
+                return 1
+            seen.add(path)
 
-        tar.extractall(path=index_dir)
+        index_dir.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix=f".{index_dir.name}.import-", dir=index_dir.parent))
+        try:
+            tar.extractall(path=temp_dir, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"error: failed to extract archive: {exc}", file=sys.stderr)
+            return 1
 
-    extracted_meta = index_dir / ".export_meta.json"
+    extracted_meta = temp_dir / ".export_meta.json"
     if extracted_meta.exists():
         extracted_meta.unlink()
 
-    file_count = sum(1 for p in index_dir.rglob("*") if p.is_file())
+    try:
+        if index_dir.exists():
+            backup_dir = index_dir.with_name(f".{index_dir.name}.pre-import-{os.getpid()}")
+            os.replace(index_dir, backup_dir)
+        os.replace(temp_dir, index_dir)
+        temp_dir = None
+    except OSError as exc:
+        if backup_dir is not None and backup_dir.exists() and not index_dir.exists():
+            os.replace(backup_dir, index_dir)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"error: failed to install imported index atomically: {exc}", file=sys.stderr)
+        return 1
+    if backup_dir is not None:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+    file_count = sum(1 for path in index_dir.rglob("*") if path.is_file())
     print(f"Imported: {archive} -> {index_dir} ({file_count} files)")
     return 0
 
@@ -647,7 +725,8 @@ def _build_parser() -> argparse.ArgumentParser:
     build_p.add_argument("--chunk-size", type=int, default=None)
     build_p.add_argument("--chunk-overlap", type=int, default=None)
     build_p.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Overwrite a non-empty --index-dir that was not itself produced by a prior build.",
     )
     build_p.set_defaults(func=_cmd_build)
@@ -704,9 +783,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- Servers --
     recall_p = sub.add_parser("recall", help="Query the LightRAG knowledge graph.")
     recall_p.add_argument("question", help="Natural language query")
-    recall_p.add_argument("--mode", choices=("local", "global", "hybrid", "naive"), default="hybrid")
+    recall_p.add_argument(
+        "--mode", choices=("local", "global", "hybrid", "naive"), default="hybrid"
+    )
     recall_p.add_argument("--top-k", type=int, default=20)
-    recall_p.add_argument("--context-only", action="store_true", default=True)
+    recall_p.add_argument(
+        "--context-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Return retrieved context without answer synthesis (default: enabled)",
+    )
     recall_p.add_argument("--json", action="store_true", help="Output raw JSON")
     recall_p.add_argument("--ll-keywords", nargs="*", default=None)
     recall_p.add_argument("--hl-keywords", nargs="*", default=None)
@@ -734,7 +820,8 @@ def _build_parser() -> argparse.ArgumentParser:
     export_p = sub.add_parser("export", help="Export index to a tar.gz archive.")
     export_p.add_argument("output", help="Output archive path (or directory)")
     export_p.add_argument(
-        "--index-dir", default=None,
+        "--index-dir",
+        default=None,
         help="Index directory to export (default: $HARS_MEMORY_INDEX_DIR)",
     )
     export_p.set_defaults(func=_cmd_export)
@@ -742,7 +829,8 @@ def _build_parser() -> argparse.ArgumentParser:
     import_p = sub.add_parser("import", help="Import index from a tar.gz archive.")
     import_p.add_argument("archive", help="Archive file to import")
     import_p.add_argument(
-        "--index-dir", default=None,
+        "--index-dir",
+        default=None,
         help="Target index directory (default: $HARS_MEMORY_INDEX_DIR)",
     )
     import_p.add_argument("--force", action="store_true", help="Overwrite existing index")
@@ -754,16 +842,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Estimate indexing cost before running (dry-run, no API calls).",
     )
     estimate_p.add_argument(
-        "paths", nargs="+", type=str,
+        "paths",
+        nargs="+",
+        type=str,
         help="Directories to scan for indexable files (.md, .txt, .yaml, etc.)",
     )
-    estimate_p.add_argument("--model", default="gpt-5.6-luna", help="Model name (default: gpt-5.6-luna)")
-    estimate_p.add_argument("--input-price", type=float, default=None, help="Input price per 1M tokens (overrides model lookup)")
-    estimate_p.add_argument("--output-price", type=float, default=None, help="Output price per 1M tokens (overrides model lookup)")
-    estimate_p.add_argument("--chunk-size", type=int, default=2048, help="Token chunk size (default: 2048)")
-    estimate_p.add_argument("--chunk-overlap", type=int, default=256, help="Chunk overlap tokens (default: 256)")
-    estimate_p.add_argument("--batch-size", type=int, default=256, help="Insert batch size (default: 256)")
-    estimate_p.add_argument("--max-gleaning", type=int, default=0, help="Max gleaning rounds (default: 0, disables retry loops)")
+    estimate_p.add_argument(
+        "--model", default="gpt-5.6-luna", help="Model name (default: gpt-5.6-luna)"
+    )
+    estimate_p.add_argument(
+        "--input-price",
+        type=float,
+        default=None,
+        help="Input price per 1M tokens (overrides model lookup)",
+    )
+    estimate_p.add_argument(
+        "--output-price",
+        type=float,
+        default=None,
+        help="Output price per 1M tokens (overrides model lookup)",
+    )
+    estimate_p.add_argument(
+        "--chunk-size", type=int, default=2048, help="Token chunk size (default: 2048)"
+    )
+    estimate_p.add_argument(
+        "--chunk-overlap", type=int, default=256, help="Chunk overlap tokens (default: 256)"
+    )
+    estimate_p.add_argument(
+        "--batch-size", type=int, default=256, help="Insert batch size (default: 256)"
+    )
+    estimate_p.add_argument(
+        "--max-gleaning",
+        type=int,
+        default=0,
+        help="Max gleaning rounds (default: 0, disables retry loops)",
+    )
     estimate_p.set_defaults(func=_cmd_estimate_cost)
 
     return parser

@@ -124,6 +124,11 @@ torch = { index = "pytorch-cpu" }
 line-length = 100
 target-version = "py313"
 
+[tool.ruff.lint.per-file-ignores]
+"hars_memory/grpc/hars_memory_pb2.py" = ["E402", "F401"]
+"hars_memory/grpc/hars_memory_pb2.pyi" = ["F401"]
+"hars_memory/grpc/hars_memory_pb2_grpc.py" = ["F401"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [

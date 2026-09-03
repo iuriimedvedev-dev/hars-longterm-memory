@@ -32,6 +32,7 @@ file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -44,12 +45,41 @@ from typing import Any
 
 from hars_memory.retrieval.tokenizer import tokenize_identifiers
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps the package importable
+    fcntl = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 CHUNKS_FILENAME = "kv_store_text_chunks.json"
 _CACHE_META_FILENAME = "bm25_cache_meta.json"
 _LOAD_RETRY_ATTEMPTS = 3
 _LOAD_RETRY_SLEEP_SECONDS = 0.05
+
+
+@contextlib.contextmanager
+def _cache_lock(out_dir: Path, *, exclusive: bool):
+    """Hold a process-safe lock while a published cache is swapped or opened.
+
+    Atomic directory renames alone are insufficient for mmap-backed readers:
+    bm25s opens several files by path, so a swap between those opens can mix
+    files from two generations. A stable sibling lock serializes publication
+    against that short open window; readers may still search their already-open
+    mmap after releasing it.
+    """
+    lock_path = out_dir.parent / f".{out_dir.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if fcntl is None:
+            yield
+            return
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_file.fileno(), operation)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class BM25IndexUnavailableError(RuntimeError):
@@ -230,7 +260,9 @@ def build_index(working_dir: str) -> tuple[BM25SparseIndex, float]:
     )
     logger.info(
         "Built BM25 index: %d chunks in %.3fs (source=%s)",
-        len(chunk_ids), build_seconds, chunks_file,
+        len(chunk_ids),
+        build_seconds,
+        chunks_file,
     )
     return index, build_seconds
 
@@ -269,14 +301,14 @@ def save_index(index: BM25SparseIndex, cache_dir: str) -> None:
         }
         _meta_path(staging_dir).write_text(json.dumps(meta), encoding="utf-8")
 
-        if out_dir.exists():
-            # os.replace() onto an existing directory fails (non-empty
-            # destination), so swap the old one aside first, publish, then
-            # drop it — keeping the window in which `cache_dir` does not
-            # exist as short as two rename() syscalls.
-            retired_dir = Path(staging_parent) / f"{out_dir.name}.retired"
-            os.replace(str(out_dir), str(retired_dir))
-        os.replace(str(staging_dir), str(out_dir))
+        with _cache_lock(out_dir, exclusive=True):
+            if out_dir.exists():
+                # os.replace() onto an existing directory fails (non-empty
+                # destination), so swap the old one aside first, publish, then
+                # drop it while readers are excluded from the multi-file open.
+                retired_dir = Path(staging_parent) / f"{out_dir.name}.retired"
+                os.replace(str(out_dir), str(retired_dir))
+            os.replace(str(staging_dir), str(out_dir))
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
 
@@ -298,7 +330,8 @@ def load_index(cache_dir: str) -> BM25SparseIndex | None:
     last_error: OSError | None = None
     for attempt in range(_LOAD_RETRY_ATTEMPTS):
         try:
-            return _load_index_once(out_dir)
+            with _cache_lock(out_dir, exclusive=False):
+                return _load_index_once(out_dir)
         except FileNotFoundError as exc:
             last_error = exc
             if attempt + 1 < _LOAD_RETRY_ATTEMPTS:
@@ -314,9 +347,7 @@ def _load_index_once(out_dir: Path) -> BM25SparseIndex | None:
     if not meta_file.is_file():
         return None
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    retriever = bm25s.BM25.load(
-        str(out_dir), load_corpus=False, mmap=True, show_progress=False
-    )
+    retriever = bm25s.BM25.load(str(out_dir), load_corpus=False, mmap=True, show_progress=False)
     return BM25SparseIndex(
         retriever=retriever,
         chunk_ids=list(meta["chunk_ids"]),
