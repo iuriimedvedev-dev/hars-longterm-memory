@@ -412,6 +412,175 @@ def _cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_estimate_cost(args: argparse.Namespace) -> int:
+    """Estimate indexing cost before running."""
+    import os
+    import math
+
+    # -- Model pricing table (per 1M tokens) --
+    MODEL_PRICES: dict[str, tuple[float, float]] = {
+        # (input_price_per_1M, output_price_per_1M)
+        "gpt-5.6-luna": (0.20, 1.20),
+        "gpt-4.1-mini": (0.40, 1.60),
+        "gpt-4.1-nano": (0.10, 0.40),
+        "deepseek-v3.2": (0.28, 0.42),
+        "deepseek-v4-flash": (0.14, 0.28),
+        "deepseek-v4-pro": (0.435, 0.87),
+        "deepseek-r1": (0.55, 2.19),
+        "gemini-3.5-flash": (0.10, 0.40),
+        "gemini-3.6-flash": (0.15, 0.60),
+        "claude-3.5-haiku": (0.25, 1.25),
+        "claude-3.5-sonnet": (3.00, 15.00),
+    }
+
+    model = args.model or "gpt-5.6-luna"
+    if model in MODEL_PRICES:
+        input_price, output_price = MODEL_PRICES[model]
+    elif args.input_price is not None and args.output_price is not None:
+        input_price = args.input_price
+        output_price = args.output_price
+    else:
+        print(
+            f"error: unknown model {model!r}; specify --input-price and --output-price",
+            file=sys.stderr,
+        )
+        return 1
+
+    chunk_size = args.chunk_size or 2048
+    chunk_overlap = args.chunk_overlap or 256
+    batch_size = args.batch_size or 256
+    max_gleaning = args.max_gleaning or 0
+    paths = args.paths
+
+    # -- Scan corpus --
+    file_count = 0
+    total_bytes = 0
+    by_ext: dict[str, int] = {}
+
+    for p in paths:
+        p_resolved = Path(p).expanduser().resolve()
+        if not p_resolved.is_dir():
+            print(f"warning: not a directory, skipping: {p_resolved}", file=sys.stderr)
+            continue
+        for f in p_resolved.rglob("*"):
+            if not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            if ext not in (".md", ".txt", ".yaml", ".yml", ".json", ".toml", ".cfg", ".conf"):
+                # Skip binaries, images, etc.
+                continue
+            file_count += 1
+            total_bytes += f.stat().st_size
+            by_ext[ext] = by_ext.get(ext, 0) + 1
+
+    if file_count == 0:
+        print("error: no indexable files found in specified paths", file=sys.stderr)
+        return 1
+
+    # -- Estimate tokens (rule of thumb: ~4 chars = 1 token for English text) --
+    # More precise: 1 token ≈ 0.75 word; for mixed content use 4 chars/tok
+    total_chars = total_bytes  # Approximate: bytes ≈ chars for text files
+    total_tokens_est = total_chars // 4
+
+    # -- Estimate chunks --
+    effective_chunk_size = chunk_size - chunk_overlap
+    if effective_chunk_size <= 0:
+        effective_chunk_size = chunk_size // 2
+    estimated_chunks = max(1, total_tokens_est // effective_chunk_size)
+
+    # -- Estimate LLM calls --
+    # Each chunk: 1 extract call (entity + relation extraction)
+    extract_calls = estimated_chunks
+    # Merge: roughly every batch_size files, but at least 1 merge per file
+    merge_calls = file_count  # LightRAG does merge per document
+    # With batch processing, merge is batched — but still ~1 merge call per file
+    # Gleaning: extra calls per failed extract
+    gleaning_calls = 0
+    if max_gleaning > 0:
+        gleaning_calls = int(extract_calls * 0.15 * max_gleaning)  # ~15% retry rate
+
+    total_llm_calls = extract_calls + merge_calls + gleaning_calls
+
+    # -- Estimate tokens per call --
+    # Extract: system prompt (~500) + chunk content (~chunk_size) + user prompt (~200)
+    extract_input_tok = extract_calls * (700 + chunk_size)
+    extract_output_tok = extract_calls * 3000  # average entity+relation output
+
+    # Merge: system prompt (~500) + batch of entities (~2000)
+    merge_input_tok = merge_calls * 2500
+    merge_output_tok = merge_calls * 3000
+
+    # Gleaning: same as extract but with longer context
+    glean_input_tok = gleaning_calls * (700 + chunk_size)
+    glean_output_tok = gleaning_calls * 3000
+
+    total_input_tok = extract_input_tok + merge_input_tok + glean_input_tok
+    total_output_tok = extract_output_tok + merge_output_tok + glean_output_tok
+
+    # -- Cost --
+    input_cost = total_input_tok / 1_000_000 * input_price
+    output_cost = total_output_tok / 1_000_000 * output_price
+    total_cost = input_cost + output_cost
+
+    # -- Range (lower = no gleaning + 20% cache hit, upper = 2× gleaning) --
+    lower_cost = total_cost * 0.75
+    upper_cost = total_cost * 1.5
+
+    # -- Output --
+    def _fmt_tok(n: int) -> str:
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}K"
+        return str(n)
+
+    def _fmt_cost(n: float) -> str:
+        if n < 1:
+            return f"${n:.2f}"
+        if n < 100:
+            return f"${n:.2f}"
+        return f"${n:,.0f}"
+
+    print(f"Model: {model} ({input_price}/{output_price} per 1M tok)")
+    print()
+    print(f"Corpus:")
+    print(f"  Files:          {file_count}")
+    print(f"  Total size:     {total_bytes / 1024:.1f} KB")
+    print(f"  Est. tokens:    {_fmt_tok(total_tokens_est)}")
+    print(f"  By extension:   {', '.join(f'{k}: {v}' for k, v in sorted(by_ext.items()))}")
+    print()
+    print(f"Parameters:")
+    print(f"  Chunk size:     {chunk_size} (overlap {chunk_overlap})")
+    print(f"  Batch size:     {batch_size}")
+    print(f"  Max gleaning:   {max_gleaning}")
+    print(f"  Est. chunks:    {estimated_chunks}")
+    print()
+    print(f"LLM calls:")
+    print(f"  Extract:        {extract_calls}")
+    print(f"  Merge:          {merge_calls}")
+    print(f"  Gleaning:       {gleaning_calls}")
+    print(f"  Total:          {total_llm_calls}")
+    print()
+    print(f"Tokens:")
+    print(f"  Input:          {_fmt_tok(total_input_tok)}")
+    print(f"  Output:         {_fmt_tok(total_output_tok)}")
+    print()
+    print(f"Estimated cost:")
+    print(f"  Input:          {_fmt_cost(input_cost)}")
+    print(f"  Output:         {_fmt_cost(output_cost)}")
+    print(f"  Total:          {_fmt_cost(total_cost)}")
+    print(f"  Range:          {_fmt_cost(lower_cost)} – {_fmt_cost(upper_cost)}")
+    print()
+    print(f"Notes:")
+    print(f"  - Actual cost depends on retry rate, gleaning cycles, and output")
+    print(f"  - LLM cache (LightRAG built-in) can reduce cost by 10-30%")
+    print(f"  - Large files produce more chunks and increase extract calls")
+    print(f"  - Use --max-gleaning=0 to disable expensive retry cycles")
+    print(f"  - Higher batch_size = fewer merge calls (but more per merge)")
+
+    return 0
+
+
 def _cmd_import(args: argparse.Namespace) -> int:
     """Unpack a tar.gz archive into the target LightRAG index directory."""
     import shutil
@@ -578,6 +747,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     import_p.add_argument("--force", action="store_true", help="Overwrite existing index")
     import_p.set_defaults(func=_cmd_import)
+
+    # -- Estimate cost --
+    estimate_p = sub.add_parser(
+        "estimate-cost",
+        help="Estimate indexing cost before running (dry-run, no API calls).",
+    )
+    estimate_p.add_argument(
+        "paths", nargs="+", type=str,
+        help="Directories to scan for indexable files (.md, .txt, .yaml, etc.)",
+    )
+    estimate_p.add_argument("--model", default="gpt-5.6-luna", help="Model name (default: gpt-5.6-luna)")
+    estimate_p.add_argument("--input-price", type=float, default=None, help="Input price per 1M tokens (overrides model lookup)")
+    estimate_p.add_argument("--output-price", type=float, default=None, help="Output price per 1M tokens (overrides model lookup)")
+    estimate_p.add_argument("--chunk-size", type=int, default=2048, help="Token chunk size (default: 2048)")
+    estimate_p.add_argument("--chunk-overlap", type=int, default=256, help="Chunk overlap tokens (default: 256)")
+    estimate_p.add_argument("--batch-size", type=int, default=256, help="Insert batch size (default: 256)")
+    estimate_p.add_argument("--max-gleaning", type=int, default=0, help="Max gleaning rounds (default: 0, disables retry loops)")
+    estimate_p.set_defaults(func=_cmd_estimate_cost)
 
     return parser
 
