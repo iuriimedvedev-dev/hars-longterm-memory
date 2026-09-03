@@ -420,6 +420,10 @@ def create_lightrag(
         make_embedding_func,
         validate_embedder_against_index,
     )
+    from hars_memory.server.adapter_embedder import (
+        adapter_embedding_dimension,
+        make_adapter_embedding_func,
+    )
     from hars_memory.server.reranker import make_rerank_func
     from hars_memory.schema.loader import DEFAULT_SCHEMA_PATH, load_schema
 
@@ -489,19 +493,35 @@ def create_lightrag(
 
     Path(_wdir).mkdir(parents=True, exist_ok=True)
 
-    emb_dim = embedding_dimension(_emb_model)
-    # Fail fast: an existing index at _wdir was built with some embedder's
-    # dimension baked into vdb_*.json. If HARS_MEMORY_EMBED_MODEL now disagrees,
-    # queries would silently embed into the wrong vector space and retrieval
-    # would return garbage with no error. No-ops for a brand-new working dir.
-    validate_embedder_against_index(
-        _wdir, _emb_model, emb_dim, vector_storage=_vector_storage, qdrant_url=_qdrant_url
-    )
+    # HARS_MEMORY_EMBED_BACKEND=adapter routes embeddings through a KnotGate
+    # agent-adapter's own EmbeddingProvider bridge instead of a local
+    # sentence-transformers model — see adapter_embedder.py's module doc for
+    # why this is a separate module rather than a branch inside embedder.py,
+    # and adapter_mode_guard.py for the 'local'-mode-only enforcement this
+    # backend depends on (checked at MCP server startup, not here).
+    _embed_backend = os.environ.get("HARS_MEMORY_EMBED_BACKEND", "local").strip().lower()
 
-    embed_func = make_embedding_func(
-        model_name=_emb_model,
-        hf_cache_dir=_emb_cache,
-        batch_size=embed_batch_size,
+    if _embed_backend == "adapter":
+        emb_dim = adapter_embedding_dimension()
+        _emb_model_label = f"adapter:{os.environ.get('HARS_MEMORY_EMBED_ADAPTER_URL', '')}"
+        embed_func = make_adapter_embedding_func(batch_size=embed_batch_size)
+    else:
+        emb_dim = embedding_dimension(_emb_model)
+        _emb_model_label = _emb_model
+        embed_func = make_embedding_func(
+            model_name=_emb_model,
+            hf_cache_dir=_emb_cache,
+            batch_size=embed_batch_size,
+        )
+
+    # Fail fast: an existing index at _wdir was built with some embedder's
+    # dimension baked into vdb_*.json. If the configured embedder now
+    # disagrees (whether by HARS_MEMORY_EMBED_MODEL or by
+    # HARS_MEMORY_EMBED_BACKEND changing), queries would silently embed into
+    # the wrong vector space and retrieval would return garbage with no
+    # error. No-ops for a brand-new working dir.
+    validate_embedder_against_index(
+        _wdir, _emb_model_label, emb_dim, vector_storage=_vector_storage, qdrant_url=_qdrant_url
     )
 
     # Local CPU cross-encoder reranker (tools/memory/server/reranker.py).

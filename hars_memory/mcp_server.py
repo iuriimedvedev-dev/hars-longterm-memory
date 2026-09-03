@@ -70,6 +70,7 @@ except ImportError:
         raise RuntimeError("The 'mcp' package is required to run this server")
 
 
+from hars_memory.server.adapter_mode_guard import assert_local_mode_adapter_if_configured
 from hars_memory.server.embedder import qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
@@ -83,6 +84,13 @@ logger = logging.getLogger("hars-longterm-memory-mcp")
 # HARS_MEMORY_LEGACY_ENV_PREFIXES (comma-separated); empty/unset = no-op.
 # See tools/memory/server/legacy_env_guard.py.
 refuse_if_legacy_env()
+
+# Fail-closed guard, opt-in via HARS_MEMORY_ADAPTER_HEALTH_URL: when this
+# deployment is wired to a KnotGate agent-adapter, refuse to start unless
+# that adapter is confirmed to be running in 'local' mode — every other
+# transport needs a chat turn to scope its credential grant to, which no
+# standalone MCP tool invocation has. See server/adapter_mode_guard.py.
+assert_local_mode_adapter_if_configured()
 
 # ---------------------------------------------------------------------------
 # Config (all from env — no hardcoded values)
