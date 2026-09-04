@@ -39,9 +39,9 @@ message QueryRequest {
   optional int32 fetch_top_k = 4; // fetch width, must be >= top_k
   repeated string ll_keywords = 5;   // low-level keywords (entities, codes)
   repeated string hl_keywords = 6;   // high-level keywords (themes, concepts)
-  bool context_only = 7;        // default: true — return context without LLM answer
+  optional bool context_only = 7;        // default: true — return context without LLM answer
   string context_priority = 8;  // "merged" or "lightrag" (default: "merged")
-  bool debug = 9;               // default: false — include debug data
+  optional bool debug = 9;               // default: false — include debug data
 }
 
 message QueryResponse {
