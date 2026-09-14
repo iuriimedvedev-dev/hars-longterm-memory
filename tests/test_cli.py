@@ -201,3 +201,23 @@ def test_import_rejects_metadata_only_archive(tmp_path: Path) -> None:
         )
         == 1
     )
+
+
+def test_consolidate_defaults_to_dry_run_and_can_be_disabled() -> None:
+    parser = cli._build_parser()
+
+    assert parser.parse_args(["consolidate"]).dry_run is True
+    assert parser.parse_args(["consolidate", "--dry-run"]).dry_run is True
+    assert parser.parse_args(["consolidate", "--no-dry-run"]).dry_run is False
+
+
+def test_consolidate_passes_explicit_argv_to_indexer(monkeypatch) -> None:
+    captured: dict[str, list[str]] = {}
+    monkeypatch.setattr(cli, "index_main", lambda argv: captured.setdefault("argv", argv))
+
+    assert cli._cmd_consolidate(argparse.Namespace(paths=["/tmp/staging"], dry_run=True)) == 0
+    assert captured["argv"] == ["--paths", "/tmp/staging", "--dry-run"]
+
+    captured.clear()
+    assert cli._cmd_consolidate(argparse.Namespace(paths=["/tmp/staging"], dry_run=False)) == 0
+    assert captured["argv"] == ["--paths", "/tmp/staging"]
