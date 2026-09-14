@@ -26,20 +26,90 @@
 # a GPU-concurrency check.
 set -euo pipefail
 
+# --- live deployment config: single source of truth ------------------------
+# The index directory, vector store and graph store are read from the SAME
+# source the live MCP server uses (cortex/.mcp.json ->
+# mcpServers["hars-longterm-memory"].env) instead of this script's old
+# hardcoded defaults (`index_gemma_v4` + QdrantVectorDBStorage). On 2026-09-03
+# the deployment moved to `index_compact_20260903_imported` +
+# NanoVectorDBStorage; the old defaults would have silently written vectors to
+# the wrong backend while graph/KV updates landed in the live index, diverging
+# the two with no error. Loading the live env makes that drift impossible.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=live_memory_env.sh
+if ! source "$SCRIPT_DIR/live_memory_env.sh"; then
+    echo "ERROR: cannot source $SCRIPT_DIR/live_memory_env.sh" >&2
+    exit 1
+fi
+if ! load_live_memory_env; then
+    echo "ERROR: could not load the live memory env from $HARS_MEMORY_MCP_CONFIG." >&2
+    echo "       Refusing to run: without it, indexing could target a mismatched" >&2
+    echo "       index/vector store. Set HARS_MEMORY_MCP_CONFIG or fix cortex/.mcp.json." >&2
+    exit 1
+fi
+
+# --- args: --dry-run (walk only) + optional extra ingest paths -------------
+# --dry-run walks and counts only: no extractor start, no GPU, no LLM, no
+# writes. Used both by hand and by consolidate_staging.sh's default mode.
+DRY_RUN=0
+EXTRA_PATHS=()
+for _arg in "$@"; do
+    case "$_arg" in
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--dry-run] [extra ingest paths...]"
+            echo "  default: incremental index (starts gemma-4-12b extractor on :8083)"
+            echo "  --dry-run: walk + count staged notes only; no LLM, no GPU, no writes"
+            exit 0
+            ;;
+        *) EXTRA_PATHS+=("$_arg") ;;
+    esac
+done
+
 HF_HOME="${HF_HOME:-/mnt/datasets/models/.hf_home}"
 STAGING="${HARS_MEMORY_STAGING_DIR:-/mnt/datasets/graphrag/staging}"
-INDEX="${HARS_MEMORY_INDEX_DIR:-/home/angkira/.local/share/hars-graphrag/index_gemma_v4}"
+INDEX="${HARS_MEMORY_INDEX_DIR:-}"
 PORT=8083
 BIN="$HOME/llama.cpp/build-rocm/bin/llama-server"
 GGUF=$(find -L "$HF_HOME/hub/models--unsloth--gemma-4-12b-it-GGUF" -name 'gemma-4-12b-it-Q4_K_M.gguf' | head -1)
 LOG=/tmp/memory_update_kb.log
-PYTHON_BIN="${HARS_MEMORY_PYTHON:-python3}"
+# Prefer the project's own venv so `python3 -m hars_memory.server.index`
+# resolves without relying on the caller having activated anything. Falls back
+# to $HARS_MEMORY_PYTHON then bare python3.
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -n "${HARS_MEMORY_PYTHON:-}" ]]; then
+    PYTHON_BIN="$HARS_MEMORY_PYTHON"
+elif [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+else
+    PYTHON_BIN="python3"
+fi
+
+# --- fail-fast guard: never index into a missing/blank/wrong target --------
+if [[ -z "$INDEX" ]]; then
+    echo "ERROR: HARS_MEMORY_INDEX_DIR is empty after loading the live env — refusing to run." >&2
+    exit 1
+fi
+if [[ ! -d "$INDEX" ]]; then
+    echo "ERROR: live index directory does not exist: $INDEX" >&2
+    echo "       Refusing to run: a missing path would be created as a wrong," >&2
+    echo "       empty index instead of updating the live one." >&2
+    exit 1
+fi
+if [[ -z "${HARS_MEMORY_VECTOR_STORAGE:-}" ]]; then
+    echo "ERROR: HARS_MEMORY_VECTOR_STORAGE is empty after loading the live env — refusing to run." >&2
+    exit 1
+fi
+echo "live target: index=$INDEX vector_store=$HARS_MEMORY_VECTOR_STORAGE graph_store=${HARS_MEMORY_GRAPH_STORAGE:-unset}"
 
 note_count=$(find "$STAGING" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
-if [[ $note_count -eq 0 && $# -eq 0 ]]; then
+if [[ $note_count -eq 0 && ${#EXTRA_PATHS[@]} -eq 0 ]]; then
     echo "nothing to update: no staged notes and no extra paths"; exit 0
 fi
-echo "staged notes: $note_count | extra paths: $*"
+echo "staged notes: $note_count | extra paths: ${EXTRA_PATHS[*]:-}"
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "MODE: dry-run (walk + count only, no LLM, no writes)"
+fi
 
 # --- exclude the archive directory from the walk (defense-in-depth) -------
 # The archival step below (see "archiving ingested notes...") moves every
@@ -71,7 +141,9 @@ fi
 # this generic package/script has no opinion on GPU concurrency and
 # proceeds; set means it must point at a Python file exposing
 # `assert_gpu_free(api_base_url)`, which is called and must not raise.
-if [[ -n "${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH:-}" ]]; then
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "dry-run: skipping GPU guard (no GPU is taken)."
+elif [[ -n "${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH:-}" ]]; then
     echo "GPU guard: checking ${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH} ..."
     if ! "$PYTHON_BIN" - "$HARS_MEMORY_GPU_GUARD_SCRIPT_PATH" "${HARS_API_BASE_URL:-http://localhost:8765}" <<'PYEOF'
 import importlib.util
@@ -146,6 +218,7 @@ CTX_SIZE=$(( REQUIRED_PER_SLOT * PARALLEL ))
 
 echo "ctx-size sizing: system_prompt=${SYSTEM_PROMPT_TOKENS}t + input<=${INPUT_TOKENS_EST}t (${HARS_MEMORY_LLM_MAX_TOKEN_SIZE}B @ ${BYTES_PER_TOKEN_CONSERVATIVE}B/tok) + output=${HARS_MEMORY_EXTRACTOR_MAX_TOKENS}t + overhead=${CHAT_TEMPLATE_OVERHEAD_TOKENS}t -> required/slot=${REQUIRED_PER_SLOT}t x parallel=${PARALLEL} -> ctx-size=${CTX_SIZE}"
 
+if [[ $DRY_RUN -eq 0 ]]; then
 echo "starting extractor (gemma-4-12b, $PARALLEL slots, ctx-size=$CTX_SIZE)..."
 # Prompt-prefix caching for the ~4,000-token constant LightRAG extraction
 # system prompt (byte-identical on every chunk, ~85% of every request):
@@ -187,9 +260,14 @@ for _ in $(seq 60); do
 done
 curl -sf --max-time 2 "http://localhost:$PORT/health" >/dev/null || {
     echo "extractor failed to start — see /tmp/memory_update_llm.log"; exit 1; }
+else
+    echo "dry-run: extractor not started (no GPU, no LLM)."
+fi
 
 PATHS=("$STAGING")
-[[ $# -gt 0 ]] && PATHS+=("$@")
+if [[ ${#EXTRA_PATHS[@]} -gt 0 ]]; then
+    PATHS+=("${EXTRA_PATHS[@]}")
+fi
 
 echo "indexing into $INDEX ..."
 # Invoked as an installed module (matches mcp_server.py's memory_consolidate
@@ -199,17 +277,18 @@ echo "indexing into $INDEX ..."
 # `uv run --project tools/memory-config bash cortex-scripts/update_kb.sh`,
 # or after activating that project's venv).
 #
-# Config-driven, not hardcoded: default matches the deployed backend
-# (QdrantVectorDBStorage since the 2026-07-30 migration) but MUST always
-# match whatever backend the deployed index actually uses (see
-# config/.env.example) — export HARS_MEMORY_VECTOR_STORAGE
-# (and, for Qdrant, HARS_MEMORY_QDRANT_URL/HARS_MEMORY_QDRANT_COLLECTION) in the
-# calling shell before running this script to override. A mismatch here
-# writes vectors to the wrong backend while graph/KV updates land correctly,
-# silently diverging the two.
-HARS_MEMORY_VECTOR_STORAGE="${HARS_MEMORY_VECTOR_STORAGE:-QdrantVectorDBStorage}" \
-HARS_MEMORY_QDRANT_URL="${HARS_MEMORY_QDRANT_URL:-http://localhost:6335}" \
-HARS_MEMORY_QDRANT_COLLECTION="${HARS_MEMORY_QDRANT_COLLECTION:-hars_longterm_memory}" \
+# Config comes from the live env loaded above (cortex/.mcp.json). The old
+# hardcoded QdrantVectorDBStorage default is GONE: it silently wrote vectors
+# to a backend the live index does not use. HARS_MEMORY_VECTOR_STORAGE /
+# HARS_MEMORY_GRAPH_STORAGE / HARS_MEMORY_INDEX_DIR are the live values, and
+# the guard above refuses to run if the index dir or vector store is unset.
+# Override by exporting before running only if you really mean a different
+# target.
+INDEX_ARGS=(--paths "${PATHS[@]}")
+if [[ $DRY_RUN -eq 1 ]]; then
+    INDEX_ARGS+=(--dry-run)
+fi
+HARS_MEMORY_VECTOR_STORAGE="$HARS_MEMORY_VECTOR_STORAGE" \
 HARS_MEMORY_INDEX_DIR="$INDEX" \
 HARS_MEMORY_EXTRACTOR_BASE_URL="http://localhost:$PORT/v1" \
 HARS_MEMORY_EXTRACTOR_MODEL=gemma-4-12b \
@@ -228,9 +307,13 @@ HARS_MEMORY_EMBED_DEVICE=cpu \
 HARS_MEMORY_EMBED_LOCAL_FILES_ONLY=1 \
 HF_HOME="$HF_HOME" \
 "$PYTHON_BIN" -m hars_memory.server.index \
-    --paths "${PATHS[@]}" > "$LOG" 2>&1
+    "${INDEX_ARGS[@]}" > "$LOG" 2>&1
 
-echo "indexing done; archiving ingested notes..."
-mkdir -p "$STAGING/ingested"
-find "$STAGING" -maxdepth 1 -name '*.md' -exec mv {} "$STAGING/ingested/" \;
-echo "KB update complete. Log: $LOG"
+if [[ $DRY_RUN -eq 0 ]]; then
+    echo "indexing done; archiving ingested notes..."
+    mkdir -p "$STAGING/ingested"
+    find "$STAGING" -maxdepth 1 -name '*.md' -exec mv {} "$STAGING/ingested/" \;
+    echo "KB update complete. Log: $LOG"
+else
+    echo "dry-run complete; nothing written, nothing archived. Log: $LOG"
+fi

@@ -39,11 +39,11 @@ def _ensure_project_root() -> None:
         sys.path.insert(0, str(root))
 
 
-def index_main() -> None:
+def index_main(argv: Sequence[str] | None = None) -> None:
     _ensure_project_root()
     from hars_memory.server.index import main
 
-    main()
+    main(argv)
 
 
 def mcp_main() -> None:
@@ -370,16 +370,18 @@ def _cmd_grpc(args: argparse.Namespace) -> int:
 
 
 def _cmd_consolidate(args: argparse.Namespace) -> int:
-    """Trigger incremental reindex."""
-    if args.paths:
-        import os as _os
+    """Trigger incremental reindex.
 
-        _os.environ["HARS_MEMORY_INDEX_PATHS"] = " ".join(args.paths)
+    Builds the indexer's own argv explicitly instead of setting environment
+    variables and re-entering ``index_main()``: the latter re-parsed the
+    process ``sys.argv`` (which still contained ``consolidate``), so every
+    ``memory consolidate`` invocation died with
+    ``unrecognized arguments: consolidate`` and never indexed anything.
+    """
+    index_argv: list[str] = ["--paths", *args.paths]
     if args.dry_run:
-        import os as _os
-
-        _os.environ["HARS_MEMORY_INDEX_DRY_RUN"] = "1"
-    index_main()
+        index_argv.append("--dry-run")
+    index_main(index_argv)
     return 0
 
 
@@ -813,7 +815,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     consolidate_p = sub.add_parser("consolidate", help="Trigger incremental reindex.")
     consolidate_p.add_argument("--paths", nargs="*", default=[".plans", "docs"])
-    consolidate_p.add_argument("--dry-run", action="store_true", default=True)
+    consolidate_p.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Walk + count only, no LLM/writes (default: on). "
+            "Pass --no-dry-run for a real ingest."
+        ),
+    )
     consolidate_p.set_defaults(func=_cmd_consolidate)
 
     # -- Export/Import --

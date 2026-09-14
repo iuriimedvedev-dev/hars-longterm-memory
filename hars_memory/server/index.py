@@ -52,7 +52,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Final
+from typing import Final, Sequence
 
 from hars_memory.ingest import sources
 from hars_memory.ingest.change_detection import (
@@ -89,7 +89,7 @@ _BM25_CACHE_DIR_NAME: Final[str] = "bm25_cache"
 _DELETION_GC_MIN_CURRENT_RATIO: Final[float] = 0.5
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build / update the HARS long-term memory knowledge graph index."
     )
@@ -130,7 +130,7 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Walk + count documents only — no LLM extraction, no DB writes.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _install_signal_handlers(
@@ -504,7 +504,7 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     logger.info("Indexing complete.")
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     # Permanent fail-closed guard: refuse to start against a legacy env
     # prefix (e.g. Cortex's pre-2026-07-29 GRAPHRAG_* rename) instead of
     # silently falling back to HARS_MEMORY_* defaults. Configured via
@@ -514,7 +514,7 @@ def main() -> None:
 
     refuse_if_legacy_env()
 
-    args = _parse_args()
+    args = _parse_args(argv)
     asyncio.run(_run_indexing(args))
 
 
