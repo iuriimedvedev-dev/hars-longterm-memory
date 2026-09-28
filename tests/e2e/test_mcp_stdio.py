@@ -68,8 +68,13 @@ def test_real_mcp_stdio_transport_is_llm_and_network_free(tmp_path: Path) -> Non
                     "memory_recall",
                     "memory_remember",
                     "memory_entities",
+                    "memory_inspect_entity",
                     "memory_related",
                     "memory_status",
+                    "memory_upsert_document",
+                    "memory_delete_document",
+                    "memory_sync_status",
+                    "memory_list_projects",
                     "memory_consolidate",
                     "memory_forget",
                 }

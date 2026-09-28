@@ -8,13 +8,17 @@ Matches hars-control house style:
 - sync main() (console-script entrypoint) wraps async _serve() + stdio_server()
 
 Tool catalogue:
-  memory_recall       — primary workhorse (local/global/hybrid/naive)
-  memory_remember     — save a knowledge note into staging
-  memory_entities     — 1-hop neighbourhood lookup (INTROSPECTION, unstable)
-  memory_related      — N-hop subgraph for a given entity (INTROSPECTION, unstable)
-  memory_status       — index health + staleness (GPU-FREE)
-  memory_consolidate  — trigger incremental ingest (admin)
-  memory_forget       — purge stale documents by date, with keyword protection (admin)
+  memory_recall          — primary workhorse (local/global/hybrid/naive)
+  memory_remember        — save a knowledge note into staging
+  memory_entities        — 1-hop neighbourhood lookup (INTROSPECTION, unstable)
+  memory_inspect_entity  — detailed entity inspection: properties, full description, relationships
+  memory_related         — N-hop subgraph for a given entity (INTROSPECTION, unstable)
+  memory_status          — index health + staleness (GPU-FREE)
+  memory_upsert_document — atomic single-document insert or update into knowledge graph
+  memory_delete_document — purge single document and unshared entities by path or doc_id
+  memory_sync_status     — fast zero-LLM divergence check between disk sources and index
+  memory_consolidate     — trigger incremental ingest (admin)
+  memory_forget          — purge stale documents by date, with keyword protection (admin)
 
 Query tools work against an existing index using CPU embeddings only.
 Only memory_consolidate and memory_forget(apply=True) touch the durable index.
@@ -70,6 +74,17 @@ except ImportError:
         raise RuntimeError("The 'mcp' package is required to run this server")
 
 
+from hars_memory.auth import (
+    LOCAL_SUPERUSER,
+    TokenStore,
+    check_permission,
+    get_default_token_store,
+    is_auth_enabled,
+)
+from hars_memory.projects import (
+    ProjectMetadata,
+    get_default_project_registry,
+)
 from hars_memory.server.embedder import qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
@@ -176,6 +191,10 @@ HARS_MEMORY_HYBRID_ALPHA = float(os.environ.get("HARS_MEMORY_HYBRID_ALPHA", "0.5
 HARS_MEMORY_HYBRID_ENABLED = os.environ.get("HARS_MEMORY_HYBRID_ENABLED", "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
+HARS_MEMORY_AUTH_ENABLED = os.environ.get("HARS_MEMORY_AUTH_ENABLED", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+HARS_MEMORY_TOKENS_CONFIG = os.environ.get("HARS_MEMORY_TOKENS_CONFIG", "").strip()
 
 # ---------------------------------------------------------------------------
 # Tunable constants (no magic values — see per-item justification in comments)
@@ -202,7 +221,7 @@ STALE_INDEX_WARNING_DAYS = 7  # queries against an index older than this get a s
 # it is (empirically) already sitting almost exactly on the saturation
 # point, which is why decoupling fetch width from result count measures as
 # a no-op at this shipped default (see that comment for the full sweep).
-DEFAULT_QUERY_TOP_K = 20
+DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "6"))
 
 # --- FETCH-WIDTH KNOB (decoupled from DEFAULT_QUERY_TOP_K above, 2026-08-01) ---
 #
@@ -442,7 +461,24 @@ def schema(properties: dict[str, Any], required: list[str] | None = None) -> dic
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> Tool:
-    return Tool(name=name, description=description, inputSchema=schema(properties, required))
+    props = dict(properties)
+    props.setdefault(
+        "project",
+        {
+            "type": "string",
+            "default": "default",
+            "description": "Project ID for multi-project knowledge base isolation (defaults to 'default').",
+        },
+    )
+    props.setdefault(
+        "access_token",
+        {
+            "type": "string",
+            "default": "",
+            "description": "Optional access token for authorization (defaults to HARS_MEMORY_ACCESS_TOKEN env var).",
+        },
+    )
+    return Tool(name=name, description=description, inputSchema=schema(props, required))
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +486,9 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
 # ---------------------------------------------------------------------------
 
 
-def _graph_file_path() -> Path:
+def _graph_file_path(project: ProjectMetadata | None = None) -> Path:
+    if project is not None and project.project_id != "default":
+        return Path(project.index_dir) / GRAPH_FILE_NAME
     return Path(HARS_MEMORY_INDEX_DIR) / GRAPH_FILE_NAME
 
 
@@ -469,16 +507,31 @@ def _staleness_info(graph_file: Path | None = None) -> tuple[str | None, int | N
     return mtime.isoformat(), stale_days
 
 
-def _index_status() -> dict[str, Any]:
+def _index_status(project: ProjectMetadata | None = None) -> dict[str, Any]:
     """Return index health without loading LightRAG or calling an LLM."""
-    working_dir = Path(HARS_MEMORY_INDEX_DIR)
+    if project is not None and project.project_id != "default":
+        working_dir = Path(project.index_dir)
+        project_id = project.project_id
+        project_name = project.name
+        staging_dir = Path(project.staging_dir) if project.staging_dir else Path(HARS_MEMORY_STAGING_DIR)
+        graph_file = _graph_file_path(project)
+        prefix = project.qdrant_collection_prefix or HARS_MEMORY_QDRANT_COLLECTION_PREFIX
+        workspace_id = project.qdrant_collection or HARS_MEMORY_QDRANT_COLLECTION
+    else:
+        working_dir = Path(HARS_MEMORY_INDEX_DIR)
+        project_id = "default"
+        project_name = "Default Project"
+        staging_dir = Path(HARS_MEMORY_STAGING_DIR)
+        graph_file = _graph_file_path()
+        prefix = HARS_MEMORY_QDRANT_COLLECTION_PREFIX
+        workspace_id = HARS_MEMORY_QDRANT_COLLECTION
+
     index_exists = working_dir.exists() and any(working_dir.iterdir()) if working_dir.exists() else False
 
     # Try to read node/edge counts from LightRAG's graph file if present.
     node_count: int | None = None
     edge_count: int | None = None
 
-    graph_file = _graph_file_path()
     last_ingest, _stale_days = _staleness_info(graph_file)
     if graph_file.exists():
         try:
@@ -503,25 +556,12 @@ def _index_status() -> dict[str, Any]:
         vector_info["files"] = [path.name for path in vector_files]
         vector_info["file_count"] = len(vector_files)
     elif "qdrant" in HARS_MEMORY_VECTOR_STORAGE.lower():
-        # HARS_MEMORY_QDRANT_COLLECTION is NOT a Qdrant collection name — LightRAG's
-        # QdrantVectorDBStorage exports it as QDRANT_WORKSPACE and uses it as the
-        # tenant id written into every payload's workspace_id (see
-        # lightrag_init.py). The real collection base names are fixed by
-        # qdrant_impl.py::__post_init__ (no model_suffix at this call site) to
-        # exactly lightrag_vdb_{chunks,entities,relationships}, namespaced per
-        # project by HARS_MEMORY_QDRANT_COLLECTION_PREFIX (qdrant_collection_names)
-        # — enumerate those three and filter counts by the workspace tenant.
-        if not HARS_MEMORY_QDRANT_COLLECTION_PREFIX:
-            # Required-config error, NOT a connectivity problem — do not fold
-            # this into the generic except below (which sets reachable=False
-            # and would mislead an operator into chasing a phantom network
-            # issue). Signal it distinctly: reachable=None ("unknown, could
-            # not even attempt the check") plus an explicit config_error.
+        if not prefix:
             vector_info.update(
                 {
                     "reachable": None,
                     "config_error": "HARS_MEMORY_QDRANT_COLLECTION_PREFIX is not set",
-                    "workspace": HARS_MEMORY_QDRANT_COLLECTION,
+                    "workspace": workspace_id,
                 }
             )
         else:
@@ -533,7 +573,7 @@ def _index_status() -> dict[str, Any]:
                 collections: dict[str, Any] = {}
                 total_workspace_points = 0
                 dims: set[int] = set()
-                collection_names = qdrant_collection_names(HARS_MEMORY_QDRANT_COLLECTION_PREFIX)
+                collection_names = qdrant_collection_names(prefix)
                 for ns, name in zip(("chunks", "entities", "relationships"), collection_names):
                     if not qc.collection_exists(name):
                         collections[ns] = {"collection": name, "exists": False}
@@ -547,7 +587,7 @@ def _index_status() -> dict[str, Any]:
                             must=[
                                 _qmodels.FieldCondition(
                                     key="workspace_id",
-                                    match=_qmodels.MatchValue(value=HARS_MEMORY_QDRANT_COLLECTION),
+                                    match=_qmodels.MatchValue(value=workspace_id),
                                 )
                             ]
                         ),
@@ -564,7 +604,7 @@ def _index_status() -> dict[str, Any]:
                     }
                 vector_info.update(
                     {
-                        "workspace": HARS_MEMORY_QDRANT_COLLECTION,
+                        "workspace": workspace_id,
                         "collections": collections,
                         "points_count": total_workspace_points,
                         "dim": (dims.pop() if len(dims) == 1 else sorted(dims)) if dims else None,
@@ -575,13 +615,15 @@ def _index_status() -> dict[str, Any]:
                 logger.warning(
                     "Qdrant collection lookup failed for workspace %s @ %s (vector_info.error "
                     "only, not fatal to memory_status): %s",
-                    HARS_MEMORY_QDRANT_COLLECTION, HARS_MEMORY_QDRANT_URL, exc,
+                    workspace_id, HARS_MEMORY_QDRANT_URL, exc,
                 )
                 vector_info.update(
-                    {"error": str(exc), "reachable": False, "workspace": HARS_MEMORY_QDRANT_COLLECTION}
+                    {"error": str(exc), "reachable": False, "workspace": workspace_id}
                 )
 
     return {
+        "project": project_id,
+        "project_name": project_name,
         "index_exists": index_exists,
         "working_dir": str(working_dir),
         "node_count": node_count,
@@ -596,7 +638,7 @@ def _index_status() -> dict[str, Any]:
             "query": f"{HARS_MEMORY_QUERY_MODEL} @ {HARS_MEMORY_QUERY_BASE_URL}",
             "embedder": f"{HARS_MEMORY_EMBED_MODEL} (CPU)",
         },
-        "staging_backlog": _staging_backlog_info(),
+        "staging_backlog": _staging_backlog_info(staging_dir),
         "message": (
             "Index ready."
             if index_exists
@@ -605,13 +647,13 @@ def _index_status() -> dict[str, Any]:
     }
 
 
-def _staging_backlog_info() -> dict[str, Any]:
+def _staging_backlog_info(staging_dir: Path | None = None) -> dict[str, Any]:
     """Report how many notes are waiting in HARS_MEMORY_STAGING_DIR and the
     age of the oldest one, since nobody would otherwise notice a growing
     backlog without listing the directory by hand (memory_remember writes
     here; only the next `update_kb.sh` run merges these into the graph).
     """
-    staging = Path(HARS_MEMORY_STAGING_DIR)
+    staging = staging_dir if staging_dir is not None else Path(HARS_MEMORY_STAGING_DIR)
     if not staging.exists():
         return {"pending_notes": 0, "oldest_note": None, "oldest_note_age_days": None, "staging_dir": str(staging)}
 
@@ -630,15 +672,15 @@ def _staging_backlog_info() -> dict[str, Any]:
     }
 
 
-async def _get_rag() -> object:
-    """Lazily initialise the LightRAG instance (thread-safe)."""
+_rag_instance: object | None = None
+
+
+async def _get_rag(project_id: str = "default") -> object:
+    """Lazily initialise the LightRAG instance (thread-safe, project-isolated)."""
     global _rag_instance
-    async with _rag_lock:
-        if _rag_instance is None:
-            from hars_memory.server.lightrag_init import create_lightrag
-            _rag_instance = create_lightrag()
-            await _rag_instance.initialize_storages()  # type: ignore[attr-defined]
+    if _rag_instance is not None:
         return _rag_instance
+    return await get_default_project_registry().get_rag(project_id)
 
 
 def _lightrag_mode(mode: str) -> str:
@@ -702,29 +744,47 @@ _graph_cache_mtime: float | None = None
 _graph_lock = asyncio.Lock()
 
 
-async def _get_graph() -> tuple[Any, str]:
-    """Return (cached NetworkX graph, cache_status), reloading if the GraphML
-    file changed. cache_status is "hit" or "rebuild" — surfaced to callers
-    (currently the usage-event log, see logging_setup.log_query_event) so
-    cache effectiveness is observable instead of silently discarded.
+async def _get_graph(project_id: str = "default") -> tuple[Any, str]:
+    """Return (cached NetworkX graph, cache_status) for the given project.
 
     Raises FileNotFoundError if the index has not been built yet.
     """
     global _graph_cache, _graph_cache_mtime
-    graph_file = _graph_file_path()
-    if not graph_file.exists():
-        raise FileNotFoundError(f"Index not built yet: {graph_file}")
+    if _graph_cache is not None:
+        return _graph_cache, "hit"
+    if project_id == "default":
+        graph_file = _graph_file_path()
+        if not graph_file.exists():
+            raise FileNotFoundError(f"Index not built yet: {graph_file}")
 
-    mtime = graph_file.stat().st_mtime
-    async with _graph_lock:
-        cache_status = "hit"
-        if _graph_cache is None or _graph_cache_mtime != mtime:
-            import networkx as nx  # type: ignore[import-not-found]
-            logger.info("Loading GraphML index into cache: %s", graph_file)
-            _graph_cache = await asyncio.to_thread(nx.read_graphml, str(graph_file))
-            _graph_cache_mtime = mtime
-            cache_status = "rebuild"
-        return _graph_cache, cache_status
+        mtime = graph_file.stat().st_mtime
+        async with _graph_lock:
+            cache_status = "hit"
+            if _graph_cache is None or _graph_cache_mtime != mtime:
+                import networkx as nx  # type: ignore[import-not-found]
+
+                logger.info("Loading GraphML index into cache (source mtime changed or first use)")
+                _graph_cache = await asyncio.to_thread(nx.read_graphml, str(graph_file))
+                _graph_cache_mtime = mtime
+                cache_status = "rebuild"
+                logger.info(
+                    "GraphML cache ready: %d nodes, %d edges",
+                    _graph_cache.number_of_nodes(),  # type: ignore[attr-defined]
+                    _graph_cache.number_of_edges(),  # type: ignore[attr-defined]
+                )
+            return _graph_cache, cache_status
+    return await get_default_project_registry().get_graph(project_id)
+
+
+def _clear_in_memory_graph_cache(project_id: str | None = None) -> None:
+    """Reset cached NetworkX graph instance in memory."""
+    global _graph_cache, _graph_cache_mtime
+    _graph_cache = None
+    _graph_cache_mtime = None
+    if project_id:
+        get_default_project_registry().invalidate_caches(project_id)
+    else:
+        get_default_project_registry().invalidate_all_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -737,38 +797,45 @@ _bm25_cache_source_mtime: float | None = None
 _bm25_lock = asyncio.Lock()
 
 
-async def _get_bm25_index() -> tuple[Any, str]:
-    """Return (cached BM25SparseIndex, cache_status), rebuilding if the source
-    chunk store changed. cache_status is "hit" or "rebuild" — surfaced to
-    callers (currently the usage-event log, see
-    logging_setup.log_query_event) so cache effectiveness is observable
-    instead of silently discarded.
-
-    Raises hars_memory.retrieval.bm25_index.BM25IndexUnavailableError if the
-    LightRAG index (and therefore kv_store_text_chunks.json) has not been built yet.
-    """
+async def _get_bm25_index(project_id: str = "default") -> tuple[Any, str]:
+    """Return (cached BM25SparseIndex, cache_status) for the given project."""
     global _bm25_cache, _bm25_cache_source_mtime
-    from hars_memory.retrieval.bm25_index import (
-        CHUNKS_FILENAME,
-        BM25IndexUnavailableError,
-        get_or_build_index,
-    )
+    if _bm25_cache is not None:
+        return _bm25_cache, "hit"
+    if project_id == "default":
+        from hars_memory.retrieval.bm25_index import (
+            CHUNKS_FILENAME,
+            BM25IndexUnavailableError,
+            get_or_build_index,
+        )
 
-    chunks_file = Path(HARS_MEMORY_INDEX_DIR) / CHUNKS_FILENAME
-    if not chunks_file.exists():
-        raise BM25IndexUnavailableError(f"No text-chunk store at {chunks_file}")
+        chunks_file = Path(HARS_MEMORY_INDEX_DIR) / CHUNKS_FILENAME
+        if not chunks_file.exists():
+            raise BM25IndexUnavailableError(f"No text-chunk store at {chunks_file}")
 
-    mtime = chunks_file.stat().st_mtime
-    async with _bm25_lock:
-        cache_status = "hit"
-        if _bm25_cache is None or _bm25_cache_source_mtime != mtime:
-            logger.info("Loading/building BM25 sparse index (source mtime changed or first use)")
-            _bm25_cache, _stats = await asyncio.to_thread(
-                get_or_build_index, HARS_MEMORY_INDEX_DIR, HARS_MEMORY_BM25_CACHE_DIR
-            )
-            _bm25_cache_source_mtime = mtime
-            cache_status = "rebuild"
-        return _bm25_cache, cache_status
+        mtime = chunks_file.stat().st_mtime
+        async with _bm25_lock:
+            cache_status = "hit"
+            if _bm25_cache is None or _bm25_cache_source_mtime != mtime:
+                logger.info("Loading/building BM25 sparse index (source mtime changed or first use)")
+                _bm25_cache, _stats = await asyncio.to_thread(
+                    get_or_build_index, HARS_MEMORY_INDEX_DIR, HARS_MEMORY_BM25_CACHE_DIR
+                )
+                _bm25_cache_source_mtime = mtime
+                cache_status = "rebuild"
+            return _bm25_cache, cache_status
+    return await get_default_project_registry().get_bm25_index(project_id)
+
+
+def _invalidate_bm25_cache(project_id: str | None = None) -> None:
+    """Reset cached BM25SparseIndex in memory."""
+    global _bm25_cache, _bm25_cache_source_mtime
+    _bm25_cache = None
+    _bm25_cache_source_mtime = None
+    if project_id:
+        get_default_project_registry().invalidate_caches(project_id)
+    else:
+        get_default_project_registry().invalidate_all_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +954,7 @@ async def _compute_hybrid_block(
     ll_keywords: list[str] | None = None,
     *,
     fetch_top_k: int | None = None,
+    project_id: str = "default",
 ) -> dict[str, Any]:
     """Return the additive `hybrid` field for memory_recall: BM25 sparse hits,
     dense/sparse fused ranking, and an explicit exact-identifier lookup.
@@ -940,7 +1008,7 @@ async def _compute_hybrid_block(
             effective_fetch_top_k * HYBRID_CANDIDATE_POOL_MULTIPLIER, effective_fetch_top_k, top_k
         )
 
-        bm25_index, bm25_cache_status = await _get_bm25_index()
+        bm25_index, bm25_cache_status = await _get_bm25_index(project_id)
         sparse_start = time.monotonic()
         sparse_search_hits = await bm25_index.asearch(question, pool_size)
         sparse_elapsed_ms = (time.monotonic() - sparse_start) * 1000
@@ -2149,6 +2217,83 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        tool(
+            "memory_inspect_entity",
+            (
+                "Inspect an entity in the knowledge graph: returns full description, entity type, "
+                "associated source documents/chunks, and all direct relationships (incoming and outgoing) "
+                "with descriptions and weights. Useful for fact-checking and diagnosing stale knowledge."
+            ),
+            {
+                "name": {
+                    "type": "string",
+                    "description": "Name or ID of the entity to inspect (e.g. 'Artifactory', 'Loki', 'gke-europe-west1').",
+                },
+            },
+            ["name"],
+        ),
+        tool(
+            "memory_upsert_document",
+            (
+                "Atomically insert or update a document in the knowledge graph. "
+                "If the document already exists and its content changed, its stale chunks and "
+                "graph entities are deleted before re-inserting. "
+                "If content is identical, it is safely skipped. "
+                "Accepts either an existing file_path on disk, or file_path + new content string."
+            ),
+            {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the document file (absolute or relative to repo root).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Optional: override or supply text content directly instead of reading from disk.",
+                },
+            },
+            ["file_path"],
+        ),
+        tool(
+            "memory_delete_document",
+            (
+                "Delete a document and all its unshared entities/relations from the knowledge graph. "
+                "Accepts either a file_path or a doc_id (e.g. 'file:4f0f645832fd'). "
+                "Purges stale knowledge immediately and updates fingerprint records."
+            ),
+            {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the document file (absolute or relative to repo root).",
+                },
+                "doc_id": {
+                    "type": "string",
+                    "description": "Stable document ID (e.g. 'file:4f0f645832fd').",
+                },
+            },
+        ),
+        tool(
+            "memory_sync_status",
+            (
+                "Check index freshness and divergence against knowledge sources without running LLMs. "
+                "Scans source files, compares content fingerprints with the index, and reports: "
+                "changed files, new files, deleted files, and unchanged count. Fast (takes 1-2 seconds)."
+            ),
+            {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of paths to scan. Defaults to ingest roots from knowledge-sources.yaml.",
+                },
+            },
+        ),
+        tool(
+            "memory_list_projects",
+            (
+                "List all knowledge base projects accessible to the current access token "
+                "(or local superuser). Returns project identifiers, visibility, descriptions, and permitted actions."
+            ),
+            {},
+        ),
     ]
 
 
@@ -2160,13 +2305,88 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
+    project_id = str(args.get("project") or "default").strip()
+    raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
+
+    registry = get_default_project_registry()
+    token_store = TokenStore(config_path=HARS_MEMORY_TOKENS_CONFIG) if HARS_MEMORY_TOKENS_CONFIG else get_default_token_store()
+
+    # Determine token context
+    auth_enabled = HARS_MEMORY_AUTH_ENABLED or is_auth_enabled()
+    if not auth_enabled:
+        token_context = LOCAL_SUPERUSER
+    elif raw_token:
+        token_context = token_store.verify_token(raw_token)
+        if token_context is None:
+            return json_text({
+                "ok": False,
+                "error": "Invalid or expired access token",
+                "error_type": "UnauthorizedError",
+                "code": 401,
+            })
+    else:
+        token_context = None
 
     try:
+        # ------------------------------------------------------------------ #
+        # memory_list_projects                                               #
+        # ------------------------------------------------------------------ #
+        if name == "memory_list_projects":
+            accessible_projects = []
+            for proj in registry.list_projects():
+                read_ok = check_permission(token_context, proj.project_id, "read", proj, auth_enabled=auth_enabled)
+                write_ok = check_permission(token_context, proj.project_id, "write", proj, auth_enabled=auth_enabled)
+                admin_ok = check_permission(token_context, proj.project_id, "admin", proj, auth_enabled=auth_enabled)
+                if read_ok or write_ok or admin_ok:
+                    actions = []
+                    if read_ok:
+                        actions.append("read")
+                    if write_ok:
+                        actions.append("write")
+                    if admin_ok:
+                        actions.append("admin")
+                    accessible_projects.append({
+                        "project_id": proj.project_id,
+                        "name": proj.name,
+                        "visibility": proj.visibility,
+                        "description": proj.description,
+                        "shared_departments": list(proj.shared_departments),
+                        "owner_user_id": proj.owner_user_id,
+                        "actions": actions,
+                    })
+            return json_text({"ok": True, "projects": accessible_projects})
+
+        action_map = {
+            "memory_status": "read",
+            "memory_recall": "read",
+            "memory_entities": "read",
+            "memory_related": "read",
+            "memory_inspect_entity": "read",
+            "memory_sync_status": "read",
+            "memory_remember": "write",
+            "memory_upsert_document": "write",
+            "memory_delete_document": "admin",
+            "memory_forget": "admin",
+            "memory_consolidate": "admin",
+        }
+        required_action = action_map.get(name)
+        project_meta = registry.get_project(project_id)
+        if project_meta is None:
+            return json_text({"ok": False, "error": f"Project '{project_id}' not found", "code": 404})
+
+        if required_action and not check_permission(token_context, project_id, required_action, project_meta, auth_enabled=auth_enabled):
+            return json_text({
+                "ok": False,
+                "error": "Permission denied",
+                "error_type": "ForbiddenError" if token_context else "UnauthorizedError",
+                "code": 403 if token_context else 401,
+            })
+
         # ------------------------------------------------------------------ #
         # memory_status — always GPU-free                                    #
         # ------------------------------------------------------------------ #
         if name == "memory_status":
-            return json_text({"ok": True, **_index_status()})
+            return json_text({"ok": True, **_index_status(project=project_meta)})
 
         # ------------------------------------------------------------------ #
         # memory_recall                                                        #
@@ -2193,7 +2413,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             kw_args = {"ll_keywords": ll_keywords, "hl_keywords": hl_keywords} if (ll_keywords or hl_keywords) else {}
             rag_mode, mode_fallback = _resolve_query_mode(rag_mode, ll_keywords, hl_keywords)
 
-            last_ingest, stale_days = _staleness_info()
+            last_ingest, stale_days = _staleness_info(_graph_file_path(project_meta))
             staleness_fields: dict[str, Any] = {"last_ingest": last_ingest, "stale_days": stale_days}
             if stale_days is not None and stale_days > STALE_INDEX_WARNING_DAYS:
                 staleness_fields["staleness_warning"] = (
@@ -2201,13 +2421,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "anything added or changed after that date is absent from this response."
                 )
 
-            rag = await _get_rag()
+            rag = await _get_rag(project_id)
 
             # Additive hybrid (dense + BM25 sparse) fields — computed once, attached
             # to both response shapes below. Never raises; see _compute_hybrid_block.
-            hybrid_block = await _compute_hybrid_block(
-                rag, question, top_k, ll_keywords, fetch_top_k=fetch_top_k
-            )
+            try:
+                hybrid_block = await _compute_hybrid_block(
+                    rag, question, top_k, ll_keywords, fetch_top_k=fetch_top_k, project_id=project_id,
+                )
+            except TypeError:
+                hybrid_block = await _compute_hybrid_block(
+                    rag, question, top_k, ll_keywords, fetch_top_k=fetch_top_k,
+                )
 
             # Usage-tracking envelope shared by every return path below (success or
             # failure) — see logging_setup.log_query_event. graph_channel_ms is
@@ -2454,7 +2679,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return json_text({"ok": False, "error": "content is required"})
             importance = str(args.get("importance", "normal"))
             tags = [str(x) for x in (args.get("tags") or [])]
-            staging = Path(HARS_MEMORY_STAGING_DIR)
+            staging = Path(HARS_MEMORY_STAGING_DIR) if project_id == "default" else (Path(project_meta.staging_dir) if project_meta.staging_dir else Path(HARS_MEMORY_STAGING_DIR))
             staging.mkdir(parents=True, exist_ok=True)
             now = datetime.datetime.now()
             fname = f"{now:%Y-%m-%d}_{title}_{now:%H%M%S}.md"
@@ -2477,15 +2702,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             })
 
         # ------------------------------------------------------------------ #
-        # memory_entities                                              #
+        # memory_entities                                                    #
         # ------------------------------------------------------------------ #
         if name == "memory_entities":
-            entity_name = str(args.get("name", ""))
+            entity_name = str(args.get("name", "")).strip()
             limit = int(args.get("limit", 10))
             if not entity_name:
                 return json_text({"ok": False, "error": "name is required"})
 
-            graph_file = _graph_file_path()
+            graph_file = _graph_file_path(project_meta)
             if not graph_file.exists():
                 return json_text({
                     "ok": False,
@@ -2494,7 +2719,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 })
 
             try:
-                G, _graph_cache_status = await _get_graph()
+                G, _graph_cache_status = await _get_graph(project_id)
 
                 query_variants = _expand_query_aliases(entity_name)
                 variant_infos = [
@@ -2552,12 +2777,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if not entity_id:
                 return json_text({"ok": False, "error": "entity_id is required"})
 
-            graph_file = _graph_file_path()
+            graph_file = _graph_file_path(project_meta)
             if not graph_file.exists():
                 return json_text({"ok": False, "error": "Index not built yet."})
 
             try:
-                G, _graph_cache_status = await _get_graph()
+                G, _graph_cache_status = await _get_graph(project_id)
 
                 # Find node by exact id or case-insensitive match
                 root_node = entity_id
@@ -2787,7 +3012,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return json_text({"ok": False, "error_type": "ValueError", "error": str(exc)})
 
             keep_res = [re.compile(p, re.IGNORECASE) for p in protect_patterns]
-            wdir = Path(HARS_MEMORY_INDEX_DIR)
+            wdir = Path(HARS_MEMORY_INDEX_DIR) if project_id == "default" else Path(project_meta.index_dir)
 
             try:
                 report = find_candidates(wdir, cutoff, keep_res, sections)
@@ -2844,6 +3069,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
                 return json_text(result)
 
+            _clear_in_memory_graph_cache(project_id)
+            _invalidate_bm25_cache(project_id)
             result["deleted"] = deleted
             log_write_event(
                 tool="memory_forget",
@@ -2855,6 +3082,355 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 },
             )
             return json_text(result)
+
+        # ------------------------------------------------------------------ #
+        # memory_inspect_entity                                              #
+        # ------------------------------------------------------------------ #
+        if name == "memory_inspect_entity":
+            entity_name = str(args.get("name", "")).strip()
+            if not entity_name:
+                return json_text({"ok": False, "error": "name is required"})
+
+            graph_file = _graph_file_path(project_meta)
+            if not graph_file.exists():
+                return json_text({
+                    "ok": False,
+                    "error": "Index not built yet.",
+                    "hint": "Run memory_consolidate or python -m hars_memory.server.index",
+                })
+
+            try:
+                G, _graph_cache_status = await _get_graph(project_id)
+
+                # Exact match first
+                node_id: Any = None
+                if entity_name in G.nodes:
+                    node_id = entity_name
+                else:
+                    for n in G.nodes:
+                        if str(n).lower() == entity_name.lower():
+                            node_id = n
+                            break
+
+                # Fuzzy match via aliases and match tiers if exact not found
+                if node_id is None:
+                    query_variants = _expand_query_aliases(entity_name)
+                    variant_infos = [
+                        (norm, [t for t in norm.split(" ") if t])
+                        for norm in (_normalize_entity_text(v) for v in query_variants)
+                    ]
+                    ranked: list[tuple[int, str, Any, dict[str, Any]]] = []
+                    for nid, ndata in G.nodes(data=True):
+                        desc = str(ndata.get("description", ""))
+                        best_tier: str | None = None
+                        for query_norm, query_tokens in variant_infos:
+                            tier = _entity_match_tier(query_norm, query_tokens, nid, desc)
+                            if tier is not None and (
+                                best_tier is None or _MATCH_TIER_RANK[tier] < _MATCH_TIER_RANK[best_tier]
+                            ):
+                                best_tier = tier
+                        if best_tier is not None:
+                            ranked.append((_MATCH_TIER_RANK[best_tier], best_tier, nid, ndata))
+                    if ranked:
+                        ranked.sort(key=lambda m: (m[0], str(m[2])))
+                        node_id = ranked[0][2]
+
+                if node_id is None or node_id not in G.nodes:
+                    return json_text({
+                        "ok": False,
+                        "error": f"Entity '{entity_name}' not found in knowledge graph.",
+                    })
+
+                node_data = G.nodes[node_id]
+                relations: list[dict[str, Any]] = []
+
+                for neighbor in G.neighbors(node_id):
+                    edge_dict = G.get_edge_data(node_id, neighbor) or {}
+                    relations.append({
+                        "direction": "out",
+                        "target": str(neighbor),
+                        "relation": _edge_relation_label(edge_dict),
+                        "description": str(edge_dict.get("description", "")),
+                        "weight": edge_dict.get("weight", 1.0),
+                    })
+
+                if hasattr(G, "predecessors") and G.is_directed():
+                    for predecessor in G.predecessors(node_id):
+                        edge_dict = G.get_edge_data(predecessor, node_id) or {}
+                        relations.append({
+                            "direction": "in",
+                            "target": str(predecessor),
+                            "relation": _edge_relation_label(edge_dict),
+                            "description": str(edge_dict.get("description", "")),
+                            "weight": edge_dict.get("weight", 1.0),
+                        })
+
+                relations.sort(key=lambda r: (r["direction"], r["target"]))
+
+                return json_text({
+                    "ok": True,
+                    "entity": {
+                        "id": str(node_id),
+                        "entity_type": str(node_data.get("entity_type", "")),
+                        "description": str(node_data.get("description", "")),
+                        "source_id": str(node_data.get("source_id", "")),
+                        "file_path": str(node_data.get("file_path", "")),
+                        "relations_count": len(relations),
+                        "relations": relations,
+                    },
+                })
+            except Exception as exc:
+                logger.warning("memory_inspect_entity failed for name=%r: %s", entity_name, exc)
+                return json_text({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
+
+        # ------------------------------------------------------------------ #
+        # memory_upsert_document                                             #
+        # ------------------------------------------------------------------ #
+        if name == "memory_upsert_document":
+            file_path_str = str(args.get("file_path", "")).strip()
+            content_override = args.get("content")
+            if not file_path_str:
+                return json_text({"ok": False, "error": "file_path is required"})
+
+            from hars_memory.ingest.change_detection import (
+                FingerprintStore,
+                compute_fingerprint,
+                default_fingerprint_store_path,
+            )
+            from hars_memory.ingest.document import (
+                Document,
+                file_stable_id,
+            )
+            from hars_memory.ingest.walker import (
+                HEADER_DATE_UNKNOWN,
+                _file_date,
+                _infer_section,
+                apply_source_header,
+                build_source_header,
+                infer_source_kind,
+                walk,
+            )
+            from hars_memory.server.index import _insert_all_batches
+
+            path = Path(file_path_str).expanduser()
+            if not path.is_absolute():
+                candidate = Path.cwd() / path
+                if candidate.exists():
+                    path = candidate
+                else:
+                    from hars_memory.ingest.sources import manifest_path
+                    mpath = manifest_path()
+                    if mpath and (mpath.parent / path).exists():
+                        path = mpath.parent / path
+                    else:
+                        path = candidate.resolve()
+            else:
+                path = path.resolve()
+
+            if content_override is None:
+                if not path.is_file():
+                    return json_text({"ok": False, "error": f"File does not exist: {path}"})
+                docs, walk_stats = walk([path])
+                if not docs:
+                    return json_text({
+                        "ok": False,
+                        "error": f"File was skipped by walker (globs/binary/size guard): {path}",
+                    })
+                doc = docs[0]
+            else:
+                doc_id = file_stable_id(path)
+                kind = infer_source_kind(path)
+                mtime = path.stat().st_mtime if path.exists() else 0.0
+                date_str = _file_date(path, mtime) if path.exists() else HEADER_DATE_UNKNOWN
+                header = build_source_header(
+                    document_name=path.name,
+                    section=_infer_section(path.parent, kind),
+                    date=date_str,
+                )
+                final_content = apply_source_header(str(content_override), header)
+                rel_path = path.name
+                doc = Document(
+                    doc_id=doc_id,
+                    content=final_content,
+                    source_kind=kind,
+                    source_path=str(path),
+                    metadata={
+                        "base_path": str(path.parent),
+                        "relative_path": rel_path,
+                    },
+                )
+
+            current_fp = compute_fingerprint(doc.content)
+            idx_dir = str(HARS_MEMORY_INDEX_DIR) if project_id == "default" else str(project_meta.index_dir)
+            store_path = default_fingerprint_store_path(idx_dir)
+            store = FingerprintStore.load(store_path)
+            stored_fp = store.get(doc.doc_id)
+
+            if stored_fp == current_fp:
+                return json_text({
+                    "ok": True,
+                    "action": "unchanged",
+                    "doc_id": doc.doc_id,
+                    "file_path": str(path),
+                    "fingerprint": current_fp,
+                    "note": "Document content is identical to stored fingerprint; skipped.",
+                })
+
+            rag = await _get_rag(project_id)
+
+            if stored_fp is not None:
+                logger.info("Purging stale chunks for modified doc %s before upsert", doc.doc_id)
+                await rag.adelete_by_doc_id(doc.doc_id)
+
+            await _insert_all_batches(rag, [doc], batch_size=1)
+
+            store.set(doc.doc_id, current_fp)
+            store.save()
+
+            _clear_in_memory_graph_cache(project_id)
+            _invalidate_bm25_cache(project_id)
+
+            log_write_event(
+                tool="memory_upsert_document",
+                ok=True,
+                detail={
+                    "doc_id": doc.doc_id,
+                    "file_path": str(path),
+                    "action": "updated" if stored_fp is not None else "inserted",
+                },
+            )
+
+            return json_text({
+                "ok": True,
+                "action": "updated" if stored_fp is not None else "inserted",
+                "doc_id": doc.doc_id,
+                "file_path": str(path),
+                "fingerprint": current_fp,
+            })
+
+        # ------------------------------------------------------------------ #
+        # memory_delete_document                                             #
+        # ------------------------------------------------------------------ #
+        if name == "memory_delete_document":
+            file_path_str = str(args.get("file_path", "")).strip()
+            doc_id_arg = str(args.get("doc_id", "")).strip()
+
+            if not file_path_str and not doc_id_arg:
+                return json_text({
+                    "ok": False,
+                    "error": "Either file_path or doc_id must be provided.",
+                })
+
+            from hars_memory.ingest.change_detection import (
+                FingerprintStore,
+                default_fingerprint_store_path,
+            )
+            from hars_memory.ingest.document import file_stable_id
+
+            resolved_path_str: str | None = None
+            if file_path_str:
+                path = Path(file_path_str).expanduser()
+                if not path.is_absolute():
+                    candidate = Path.cwd() / path
+                    if candidate.exists():
+                        path = candidate
+                    else:
+                        from hars_memory.ingest.sources import manifest_path
+                        mpath = manifest_path()
+                        if mpath and (mpath.parent / path).exists():
+                            path = mpath.parent / path
+                        else:
+                            path = candidate.resolve()
+                else:
+                    path = path.resolve()
+                resolved_path_str = str(path)
+                target_doc_id = file_stable_id(path)
+            else:
+                target_doc_id = doc_id_arg
+
+            rag = await _get_rag(project_id)
+            logger.info("Deleting document %s from LightRAG index", target_doc_id)
+            await rag.adelete_by_doc_id(target_doc_id)
+
+            idx_dir = str(HARS_MEMORY_INDEX_DIR) if project_id == "default" else str(project_meta.index_dir)
+            store_path = default_fingerprint_store_path(idx_dir)
+            store = FingerprintStore.load(store_path)
+            store.discard(target_doc_id)
+            store.save()
+
+            _clear_in_memory_graph_cache(project_id)
+            _invalidate_bm25_cache(project_id)
+
+            log_write_event(
+                tool="memory_delete_document",
+                ok=True,
+                detail={"doc_id": target_doc_id, "file_path": resolved_path_str},
+            )
+
+            return json_text({
+                "ok": True,
+                "deleted": True,
+                "doc_id": target_doc_id,
+                "file_path": resolved_path_str,
+            })
+
+        # ------------------------------------------------------------------ #
+        # memory_sync_status                                                 #
+        # ------------------------------------------------------------------ #
+        if name == "memory_sync_status":
+            paths_arg = args.get("paths")
+            from hars_memory.ingest.change_detection import (
+                FingerprintStore,
+                default_fingerprint_store_path,
+                detect_changed_documents,
+            )
+            from hars_memory.ingest.sources import ingest_roots
+            from hars_memory.ingest.walker import walk
+
+            if paths_arg and isinstance(paths_arg, list):
+                scan_paths = [Path(p).expanduser().resolve() for p in paths_arg]
+            elif project_meta.sources_manifest and Path(project_meta.sources_manifest).exists():
+                from hars_memory.ingest.sources import read_manifest
+                manifest_cfg = read_manifest(Path(project_meta.sources_manifest))
+                scan_paths = [
+                    (Path(project_meta.sources_manifest).parent / src.path).resolve()
+                    for src in manifest_cfg.sources
+                ]
+            else:
+                scan_paths = ingest_roots()
+
+            if not scan_paths:
+                return json_text({
+                    "ok": False,
+                    "error": "No scan paths found. Set HARS_MEMORY_SOURCES_MANIFEST or provide 'paths'.",
+                })
+
+            docs, stats = walk(scan_paths, dry_run=False)
+            idx_dir = str(HARS_MEMORY_INDEX_DIR) if project_id == "default" else str(project_meta.index_dir)
+            store_path = default_fingerprint_store_path(idx_dir)
+            store = FingerprintStore.load(store_path)
+
+            doc_map = {d.doc_id: d.source_path for d in docs}
+            new_files = [d.source_path for d in docs if store.get(d.doc_id) is None]
+
+            report = detect_changed_documents(docs, store)
+            changed_files = [doc_map[did] for did in report.changed_doc_ids if did in doc_map]
+
+            is_synced = (len(changed_files) == 0 and len(new_files) == 0 and len(report.deleted_doc_ids) == 0)
+
+            return json_text({
+                "ok": True,
+                "is_synced": is_synced,
+                "scanned_paths": [str(p) for p in scan_paths],
+                "files_accepted": stats.files_accepted,
+                "unchanged_count": len(report.unchanged_doc_ids),
+                "changed_count": len(changed_files),
+                "changed_files": changed_files,
+                "new_count": len(new_files),
+                "new_files": new_files,
+                "deleted_count": len(report.deleted_doc_ids),
+                "deleted_doc_ids": list(report.deleted_doc_ids),
+            })
 
         return json_text({"ok": False, "error": f"Unknown tool: {name}"})
 

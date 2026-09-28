@@ -105,18 +105,140 @@ class RememberRequest(_message.Message):
     def __init__(self, title: _Optional[str] = ..., content: _Optional[str] = ..., importance: _Optional[str] = ..., tags: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RememberResponse(_message.Message):
-    __slots__ = ("ok", "saved", "pending_notes", "note", "error")
+    __slots__ = ("ok", "saved", "pending_notes", "note", "error", "memory_id")
     OK_FIELD_NUMBER: _ClassVar[int]
     SAVED_FIELD_NUMBER: _ClassVar[int]
     PENDING_NOTES_FIELD_NUMBER: _ClassVar[int]
     NOTE_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
     ok: bool
     saved: str
     pending_notes: int
     note: str
     error: str
-    def __init__(self, ok: _Optional[bool] = ..., saved: _Optional[str] = ..., pending_notes: _Optional[int] = ..., note: _Optional[str] = ..., error: _Optional[str] = ...) -> None: ...
+    memory_id: str
+    def __init__(self, ok: _Optional[bool] = ..., saved: _Optional[str] = ..., pending_notes: _Optional[int] = ..., note: _Optional[str] = ..., error: _Optional[str] = ..., memory_id: _Optional[str] = ...) -> None: ...
+
+class MemoryRecord(_message.Message):
+    __slots__ = ("memory_id", "title", "content", "importance", "tags", "source_path", "doc_id", "status", "created_at", "updated_at")
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    IMPORTANCE_FIELD_NUMBER: _ClassVar[int]
+    TAGS_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_PATH_FIELD_NUMBER: _ClassVar[int]
+    DOC_ID_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_FIELD_NUMBER: _ClassVar[int]
+    UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
+    memory_id: str
+    title: str
+    content: str
+    importance: str
+    tags: _containers.RepeatedScalarFieldContainer[str]
+    source_path: str
+    doc_id: str
+    status: str
+    created_at: str
+    updated_at: str
+    def __init__(self, memory_id: _Optional[str] = ..., title: _Optional[str] = ..., content: _Optional[str] = ..., importance: _Optional[str] = ..., tags: _Optional[_Iterable[str]] = ..., source_path: _Optional[str] = ..., doc_id: _Optional[str] = ..., status: _Optional[str] = ..., created_at: _Optional[str] = ..., updated_at: _Optional[str] = ...) -> None: ...
+
+class GetMemoryRequest(_message.Message):
+    __slots__ = ("memory_id", "title")
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    memory_id: str
+    title: str
+    def __init__(self, memory_id: _Optional[str] = ..., title: _Optional[str] = ...) -> None: ...
+
+class GetMemoryResponse(_message.Message):
+    __slots__ = ("ok", "memory", "error")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    memory: MemoryRecord
+    error: str
+    def __init__(self, ok: _Optional[bool] = ..., memory: _Optional[_Union[MemoryRecord, _Mapping]] = ..., error: _Optional[str] = ...) -> None: ...
+
+class ListMemoriesRequest(_message.Message):
+    __slots__ = ("limit", "before", "importance", "tag", "include_deleted")
+    LIMIT_FIELD_NUMBER: _ClassVar[int]
+    BEFORE_FIELD_NUMBER: _ClassVar[int]
+    IMPORTANCE_FIELD_NUMBER: _ClassVar[int]
+    TAG_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_DELETED_FIELD_NUMBER: _ClassVar[int]
+    limit: int
+    before: str
+    importance: str
+    tag: str
+    include_deleted: bool
+    def __init__(self, limit: _Optional[int] = ..., before: _Optional[str] = ..., importance: _Optional[str] = ..., tag: _Optional[str] = ..., include_deleted: _Optional[bool] = ...) -> None: ...
+
+class ListMemoriesResponse(_message.Message):
+    __slots__ = ("ok", "memories", "total", "error")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    MEMORIES_FIELD_NUMBER: _ClassVar[int]
+    TOTAL_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    memories: _containers.RepeatedCompositeFieldContainer[MemoryRecord]
+    total: int
+    error: str
+    def __init__(self, ok: _Optional[bool] = ..., memories: _Optional[_Iterable[_Union[MemoryRecord, _Mapping]]] = ..., total: _Optional[int] = ..., error: _Optional[str] = ...) -> None: ...
+
+class UpdateMemoryRequest(_message.Message):
+    __slots__ = ("memory_id", "title", "content", "new_title", "importance", "tags", "has_tags")
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    NEW_TITLE_FIELD_NUMBER: _ClassVar[int]
+    IMPORTANCE_FIELD_NUMBER: _ClassVar[int]
+    TAGS_FIELD_NUMBER: _ClassVar[int]
+    HAS_TAGS_FIELD_NUMBER: _ClassVar[int]
+    memory_id: str
+    title: str
+    content: str
+    new_title: str
+    importance: str
+    tags: _containers.RepeatedScalarFieldContainer[str]
+    has_tags: bool
+    def __init__(self, memory_id: _Optional[str] = ..., title: _Optional[str] = ..., content: _Optional[str] = ..., new_title: _Optional[str] = ..., importance: _Optional[str] = ..., tags: _Optional[_Iterable[str]] = ..., has_tags: _Optional[bool] = ...) -> None: ...
+
+class UpdateMemoryResponse(_message.Message):
+    __slots__ = ("ok", "memory", "reindexed", "error")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
+    REINDEXED_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    memory: MemoryRecord
+    reindexed: bool
+    error: str
+    def __init__(self, ok: _Optional[bool] = ..., memory: _Optional[_Union[MemoryRecord, _Mapping]] = ..., reindexed: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+
+class DeleteMemoryRequest(_message.Message):
+    __slots__ = ("memory_id", "title", "confirm")
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    CONFIRM_FIELD_NUMBER: _ClassVar[int]
+    memory_id: str
+    title: str
+    confirm: bool
+    def __init__(self, memory_id: _Optional[str] = ..., title: _Optional[str] = ..., confirm: _Optional[bool] = ...) -> None: ...
+
+class DeleteMemoryResponse(_message.Message):
+    __slots__ = ("ok", "deleted", "memory_id", "error")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    DELETED_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    deleted: bool
+    memory_id: str
+    error: str
+    def __init__(self, ok: _Optional[bool] = ..., deleted: _Optional[bool] = ..., memory_id: _Optional[str] = ..., error: _Optional[str] = ...) -> None: ...
 
 class EntitiesRequest(_message.Message):
     __slots__ = ("name", "limit")
