@@ -397,10 +397,9 @@ class TestMCPTools:
         tools = asyncio.run(mod.list_tools())
         return tools
 
-    def test_all_seven_tools_registered(self) -> None:
-        """Exact tool-surface assertion: exactly the 7 new `memory_*` names,
-        zero legacy `graphrag_*` names — this is the hard-cutover contract
-        (see .plans/2026-07-29_rename-to-hars-longterm-memory.md section 3)."""
+    def test_all_tools_registered(self) -> None:
+        """Exact tool-surface assertion: all 12 `memory_*` names,
+        zero legacy `graphrag_*` names."""
         tools = self._load_tools()
         names = {t.name for t in tools}  # type: ignore[attr-defined]
         assert names == {
@@ -410,7 +409,12 @@ class TestMCPTools:
             "memory_consolidate",
             "memory_status",
             "memory_entities",
+            "memory_inspect_entity",
             "memory_related",
+            "memory_upsert_document",
+            "memory_delete_document",
+            "memory_sync_status",
+            "memory_list_projects",
         }
         assert not any(name.startswith("graphrag_") for name in names)
 
@@ -419,6 +423,18 @@ class TestMCPTools:
         tool = next(t for t in tools if t.name == "memory_recall")  # type: ignore[attr-defined]
         schema = tool.inputSchema  # type: ignore[attr-defined]
         assert "question" in schema.get("required", [])
+
+    def test_memory_inspect_entity_required(self) -> None:
+        tools = self._load_tools()
+        tool = next(t for t in tools if t.name == "memory_inspect_entity")  # type: ignore[attr-defined]
+        schema = tool.inputSchema  # type: ignore[attr-defined]
+        assert "name" in schema.get("required", [])
+
+    def test_memory_upsert_document_required(self) -> None:
+        tools = self._load_tools()
+        tool = next(t for t in tools if t.name == "memory_upsert_document")  # type: ignore[attr-defined]
+        schema = tool.inputSchema  # type: ignore[attr-defined]
+        assert "file_path" in schema.get("required", [])
 
     def test_memory_entities_required(self) -> None:
         tools = self._load_tools()
