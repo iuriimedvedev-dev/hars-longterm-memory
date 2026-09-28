@@ -69,14 +69,27 @@ class TokenStore:
     def verify_token(self, token_str: str | None) -> TokenContext | None:
         """Verify an authentication token string.
 
-        Supports tokens prefixed with 'Bearer ' or plain strings.
-        Performs constant-time comparison to prevent timing attacks.
+        Supports signed JWT tokens and static opaque tokens.
+        Tokens may optionally be prefixed with 'Bearer '.
+        Performs constant-time comparison for static keys to prevent timing attacks.
         Returns TokenContext on success, or None on failure.
         """
         candidate = self._normalize_token(token_str)
         if not candidate:
             return None
 
+        # 1. Check signed JWT first if candidate looks like a JWT
+        if candidate.count(".") == 2:
+            try:
+                from hars_memory.auth.jwt import get_default_jwt_manager  # noqa: PLC0415
+
+                jwt_ctx = get_default_jwt_manager().verify_token(candidate)
+                if jwt_ctx is not None:
+                    return jwt_ctx
+            except Exception as exc:
+                logger.debug("JWT verification error: %s", exc)
+
+        # 2. Check static registered tokens with constant-time comparison
         for known_key, access_token in self._tokens.items():
             if hmac.compare_digest(candidate, known_key):
                 return TokenContext.from_access_token(access_token)
