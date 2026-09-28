@@ -251,3 +251,31 @@ class TestAuthCLI:
         ctx = jwt_mgr.verify_token(f"Bearer {tok}")
         assert ctx is not None
         assert ctx.user_id == "prefix_user"
+
+    def test_passphrase_env_var(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HARS_MEMORY_AUTH_PASSPHRASE", "my_env_secret")
+        ks_path = tmp_path / "env_ks.enc"
+        ks = EncryptedKeyStore(keystore_path=ks_path)
+        ks.save(KeyStoreData(active_kid="env_key"))
+
+        ks_reload = EncryptedKeyStore(keystore_path=ks_path)
+        assert ks_reload.load().active_kid == "env_key"
+
+    def test_hot_reload_on_disk_change(self, temp_auth_dir):
+        _, keystore_path, master_key = temp_auth_dir
+        jwt_mgr1 = JWTManager(
+            keystore=EncryptedKeyStore(keystore_path=keystore_path, master_key=master_key)
+        )
+        tok = jwt_mgr1.issue_token(user_id="server_user")
+
+        jwt_mgr2_daemon = JWTManager(
+            keystore=EncryptedKeyStore(keystore_path=keystore_path, master_key=master_key)
+        )
+        # Daemon verifies token
+        assert jwt_mgr2_daemon.verify_token(tok) is not None
+
+        # Admin revokes token in separate manager (simulating CLI)
+        jwt_mgr1.revoke_token(tok)
+
+        # Daemon should pick up changes on disk without restart
+        assert jwt_mgr2_daemon.verify_token(tok) is None
