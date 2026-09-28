@@ -62,6 +62,9 @@ dependencies = [
   "grpcio>=1.60.0",
   "grpcio-health-checking>=1.60.0",
   "protobuf>=5.0.0",
+  # Auth, key encryption at rest and JWT signing
+  "cryptography>=42.0.0",
+  "pyjwt>=2.8.0",
 ]
 
 [project.optional-dependencies]

@@ -205,6 +205,12 @@ def grep_roots() -> list[Path]:
     return _existing([s for s in load_sources() if s.grep], "literal search")
 
 
+def read_manifest(manifest_path: Path) -> list[KnowledgeSource]:
+    """Read a knowledge-source manifest file and return KnowledgeSource entries."""
+    path = Path(manifest_path).expanduser().resolve()
+    return _load_file(path, path.parent)
+
+
 __all__ = [
     "HARS_MEMORY_SOURCES_MANIFEST_ENV",
     "HARS_MEMORY_SOURCES_MANIFEST_LOCAL_ENV",
@@ -214,4 +220,5 @@ __all__ = [
     "ingest_roots",
     "load_sources",
     "manifest_path",
+    "read_manifest",
 ]

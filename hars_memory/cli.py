@@ -218,7 +218,6 @@ def _cmd_recall(args: argparse.Namespace) -> int:
         _compute_hybrid_block,
         _get_rag,
         _lightrag_mode,
-        _resolve_fetch_top_k,
         _resolve_query_mode,
         _staleness_info,
         STALE_INDEX_WARNING_DAYS,
@@ -414,9 +413,6 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 def _cmd_estimate_cost(args: argparse.Namespace) -> int:
     """Estimate indexing cost before running."""
-    import os
-    import math
-
     # -- Model pricing table (per 1M tokens) --
     MODEL_PRICES: dict[str, tuple[float, float]] = {
         # (input_price_per_1M, output_price_per_1M)
@@ -578,6 +574,177 @@ def _cmd_estimate_cost(args: argparse.Namespace) -> int:
     print(f"  - Use --max-gleaning=0 to disable expensive retry cycles")
     print(f"  - Higher batch_size = fewer merge calls (but more per merge)")
 
+    return 0
+
+
+def _parse_duration_seconds(duration_str: str | None) -> int | None:
+    if not duration_str or duration_str.lower() in ("never", "none", "0", "infinite"):
+        return None
+    s = duration_str.strip().lower()
+    if s.endswith("d"):
+        return int(s[:-1]) * 86400
+    if s.endswith("h"):
+        return int(s[:-1]) * 3600
+    if s.endswith("m"):
+        return int(s[:-1]) * 60
+    if s.endswith("y"):
+        return int(s[:-1]) * 86400 * 365
+    if s.endswith("s"):
+        return int(s[:-1])
+    return int(s)
+
+
+def _cmd_auth_init_keys(args: argparse.Namespace) -> int:
+    from hars_memory.auth.jwt import get_default_jwt_manager
+    manager = get_default_jwt_manager()
+    try:
+        res = manager.init_keys(
+            algorithm=args.algorithm,
+            key_id=args.key_id,
+            force=args.force,
+        )
+        if args.json:
+            import json
+            print(json.dumps(res, indent=2))
+        else:
+            status_str = "created" if res.get("created") else "already exists (active)"
+            print(f"Signing key: {res.get('kid')} ({res.get('algorithm')}) - {status_str}")
+            if res.get("public_key_pem"):
+                print("\nPublic Key (PEM):")
+                print(res["public_key_pem"])
+        return 0
+    except Exception as exc:
+        print(f"error: failed to initialize keys: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_auth_issue_token(args: argparse.Namespace) -> int:
+    import json
+    from hars_memory.auth.jwt import get_default_jwt_manager
+
+    manager = get_default_jwt_manager()
+
+    departments = [d.strip() for d in args.dept.split(",")] if args.dept else []
+    groups = [g.strip() for g in args.groups.split(",")] if args.groups else []
+    roles = [r.strip() for r in args.roles.split(",")] if args.roles else []
+    scopes = [s.strip() for s in args.scopes.split(",")] if args.scopes else []
+
+    try:
+        expires_in_sec = _parse_duration_seconds(args.expires_in)
+        token = manager.issue_token(
+            user_id=args.user_id,
+            departments=departments,
+            groups=groups,
+            roles=roles,
+            scopes=scopes,
+            expires_in_seconds=expires_in_sec,
+            jti=args.jti,
+        )
+
+        info = manager.inspect_token(token)
+        payload = info.get("payload", {})
+
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "token": token,
+                        "token_type": "Bearer",
+                        "expires_at": info.get("expires_at"),
+                        "jti": payload.get("jti"),
+                        "claims": payload,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Token (Bearer):\n{token}\n")
+            print(f"Subject:    {payload.get('sub')}")
+            print(f"JTI:        {payload.get('jti')}")
+            print(f"Roles:      {', '.join(payload.get('roles', [])) or '(none)'}")
+            print(f"Depts:      {', '.join(payload.get('dept', [])) or '(none)'}")
+            print(f"Scopes:     {', '.join(payload.get('scope', [])) or '(none)'}")
+            print(f"Expires at: {info.get('expires_at')}")
+        return 0
+    except Exception as exc:
+        print(f"error: failed to issue token: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_auth_inspect_token(args: argparse.Namespace) -> int:
+    import json
+    from hars_memory.auth.jwt import get_default_jwt_manager
+
+    manager = get_default_jwt_manager()
+
+    info = manager.inspect_token(args.token)
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+
+    if not info.get("valid_structure"):
+        print(f"error: malformed JWT: {info.get('error')}", file=sys.stderr)
+        return 1
+
+    payload = info.get("payload", {})
+    verified = info.get("signature_verified", False)
+    revoked = info.get("is_revoked", False)
+    expired = info.get("is_expired", False)
+
+    print(f"Signature:  {'VALID' if verified else 'INVALID'}")
+    print(f"Status:     {'REVOKED' if revoked else ('EXPIRED' if expired else 'ACTIVE')}")
+    print(f"Subject:    {payload.get('sub')}")
+    print(f"JTI:        {payload.get('jti')}")
+    print(f"Roles:      {', '.join(payload.get('roles', [])) or '(none)'}")
+    print(f"Depts:      {', '.join(payload.get('dept', [])) or '(none)'}")
+    print(f"Scopes:     {', '.join(payload.get('scope', [])) or '(none)'}")
+    print(f"Expires at: {info.get('expires_at')}")
+    return 0
+
+
+def _cmd_auth_revoke_token(args: argparse.Namespace) -> int:
+    from hars_memory.auth.jwt import get_default_jwt_manager
+
+    manager = get_default_jwt_manager()
+
+    ok = manager.revoke_token(args.token_or_jti)
+    if ok:
+        print("Token revoked successfully.")
+        return 0
+    else:
+        print("error: failed to revoke token (invalid token or jti)", file=sys.stderr)
+        return 1
+
+
+def _cmd_auth_list_keys(args: argparse.Namespace) -> int:
+    import json
+    from hars_memory.auth.jwt import get_default_jwt_manager
+
+    manager = get_default_jwt_manager()
+    data = manager._get_data(refresh=True)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "active_kid": data.active_kid,
+                    "keys": {
+                        k: {"algorithm": v.get("algorithm"), "created_at": v.get("created_at")}
+                        for k, v in data.keys.items()
+                    },
+                    "revoked_count": len(data.revoked_jtis),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"Active Key ID:  {data.active_kid or '(none)'}")
+    print(f"Total keys:     {len(data.keys)}")
+    print(f"Revoked tokens: {len(data.revoked_jtis)}")
+    for kid, kinfo in data.keys.items():
+        active_mark = " (ACTIVE)" if kid == data.active_kid else ""
+        print(f" - {kid}: alg={kinfo.get('algorithm')}, created={kinfo.get('created_at', '?')}{active_mark}")
     return 0
 
 
@@ -765,6 +932,43 @@ def _build_parser() -> argparse.ArgumentParser:
     estimate_p.add_argument("--batch-size", type=int, default=256, help="Insert batch size (default: 256)")
     estimate_p.add_argument("--max-gleaning", type=int, default=0, help="Max gleaning rounds (default: 0, disables retry loops)")
     estimate_p.set_defaults(func=_cmd_estimate_cost)
+
+    # -- Auth & Token Management --
+    auth_p = sub.add_parser("auth", help="Token and key management (JWT, keystore, revocation).")
+    auth_sub = auth_p.add_subparsers(dest="auth_command", required=True)
+
+    init_k_p = auth_sub.add_parser("init-keys", help="Initialize signing key pair in encrypted keystore.")
+    init_k_p.add_argument(
+        "--algorithm", default="EdDSA", choices=("EdDSA", "HS256"), help="Signing algorithm (default: EdDSA)"
+    )
+    init_k_p.add_argument("--key-id", default=None, help="Custom Key ID")
+    init_k_p.add_argument("--force", action="store_true", help="Force new key generation even if active key exists")
+    init_k_p.add_argument("--json", action="store_true", help="Output JSON")
+    init_k_p.set_defaults(func=_cmd_auth_init_keys)
+
+    issue_p = auth_sub.add_parser("issue-token", help="Issue a signed JWT access token.")
+    issue_p.add_argument("--user-id", required=True, help="User/caller identifier (e.g. alice, pier-agent)")
+    issue_p.add_argument("--dept", default="", help="Comma-separated departments (e.g. sre,monitoring)")
+    issue_p.add_argument("--groups", default="", help="Comma-separated groups")
+    issue_p.add_argument("--roles", default="developer", help="Comma-separated roles (e.g. admin, developer, viewer)")
+    issue_p.add_argument("--scopes", default="knowledge:read,knowledge:write", help="Comma-separated scopes or '*'")
+    issue_p.add_argument("--expires-in", default="30d", help="Token expiration (e.g. 30d, 90d, 1y, never)")
+    issue_p.add_argument("--jti", default=None, help="Custom token ID")
+    issue_p.add_argument("--json", action="store_true", help="Output JSON")
+    issue_p.set_defaults(func=_cmd_auth_issue_token)
+
+    inspect_p = auth_sub.add_parser("inspect-token", help="Decode and inspect a JWT access token.")
+    inspect_p.add_argument("token", help="JWT token string")
+    inspect_p.add_argument("--json", action="store_true", help="Output JSON")
+    inspect_p.set_defaults(func=_cmd_auth_inspect_token)
+
+    revoke_p = auth_sub.add_parser("revoke-token", help="Revoke a token by its jti or raw token string.")
+    revoke_p.add_argument("token_or_jti", help="JWT token string or jti claim")
+    revoke_p.set_defaults(func=_cmd_auth_revoke_token)
+
+    list_k_p = auth_sub.add_parser("list-keys", help="List signing keys and revocation stats.")
+    list_k_p.add_argument("--json", action="store_true", help="Output JSON")
+    list_k_p.set_defaults(func=_cmd_auth_list_keys)
 
     return parser
 
