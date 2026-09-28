@@ -35,15 +35,38 @@ class JWTManager:
             keystore_path=keystore_path, master_key=master_key
         )
         self._cached_data: KeyStoreData | None = None
+        self._last_mtime_ns: int | None = None
 
     def _get_data(self, refresh: bool = False) -> KeyStoreData:
-        if self._cached_data is None or refresh:
+        try:
+            current_mtime = (
+                self.keystore.keystore_path.stat().st_mtime_ns
+                if self.keystore.keystore_path.exists()
+                else None
+            )
+        except OSError:
+            current_mtime = None
+
+        if (
+            self._cached_data is None
+            or refresh
+            or (current_mtime is not None and current_mtime != self._last_mtime_ns)
+        ):
             self._cached_data = self.keystore.load()
+            self._last_mtime_ns = current_mtime
         return self._cached_data
 
     def _save_data(self, data: KeyStoreData) -> None:
         self.keystore.save(data)
         self._cached_data = data
+        try:
+            self._last_mtime_ns = (
+                self.keystore.keystore_path.stat().st_mtime_ns
+                if self.keystore.keystore_path.exists()
+                else None
+            )
+        except OSError:
+            self._last_mtime_ns = None
 
     def init_keys(
         self,

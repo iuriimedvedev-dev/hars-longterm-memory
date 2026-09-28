@@ -100,8 +100,9 @@ class EncryptedKeyStore:
         if env_key:
             return self._parse_key_string(env_key)
 
-        if passphrase:
-            return self._derive_key_from_passphrase(passphrase, salt=b"hars_memory_master_salt_static")
+        passphrase_val = passphrase or os.environ.get("HARS_MEMORY_AUTH_PASSPHRASE", "").strip()
+        if passphrase_val:
+            return self._derive_key_from_passphrase(passphrase_val, salt=b"hars_memory_master_salt_static")
 
         # Check default master key file
         master_key_file = DEFAULT_MASTER_KEY_PATH

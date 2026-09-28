@@ -836,16 +836,30 @@ class APIKeyInterceptor(grpc.aio.ServerInterceptor):
         from hars_memory.auth.store import get_default_token_store  # noqa: PLC0415
 
         metadata = dict(handler_call_details.invocation_metadata or [])
+        method_path = handler_call_details.method or ""
+        method_name = method_path.split("/")[-1]
+
+        # Health checks bypass authentication
+        if "Health" in method_path or method_name in ("Check", "Watch"):
+            return await continuation(handler_call_details)
+
         auth_enabled = is_auth_enabled()
 
-        # 1. API key check if HARS_MEMORY_API_KEYS_JSON is set
-        if self._keys:
-            api_key = metadata.get("x-api-key", metadata.get("X-API-Key", ""))
-            if not api_key or api_key not in self._keys:
-                return self._abort_handler(grpc.StatusCode.UNAUTHENTICATED, "invalid API key")
+        # Check API key if configured
+        api_key = metadata.get("x-api-key", metadata.get("X-API-Key", ""))
+        api_key_valid = bool(self._keys and api_key and api_key in self._keys)
 
-        # 2. Token-based auth if HARS_MEMORY_AUTH_ENABLED is true
+        if self._keys and not auth_enabled:
+            if not api_key_valid:
+                return self._abort_handler(grpc.StatusCode.UNAUTHENTICATED, "invalid API key")
+            return await continuation(handler_call_details)
+
+        # Token-based auth if HARS_MEMORY_AUTH_ENABLED is true
         if auth_enabled:
+            if api_key_valid:
+                # Pre-configured API key bypasses token requirement
+                return await continuation(handler_call_details)
+
             auth_header = metadata.get("authorization", metadata.get("Authorization", ""))
             raw_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header.strip()
             token_store = self._token_store or get_default_token_store()
@@ -854,9 +868,6 @@ class APIKeyInterceptor(grpc.aio.ServerInterceptor):
             if not token_context:
                 return self._abort_handler(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing access token")
 
-            # Determine method action
-            method_path = handler_call_details.method or ""
-            method_name = method_path.split("/")[-1]
             action = self.METHOD_ACTION_MAP.get(method_name, "read")
 
             if not check_permission(token_context, "default", action, auth_enabled=True):
