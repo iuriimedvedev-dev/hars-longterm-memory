@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import uuid
 from concurrent import futures
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from google.protobuf import empty_pb2, struct_pb2
 
 from hars_memory.grpc import hars_memory_pb2 as pb2
 from hars_memory.grpc import hars_memory_pb2_grpc as pb2_grpc
+from hars_memory.catalog import Memory, MemoryCatalog
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_write_event, setup_logging
 
@@ -37,7 +39,6 @@ from hars_memory.mcp_server import (  # noqa: PLC2701
     _get_graph,
     _get_rag,
     _graph_file_path,
-    _has_graph_entity_context,
     _index_status,
     _lightrag_mode,
     _normalize_entity_text,
@@ -57,8 +58,6 @@ from hars_memory.mcp_server import (  # noqa: PLC2701
     HARS_MEMORY_INDEX_DIR,
     HARS_MEMORY_STAGING_DIR,
     LLM_RESPONSE_TYPE,
-    NAIVE_FALLBACK_MODE,
-    STALE_INDEX_WARNING_DAYS,
     SUBGRAPH_MAX_HOPS,
     _QUERY_MODEL_LOCK,
     _merge_context_with_fusion,
@@ -79,6 +78,64 @@ def _dict_to_struct(data: dict[str, Any]) -> struct_pb2.Struct:
     from google.protobuf import json_format as _json_format
 
     return _json_format.ParseDict(json.loads(json.dumps(data, default=str)), struct_pb2.Struct())
+
+
+def _catalog() -> MemoryCatalog:
+    return MemoryCatalog()
+
+
+def _memory_record(memory: Memory) -> pb2.MemoryRecord:
+    return pb2.MemoryRecord(
+        memory_id=memory.memory_id,
+        title=memory.title,
+        content=memory.content,
+        importance=memory.importance,
+        tags=list(memory.tags),
+        source_path=memory.source_path,
+        doc_id=memory.doc_id or "",
+        status=memory.status,
+        created_at=memory.created_at,
+        updated_at=memory.updated_at,
+    )
+
+
+def _memory_file_text(*, path: Path, importance: str, tags: list[str], content: str) -> str:
+    now = datetime.datetime.now()
+    header = (
+        f"[Document: {path.name} | Section: staging | Date: {now:%Y-%m-%d} "
+        f"| Importance: {importance}]\n\n"
+    )
+    meta = f"Tags: {', '.join(tags)}\n\n" if tags else ""
+    return header + meta + content + "\n"
+
+
+def _select_memory(request: Any, store: MemoryCatalog) -> tuple[Memory | None, str | None]:
+    has_memory_id = request.HasField("memory_id")
+    has_title = request.HasField("title")
+    if has_memory_id == has_title:
+        return None, "supply exactly one of memory_id or title"
+    if has_memory_id:
+        memory_id = request.memory_id.strip()
+        if not memory_id:
+            return None, "memory_id is required"
+        memory = store.get_by_id(memory_id)
+        return memory, None if memory else f"memory not found: {memory_id}"
+    title = request.title.strip()
+    if not title:
+        return None, "title is required"
+    matches = store.find_by_title(title)
+    if not matches:
+        return None, f"memory not found: {title}"
+    if len(matches) > 1:
+        ids = ", ".join(memory.memory_id for memory in matches)
+        return None, f"title is ambiguous; candidate ids: {ids}"
+    return matches[0], None
+
+
+async def replace_indexed_document(rag: Any, doc_id: str, text: str, path: str) -> None:
+    """Replace one LightRAG document; kept separate so tests can inject it."""
+    await rag.adelete_by_doc_id(doc_id)
+    await rag.ainsert([text], ids=[doc_id], file_paths=[path])
 
 
 class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
@@ -123,9 +180,6 @@ class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
             query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
 
             if context_only:
-                import time as _time  # noqa: PLC0415
-
-                graph_start = _time.monotonic()
                 context_str = await asyncio.wait_for(
                     rag.aquery(  # type: ignore[attr-defined]
                         question,
@@ -255,27 +309,46 @@ class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
     ) -> pb2.RememberResponse:
         """Handle memory_remember via gRPC."""
         try:
-            import datetime as _dt  # noqa: PLC0415
-
             content = request.content.strip()
             if not content:
                 return pb2.RememberResponse(ok=False, error="content is required")
-            title = re.sub(r"[^A-Za-z0-9._-]", "-", request.title or "note")[:80]
+            display_title = (request.title or "note").strip() or "note"
+            title = re.sub(r"[^A-Za-z0-9._-]", "-", display_title)[:80]
             importance = request.importance or "normal"
             tags = list(request.tags) or []
             staging = Path(HARS_MEMORY_STAGING_DIR)
             staging.mkdir(parents=True, exist_ok=True)
-            now = _dt.datetime.now()
+            now = datetime.datetime.now()
             fname = f"{now:%Y-%m-%d}_{title}_{now:%H%M%S}.md"
-            header = f"[Document: {fname} | Section: staging | Date: {now:%Y-%m-%d} | Importance: {importance}]\n\n"
-            meta = f"Tags: {', '.join(tags)}\n\n" if tags else ""
-            (staging / fname).write_text(header + meta + content + "\n")
+            source_path = staging / fname
+            source_path.write_text(
+                _memory_file_text(
+                    path=source_path,
+                    importance=importance,
+                    tags=tags,
+                    content=content,
+                )
+            )
+            memory_id = uuid.uuid4().hex
+            try:
+                _catalog().create(
+                    memory_id=memory_id,
+                    title=display_title,
+                    content=content,
+                    importance=importance,
+                    tags=tags,
+                    source_path=str(source_path),
+                )
+            except Exception:
+                source_path.unlink(missing_ok=True)
+                raise
             pending = len(list(staging.glob("*.md")))
             log_write_event(
                 tool="grpc_remember",
                 ok=True,
                 detail={
-                    "saved": str(staging / fname),
+                    "saved": str(source_path),
+                    "memory_id": memory_id,
                     "pending_notes": pending,
                     "importance": importance,
                     "tags": tags,
@@ -283,13 +356,153 @@ class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
             )
             return pb2.RememberResponse(
                 ok=True,
-                saved=str(staging / fname),
+                saved=str(source_path),
                 pending_notes=pending,
                 note="Will be merged into the graph by the next update_kb.sh run.",
+                memory_id=memory_id,
             )
         except Exception as exc:
             logger.error("Remember RPC failed: %s", exc, exc_info=True)
             return pb2.RememberResponse(ok=False, error=str(exc))
+
+    async def GetMemory(  # type: ignore[override]
+        self, request: pb2.GetMemoryRequest, context: grpc.aio.ServicerContext
+    ) -> pb2.GetMemoryResponse:
+        """Return one memory selected by id or exact title."""
+        try:
+            memory, error = _select_memory(request, _catalog())
+            if error:
+                return pb2.GetMemoryResponse(ok=False, error=error)
+            return pb2.GetMemoryResponse(ok=True, memory=_memory_record(memory))
+        except Exception as exc:
+            logger.error("GetMemory RPC failed: %s", exc, exc_info=True)
+            return pb2.GetMemoryResponse(ok=False, error=str(exc))
+
+    async def ListMemories(  # type: ignore[override]
+        self, request: pb2.ListMemoriesRequest, context: grpc.aio.ServicerContext
+    ) -> pb2.ListMemoriesResponse:
+        """List memories newest first, optionally excluding tombstones."""
+        try:
+            statuses: tuple[str, ...] | None = None if request.include_deleted else ("staged", "indexed")
+            store = _catalog()
+            before = request.before if request.HasField("before") else None
+            importance = request.importance if request.HasField("importance") else None
+            tag = request.tag if request.HasField("tag") else None
+            memories = store.list(
+                limit=request.limit or 20,
+                before=before,
+                importance=importance,
+                tag=tag,
+                status=statuses,
+            )
+            return pb2.ListMemoriesResponse(
+                ok=True,
+                memories=[_memory_record(memory) for memory in memories],
+                total=store.count(before=before, importance=importance, tag=tag, status=statuses),
+            )
+        except Exception as exc:
+            logger.error("ListMemories RPC failed: %s", exc, exc_info=True)
+            return pb2.ListMemoriesResponse(ok=False, error=str(exc))
+
+    async def UpdateMemory(  # type: ignore[override]
+        self, request: pb2.UpdateMemoryRequest, context: grpc.aio.ServicerContext
+    ) -> pb2.UpdateMemoryResponse:
+        """Merge changes into a memory and replace its indexed document when needed."""
+        try:
+            store = _catalog()
+            memory, error = _select_memory(request, store)
+            if error:
+                return pb2.UpdateMemoryResponse(ok=False, error=error)
+            if memory.status == "deleted":
+                return pb2.UpdateMemoryResponse(ok=False, error="memory is deleted")
+
+            title = request.new_title if request.HasField("new_title") else memory.title
+            content = request.content.strip() if request.HasField("content") else memory.content
+            if not title.strip():
+                return pb2.UpdateMemoryResponse(ok=False, error="new_title cannot be empty")
+            if not content:
+                return pb2.UpdateMemoryResponse(ok=False, error="content cannot be empty")
+            importance = request.importance if request.HasField("importance") else memory.importance
+            if not importance:
+                return pb2.UpdateMemoryResponse(ok=False, error="importance cannot be empty")
+            tags = list(request.tags) if request.has_tags else list(memory.tags)
+
+            source_path = Path(memory.source_path)
+            old_bytes = source_path.read_bytes() if source_path.exists() else None
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(
+                _memory_file_text(
+                    path=source_path,
+                    importance=importance,
+                    tags=tags,
+                    content=content,
+                )
+            )
+            reindexed = False
+            try:
+                if memory.status == "indexed" and memory.doc_id:
+                    rag = await _get_rag()
+                    await replace_indexed_document(rag, memory.doc_id, content, str(source_path))
+                    reindexed = True
+                updated = store.update(
+                    memory.memory_id,
+                    title=title,
+                    content=content,
+                    importance=importance,
+                    tags=tags,
+                )
+            except Exception:
+                if old_bytes is None:
+                    source_path.unlink(missing_ok=True)
+                else:
+                    source_path.write_bytes(old_bytes)
+                raise
+            if updated is None:
+                return pb2.UpdateMemoryResponse(ok=False, error="memory not found")
+            return pb2.UpdateMemoryResponse(
+                ok=True,
+                memory=_memory_record(updated),
+                reindexed=reindexed,
+            )
+        except Exception as exc:
+            logger.error("UpdateMemory RPC failed: %s", exc, exc_info=True)
+            return pb2.UpdateMemoryResponse(ok=False, error=str(exc))
+
+    async def DeleteMemory(  # type: ignore[override]
+        self, request: pb2.DeleteMemoryRequest, context: grpc.aio.ServicerContext
+    ) -> pb2.DeleteMemoryResponse:
+        """Delete a memory source/index document and retain a catalog tombstone."""
+        if not request.confirm:
+            return pb2.DeleteMemoryResponse(ok=False, deleted=False, error="confirm=true is required")
+        try:
+            store = _catalog()
+            memory, error = _select_memory(request, store)
+            if error:
+                return pb2.DeleteMemoryResponse(ok=False, deleted=False, error=error)
+            if memory.status == "deleted":
+                return pb2.DeleteMemoryResponse(
+                    ok=True, deleted=False, memory_id=memory.memory_id, error="memory is already deleted"
+                )
+
+            source_path = Path(memory.source_path)
+            old_bytes = source_path.read_bytes() if source_path.exists() else None
+            try:
+                if memory.status == "indexed" and memory.doc_id:
+                    rag = await _get_rag()
+                    await rag.adelete_by_doc_id(memory.doc_id)
+                source_path.unlink(missing_ok=True)
+                deleted = store.mark_deleted(memory.memory_id)
+            except Exception:
+                if old_bytes is not None and not source_path.exists():
+                    source_path.parent.mkdir(parents=True, exist_ok=True)
+                    source_path.write_bytes(old_bytes)
+                raise
+            if deleted is None:
+                return pb2.DeleteMemoryResponse(ok=False, deleted=False, error="memory not found")
+            return pb2.DeleteMemoryResponse(ok=True, deleted=True, memory_id=memory.memory_id)
+        except Exception as exc:
+            logger.error("DeleteMemory RPC failed: %s", exc, exc_info=True)
+            return pb2.DeleteMemoryResponse(ok=False, deleted=False, error=str(exc))
 
     async def SearchEntities(  # type: ignore[override]
         self, request: pb2.EntitiesRequest, context: grpc.aio.ServicerContext
@@ -579,28 +792,77 @@ class LongTermMemoryServicer(pb2_grpc.LongTermMemoryServicer):
 
 
 class APIKeyInterceptor(grpc.aio.ServerInterceptor):
-    """gRPC interceptor that checks X-API-Key metadata against configured keys."""
+    """gRPC interceptor that checks authentication and authorization.
 
-    def __init__(self) -> None:
+    Supports:
+    1. X-API-Key metadata checked against HARS_MEMORY_API_KEYS_JSON.
+    2. Bearer tokens in Authorization metadata checked against TokenStore
+       and permissions when HARS_MEMORY_AUTH_ENABLED is active.
+    """
+
+    METHOD_ACTION_MAP: dict[str, str] = {
+        "Query": "read",
+        "Status": "read",
+        "SearchEntities": "read",
+        "RelatedEntities": "read",
+        "GetMemory": "read",
+        "ListMemories": "read",
+        "Remember": "write",
+        "UpdateMemory": "write",
+        "DeleteMemory": "admin",
+        "Consolidate": "admin",
+        "Forget": "admin",
+    }
+
+    def __init__(self, token_store: Any = None) -> None:
         raw = os.environ.get("HARS_MEMORY_API_KEYS_JSON", "")
         self._keys: dict[str, str] = json.loads(raw) if raw else {}
+        self._token_store = token_store
         super().__init__()
+
+    @staticmethod
+    def _abort_handler(code: grpc.StatusCode, details: str) -> grpc.RpcMethodHandler:
+        async def unary_unary(request: Any, context: grpc.aio.ServicerContext) -> Any:
+            await context.abort(code, details)
+
+        return grpc.unary_unary_rpc_method_handler(unary_unary)
 
     async def intercept_service(
         self,
         continuation: Any,
         handler_call_details: Any,
     ) -> grpc.RpcMethodHandler:
-        if not self._keys:
-            return await continuation(handler_call_details)
+        from hars_memory.auth.policy import check_permission, is_auth_enabled  # noqa: PLC0415
+        from hars_memory.auth.store import get_default_token_store  # noqa: PLC0415
+
         metadata = dict(handler_call_details.invocation_metadata or [])
-        api_key = metadata.get("x-api-key", metadata.get("X-API-Key", ""))
-        if api_key in self._keys:
-            return await continuation(handler_call_details)
-        context = grpc.aio.ServicerContext()
-        context.set_code(grpc.StatusCode.UNAUTHENTICATED)
-        context.set_details("invalid API key")
-        raise context  # type: ignore[misc]
+        auth_enabled = is_auth_enabled()
+
+        # 1. API key check if HARS_MEMORY_API_KEYS_JSON is set
+        if self._keys:
+            api_key = metadata.get("x-api-key", metadata.get("X-API-Key", ""))
+            if not api_key or api_key not in self._keys:
+                return self._abort_handler(grpc.StatusCode.UNAUTHENTICATED, "invalid API key")
+
+        # 2. Token-based auth if HARS_MEMORY_AUTH_ENABLED is true
+        if auth_enabled:
+            auth_header = metadata.get("authorization", metadata.get("Authorization", ""))
+            raw_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header.strip()
+            token_store = self._token_store or get_default_token_store()
+            token_context = token_store.verify_token(raw_token) if raw_token else None
+
+            if not token_context:
+                return self._abort_handler(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing access token")
+
+            # Determine method action
+            method_path = handler_call_details.method or ""
+            method_name = method_path.split("/")[-1]
+            action = self.METHOD_ACTION_MAP.get(method_name, "read")
+
+            if not check_permission(token_context, "default", action, auth_enabled=True):
+                return self._abort_handler(grpc.StatusCode.PERMISSION_DENIED, "permission denied")
+
+        return await continuation(handler_call_details)
 
 
 async def _compute_hybrid_block(
@@ -623,7 +885,9 @@ async def _serve() -> None:
     logger.info("Starting gRPC server on %s:%s", HARS_MEMORY_GRPC_HOST, HARS_MEMORY_GRPC_PORT)
 
     interceptors: list[grpc.aio.ServerInterceptor] = []
-    if os.environ.get("HARS_MEMORY_API_KEYS_JSON"):
+    from hars_memory.auth.policy import is_auth_enabled  # noqa: PLC0415
+
+    if os.environ.get("HARS_MEMORY_API_KEYS_JSON") or is_auth_enabled():
         interceptors.append(APIKeyInterceptor())
 
     server = grpc.aio.server(
@@ -640,7 +904,7 @@ async def _serve() -> None:
 
     # Add the standard gRPC health checking service
     grpc_health = _HealthServicer()
-    from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: PLC0415
+    from grpc_health.v1 import health_pb2_grpc  # noqa: PLC0415
 
     health_pb2_grpc.add_HealthServicer_to_server(grpc_health, server)  # type: ignore[attr-defined]
 

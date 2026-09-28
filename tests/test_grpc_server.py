@@ -5,12 +5,9 @@ Uses a mocked MCP server to avoid requiring a running LightRAG instance.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import sys
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import AsyncGenerator, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -317,8 +314,6 @@ class TestGrpcServerCapture:
 
     async def test_status_returns_ok(self, mock_env: None, mock_mcp_server: None) -> None:
         """Status RPC returns ok=True with index data."""
-        from hars_memory.grpc import hars_memory_pb2_grpc as pb2_grpc
-        from hars_memory.grpc import hars_memory_pb2 as pb2
         from google.protobuf import empty_pb2
         from hars_memory.grpc.server import LongTermMemoryServicer
 
@@ -418,3 +413,198 @@ class TestGrpcServerCapture:
             req = pb2.ConsolidateRequest(paths=[".plans"], dry_run=True)
             resp = await servicer.Consolidate(req, MagicMock())
             assert resp.ok is True
+
+
+class TestMemoryMaintenanceRpc:
+    """Exercise catalog-backed memory maintenance RPCs with mocked LightRAG."""
+
+    async def test_remember_get_and_ambiguous_title(self, tmp_path, monkeypatch) -> None:
+        from hars_memory.catalog import MemoryCatalog
+        from hars_memory.grpc import hars_memory_pb2 as pb2
+        from hars_memory.grpc import server
+
+        monkeypatch.setenv("HARS_MEMORY_CATALOG_PATH", str(tmp_path / "catalog.sqlite"))
+        monkeypatch.setattr(server, "HARS_MEMORY_STAGING_DIR", str(tmp_path / "staging"))
+        servicer = server.LongTermMemoryServicer()
+        response = await servicer.Remember(
+            pb2.RememberRequest(title="Shared title", content="body", tags=["tag"]), MagicMock()
+        )
+        assert response.ok is True
+        assert response.memory_id
+        assert MemoryCatalog(tmp_path / "catalog.sqlite").get_by_id(response.memory_id).status == "staged"
+
+        fetched = await servicer.GetMemory(pb2.GetMemoryRequest(memory_id=response.memory_id), MagicMock())
+        assert fetched.ok is True
+        assert fetched.memory.content == "body"
+
+        catalog = MemoryCatalog(tmp_path / "catalog.sqlite")
+        catalog.create(
+            memory_id="other",
+            title="Shared title",
+            content="other",
+            importance="normal",
+            tags=[],
+            source_path=str(tmp_path / "other.md"),
+        )
+        ambiguous = await servicer.GetMemory(pb2.GetMemoryRequest(title="shared title"), MagicMock())
+        assert ambiguous.ok is False
+        assert response.memory_id in ambiguous.error
+        assert "other" in ambiguous.error
+
+        listed = await servicer.ListMemories(pb2.ListMemoriesRequest(limit=1), MagicMock())
+        assert listed.ok is True
+        assert len(listed.memories) == 1
+        assert listed.total == 2
+
+    async def test_update_staged_rewrites_file_without_rag(self, tmp_path, monkeypatch) -> None:
+        from hars_memory.catalog import MemoryCatalog
+        from hars_memory.grpc import hars_memory_pb2 as pb2
+        from hars_memory.grpc import server
+
+        monkeypatch.setenv("HARS_MEMORY_CATALOG_PATH", str(tmp_path / "catalog.sqlite"))
+        monkeypatch.setattr(server, "HARS_MEMORY_STAGING_DIR", str(tmp_path / "staging"))
+        servicer = server.LongTermMemoryServicer()
+        remembered = await servicer.Remember(pb2.RememberRequest(title="Old", content="old"), MagicMock())
+        memory = MemoryCatalog(tmp_path / "catalog.sqlite").get_by_id(remembered.memory_id)
+        with patch("hars_memory.grpc.server._get_rag", new_callable=AsyncMock) as get_rag:
+            updated = await servicer.UpdateMemory(
+                pb2.UpdateMemoryRequest(memory_id=remembered.memory_id, content="new", new_title="New"),
+                MagicMock(),
+            )
+        assert updated.ok is True
+        assert updated.reindexed is False
+        assert "new" in Path(memory.source_path).read_text()
+        assert get_rag.await_count == 0
+
+    async def test_update_indexed_replaces_same_doc_and_delete_tombstones(self, tmp_path, monkeypatch) -> None:
+        from hars_memory.catalog import MemoryCatalog
+        from hars_memory.grpc import hars_memory_pb2 as pb2
+        from hars_memory.grpc import server
+
+        monkeypatch.setenv("HARS_MEMORY_CATALOG_PATH", str(tmp_path / "catalog.sqlite"))
+        monkeypatch.setattr(server, "HARS_MEMORY_STAGING_DIR", str(tmp_path / "staging"))
+        servicer = server.LongTermMemoryServicer()
+        remembered = await servicer.Remember(pb2.RememberRequest(title="Indexed", content="old"), MagicMock())
+        catalog = MemoryCatalog(tmp_path / "catalog.sqlite")
+        memory = catalog.update(remembered.memory_id, status="indexed", doc_id="doc-1")
+        rag = MagicMock()
+        rag.adelete_by_doc_id = AsyncMock()
+        rag.ainsert = AsyncMock()
+        with patch("hars_memory.grpc.server._get_rag", new=AsyncMock(return_value=rag)):
+            updated = await servicer.UpdateMemory(
+                pb2.UpdateMemoryRequest(memory_id=remembered.memory_id, content="new"), MagicMock()
+            )
+            assert updated.ok is True
+            assert updated.reindexed is True
+            deleted_without_confirm = await servicer.DeleteMemory(
+                pb2.DeleteMemoryRequest(memory_id=remembered.memory_id), MagicMock()
+            )
+            assert deleted_without_confirm.ok is False
+            deleted = await servicer.DeleteMemory(
+                pb2.DeleteMemoryRequest(memory_id=remembered.memory_id, confirm=True), MagicMock()
+            )
+        assert rag.adelete_by_doc_id.await_count == 2
+        rag.adelete_by_doc_id.assert_any_await("doc-1")
+        rag.ainsert.assert_awaited_once_with(["new"], ids=["doc-1"], file_paths=[memory.source_path])
+        assert deleted.ok is True
+        assert deleted.deleted is True
+        assert not Path(memory.source_path).exists()
+        assert catalog.get_by_id(remembered.memory_id).status == "deleted"
+
+
+class TestGrpcAuthInterceptor:
+    """Test APIKeyInterceptor with API keys and Bearer tokens."""
+
+    async def test_api_key_auth(self, monkeypatch) -> None:
+        import grpc
+        from hars_memory.grpc.server import APIKeyInterceptor
+
+        monkeypatch.setenv("HARS_MEMORY_API_KEYS_JSON", '{"valid-key": "user1"}')
+        monkeypatch.delenv("HARS_MEMORY_AUTH_ENABLED", raising=False)
+        interceptor = APIKeyInterceptor()
+
+        continuation = AsyncMock(return_value="success")
+
+        # 1. Missing api key
+        call_details = MagicMock()
+        call_details.invocation_metadata = []
+        handler = await interceptor.intercept_service(continuation, call_details)
+        assert handler is not None
+        context = MagicMock()
+        context.abort = AsyncMock()
+        await handler.unary_unary(None, context)
+        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid API key")
+
+        # 2. Valid api key
+        call_details.invocation_metadata = [("x-api-key", "valid-key")]
+        res = await interceptor.intercept_service(continuation, call_details)
+        assert res == "success"
+
+    async def test_bearer_token_auth(self, monkeypatch) -> None:
+        import grpc
+        from hars_memory.auth.models import AccessToken
+        from hars_memory.auth.store import TokenStore
+        from hars_memory.grpc.server import APIKeyInterceptor
+
+        monkeypatch.delenv("HARS_MEMORY_API_KEYS_JSON", raising=False)
+        monkeypatch.setenv("HARS_MEMORY_AUTH_ENABLED", "1")
+
+        token_store = TokenStore(auto_load=False)
+        # Token with read-only permission for default project
+        token_store.add_token(
+            AccessToken(
+                token="read-token",
+                user_id="alice",
+                roles=["viewer"],
+                permissions=["default:read"],
+            )
+        )
+        # Token with full permissions
+        token_store.add_token(
+            AccessToken(
+                token="admin-token",
+                user_id="bob",
+                roles=["admin"],
+                permissions=["*"],
+            )
+        )
+
+        interceptor = APIKeyInterceptor(token_store=token_store)
+        continuation = AsyncMock(return_value="success")
+
+        # 1. Missing token
+        call_details = MagicMock()
+        call_details.method = "/hars_memory.LongTermMemory/Query"
+        call_details.invocation_metadata = []
+        handler = await interceptor.intercept_service(continuation, call_details)
+        context = MagicMock()
+        context.abort = AsyncMock()
+        await handler.unary_unary(None, context)
+        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing access token")
+
+        # 2. Invalid token
+        call_details.invocation_metadata = [("authorization", "Bearer invalid-token")]
+        handler = await interceptor.intercept_service(continuation, call_details)
+        context = MagicMock()
+        context.abort = AsyncMock()
+        await handler.unary_unary(None, context)
+        context.abort.assert_awaited_once_with(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing access token")
+
+        # 3. Read token on Query (read action) -> success
+        call_details.invocation_metadata = [("authorization", "Bearer read-token")]
+        res = await interceptor.intercept_service(continuation, call_details)
+        assert res == "success"
+
+        # 4. Read token on Remember (write action) -> permission denied
+        call_details.method = "/hars_memory.LongTermMemory/Remember"
+        call_details.invocation_metadata = [("authorization", "Bearer read-token")]
+        handler = await interceptor.intercept_service(continuation, call_details)
+        context = MagicMock()
+        context.abort = AsyncMock()
+        await handler.unary_unary(None, context)
+        context.abort.assert_awaited_once_with(grpc.StatusCode.PERMISSION_DENIED, "permission denied")
+
+        # 5. Admin token on Remember -> success
+        call_details.invocation_metadata = [("authorization", "Bearer admin-token")]
+        res = await interceptor.intercept_service(continuation, call_details)
+        assert res == "success"

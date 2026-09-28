@@ -50,6 +50,26 @@ class LongTermMemoryStub:
                 request_serializer=hars__memory__pb2.RememberRequest.SerializeToString,
                 response_deserializer=hars__memory__pb2.RememberResponse.FromString,
                 _registered_method=True)
+        self.GetMemory = channel.unary_unary(
+                '/hars_memory.LongTermMemory/GetMemory',
+                request_serializer=hars__memory__pb2.GetMemoryRequest.SerializeToString,
+                response_deserializer=hars__memory__pb2.GetMemoryResponse.FromString,
+                _registered_method=True)
+        self.ListMemories = channel.unary_unary(
+                '/hars_memory.LongTermMemory/ListMemories',
+                request_serializer=hars__memory__pb2.ListMemoriesRequest.SerializeToString,
+                response_deserializer=hars__memory__pb2.ListMemoriesResponse.FromString,
+                _registered_method=True)
+        self.UpdateMemory = channel.unary_unary(
+                '/hars_memory.LongTermMemory/UpdateMemory',
+                request_serializer=hars__memory__pb2.UpdateMemoryRequest.SerializeToString,
+                response_deserializer=hars__memory__pb2.UpdateMemoryResponse.FromString,
+                _registered_method=True)
+        self.DeleteMemory = channel.unary_unary(
+                '/hars_memory.LongTermMemory/DeleteMemory',
+                request_serializer=hars__memory__pb2.DeleteMemoryRequest.SerializeToString,
+                response_deserializer=hars__memory__pb2.DeleteMemoryResponse.FromString,
+                _registered_method=True)
         self.SearchEntities = channel.unary_unary(
                 '/hars_memory.LongTermMemory/SearchEntities',
                 request_serializer=hars__memory__pb2.EntitiesRequest.SerializeToString,
@@ -91,6 +111,34 @@ class LongTermMemoryServicer:
 
     def Remember(self, request, context):
         """Save a note into staging (equivalent to memory_remember MCP tool)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMemory(self, request, context):
+        """Retrieve one catalogued memory by id or exact title.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMemories(self, request, context):
+        """List catalogued memories with optional filters.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateMemory(self, request, context):
+        """Update one catalogued memory and reindex it when necessary.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteMemory(self, request, context):
+        """Delete one catalogued memory, retaining a tombstone.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -141,6 +189,26 @@ def add_LongTermMemoryServicer_to_server(servicer, server):
                     servicer.Remember,
                     request_deserializer=hars__memory__pb2.RememberRequest.FromString,
                     response_serializer=hars__memory__pb2.RememberResponse.SerializeToString,
+            ),
+            'GetMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMemory,
+                    request_deserializer=hars__memory__pb2.GetMemoryRequest.FromString,
+                    response_serializer=hars__memory__pb2.GetMemoryResponse.SerializeToString,
+            ),
+            'ListMemories': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMemories,
+                    request_deserializer=hars__memory__pb2.ListMemoriesRequest.FromString,
+                    response_serializer=hars__memory__pb2.ListMemoriesResponse.SerializeToString,
+            ),
+            'UpdateMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateMemory,
+                    request_deserializer=hars__memory__pb2.UpdateMemoryRequest.FromString,
+                    response_serializer=hars__memory__pb2.UpdateMemoryResponse.SerializeToString,
+            ),
+            'DeleteMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteMemory,
+                    request_deserializer=hars__memory__pb2.DeleteMemoryRequest.FromString,
+                    response_serializer=hars__memory__pb2.DeleteMemoryResponse.SerializeToString,
             ),
             'SearchEntities': grpc.unary_unary_rpc_method_handler(
                     servicer.SearchEntities,
@@ -244,6 +312,114 @@ class LongTermMemory:
             '/hars_memory.LongTermMemory/Remember',
             hars__memory__pb2.RememberRequest.SerializeToString,
             hars__memory__pb2.RememberResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hars_memory.LongTermMemory/GetMemory',
+            hars__memory__pb2.GetMemoryRequest.SerializeToString,
+            hars__memory__pb2.GetMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMemories(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hars_memory.LongTermMemory/ListMemories',
+            hars__memory__pb2.ListMemoriesRequest.SerializeToString,
+            hars__memory__pb2.ListMemoriesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hars_memory.LongTermMemory/UpdateMemory',
+            hars__memory__pb2.UpdateMemoryRequest.SerializeToString,
+            hars__memory__pb2.UpdateMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hars_memory.LongTermMemory/DeleteMemory',
+            hars__memory__pb2.DeleteMemoryRequest.SerializeToString,
+            hars__memory__pb2.DeleteMemoryResponse.FromString,
             options,
             channel_credentials,
             insecure,

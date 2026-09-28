@@ -13,7 +13,7 @@ import json
 from typing import Any
 
 import grpc
-from google.protobuf import empty_pb2, json_format, struct_pb2
+from google.protobuf import empty_pb2, struct_pb2
 
 from hars_memory.grpc import hars_memory_pb2 as pb2
 from hars_memory.grpc import hars_memory_pb2_grpc as pb2_grpc
@@ -36,6 +36,7 @@ class HarsMemoryGrpcClient:
         self,
         target: str = "localhost:8788",
         api_key: str | None = None,
+        auth_token: str | None = None,
         *,
         timeout: float = 60.0,
         max_message_size: int = 4194304,
@@ -45,6 +46,10 @@ class HarsMemoryGrpcClient:
         metadata: list[tuple[str, str]] = []
         if api_key:
             metadata.append(("x-api-key", api_key))
+        if auth_token:
+            token = auth_token.strip()
+            formatted = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+            metadata.append(("authorization", formatted))
         self._metadata = metadata
         self._channel = grpc.insecure_channel(
             target,
@@ -112,6 +117,81 @@ class HarsMemoryGrpcClient:
         """Save a knowledge note into staging."""
         req = pb2.RememberRequest(title=title, content=content, importance=importance, tags=tags or [])
         return self._stub.Remember(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    def get_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        timeout: float | None = None,
+    ) -> pb2.GetMemoryResponse:
+        req = pb2.GetMemoryRequest()
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        return self._stub.GetMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    def list_memories(
+        self,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+        importance: str | None = None,
+        tag: str | None = None,
+        include_deleted: bool = False,
+        timeout: float | None = None,
+    ) -> pb2.ListMemoriesResponse:
+        req = pb2.ListMemoriesRequest(limit=limit, include_deleted=include_deleted)
+        if before is not None:
+            req.before = before
+        if importance is not None:
+            req.importance = importance
+        if tag is not None:
+            req.tag = tag
+        return self._stub.ListMemories(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    def update_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        content: str | None = None,
+        new_title: str | None = None,
+        importance: str | None = None,
+        tags: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> pb2.UpdateMemoryResponse:
+        req = pb2.UpdateMemoryRequest()
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        if content is not None:
+            req.content = content
+        if new_title is not None:
+            req.new_title = new_title
+        if importance is not None:
+            req.importance = importance
+        if tags is not None:
+            req.tags.extend(tags)
+            req.has_tags = True
+        return self._stub.UpdateMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    def delete_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        confirm: bool = False,
+        timeout: float | None = None,
+    ) -> pb2.DeleteMemoryResponse:
+        req = pb2.DeleteMemoryRequest(confirm=confirm)
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        return self._stub.DeleteMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
 
     # ------------------------------------------------------------------
     # SearchEntities (memory_entities)
@@ -210,6 +290,7 @@ class AsyncHarsMemoryGrpcClient:
         self,
         target: str = "localhost:8788",
         api_key: str | None = None,
+        auth_token: str | None = None,
         *,
         timeout: float = 60.0,
         max_message_size: int = 4194304,
@@ -219,6 +300,10 @@ class AsyncHarsMemoryGrpcClient:
         metadata: list[tuple[str, str]] = []
         if api_key:
             metadata.append(("x-api-key", api_key))
+        if auth_token:
+            token = auth_token.strip()
+            formatted = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+            metadata.append(("authorization", formatted))
         self._metadata = metadata
         self._channel = grpc.aio.insecure_channel(
             target,
@@ -271,6 +356,81 @@ class AsyncHarsMemoryGrpcClient:
     ) -> pb2.RememberResponse:
         req = pb2.RememberRequest(title=title, content=content, importance=importance, tags=tags or [])
         return await self._stub.Remember(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    async def get_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        timeout: float | None = None,
+    ) -> pb2.GetMemoryResponse:
+        req = pb2.GetMemoryRequest()
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        return await self._stub.GetMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    async def list_memories(
+        self,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+        importance: str | None = None,
+        tag: str | None = None,
+        include_deleted: bool = False,
+        timeout: float | None = None,
+    ) -> pb2.ListMemoriesResponse:
+        req = pb2.ListMemoriesRequest(limit=limit, include_deleted=include_deleted)
+        if before is not None:
+            req.before = before
+        if importance is not None:
+            req.importance = importance
+        if tag is not None:
+            req.tag = tag
+        return await self._stub.ListMemories(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    async def update_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        content: str | None = None,
+        new_title: str | None = None,
+        importance: str | None = None,
+        tags: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> pb2.UpdateMemoryResponse:
+        req = pb2.UpdateMemoryRequest()
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        if content is not None:
+            req.content = content
+        if new_title is not None:
+            req.new_title = new_title
+        if importance is not None:
+            req.importance = importance
+        if tags is not None:
+            req.tags.extend(tags)
+            req.has_tags = True
+        return await self._stub.UpdateMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
+
+    async def delete_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        title: str | None = None,
+        confirm: bool = False,
+        timeout: float | None = None,
+    ) -> pb2.DeleteMemoryResponse:
+        req = pb2.DeleteMemoryRequest(confirm=confirm)
+        if memory_id is not None:
+            req.memory_id = memory_id
+        if title is not None:
+            req.title = title
+        return await self._stub.DeleteMemory(req, timeout=timeout or self._timeout, metadata=self._metadata)
 
     async def search_entities(
         self,
