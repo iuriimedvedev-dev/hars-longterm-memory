@@ -3390,12 +3390,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if paths_arg and isinstance(paths_arg, list):
                 scan_paths = [Path(p).expanduser().resolve() for p in paths_arg]
             elif project_meta.sources_manifest and Path(project_meta.sources_manifest).exists():
-                from hars_memory.ingest.sources import read_manifest
-                manifest_cfg = read_manifest(Path(project_meta.sources_manifest))
-                scan_paths = [
-                    (Path(project_meta.sources_manifest).parent / src.path).resolve()
-                    for src in manifest_cfg.sources
-                ]
+                from hars_memory.ingest.sources import _load_file
+                m_path = Path(project_meta.sources_manifest).resolve()
+                manifest_sources = _load_file(m_path, m_path.parent)
+                scan_paths = [src.path for src in manifest_sources if src.index and src.path.exists()]
             else:
                 scan_paths = ingest_roots()
 
