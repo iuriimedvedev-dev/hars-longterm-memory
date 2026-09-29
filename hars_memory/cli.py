@@ -221,6 +221,7 @@ def _cmd_recall(args: argparse.Namespace) -> int:
         _compute_hybrid_block,
         _get_rag,
         _lightrag_mode,
+        _resolve_fetch_top_k,
         _resolve_query_mode,
         _staleness_info,
         STALE_INDEX_WARNING_DAYS,
