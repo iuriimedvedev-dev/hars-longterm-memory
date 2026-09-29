@@ -9,6 +9,7 @@ Index path: extractor LLM (GPU) — gate with gpu_guard.assert_gpu_free() first.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -256,6 +257,20 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
     # does require auth can set HARS_MEMORY_LLM_API_KEY.
     api_key = os.environ.get("HARS_MEMORY_LLM_API_KEY") or "not-needed"
 
+    # Provider-specific request fields sent with EVERY extractor call, as JSON,
+    # e.g. '{"reasoning": {"effort": "none"}}' for OpenRouter reasoning models
+    # (reasoning tokens otherwise consume max_tokens and truncate the output).
+    _static_extra_raw = os.environ.get("HARS_MEMORY_LLM_EXTRA_BODY", "").strip()
+    static_extra_body: dict[str, object] = {}
+    if _static_extra_raw:
+        try:
+            parsed = json.loads(_static_extra_raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"HARS_MEMORY_LLM_EXTRA_BODY is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("HARS_MEMORY_LLM_EXTRA_BODY must be a JSON object")
+        static_extra_body = parsed
+
     # One AsyncOpenAI client per llm_func closure, reused across every call —
     # real connection pooling from the SDK, instead of the pre-SDK
     # implementation's httpx.AsyncClient created (and torn down) on every
@@ -314,7 +329,7 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
         forwarded = {k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)}
         call_max_tokens = forwarded.get("max_tokens", max_tokens)
         call_temperature = forwarded.get("temperature", temperature)
-        extra_body = {k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS}
+        extra_body = {**static_extra_body, **{k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS}}
 
         async def _complete_once() -> str:
             response = await client.chat.completions.create(
@@ -430,10 +445,23 @@ def create_lightrag(
     _schema_path = Path(os.environ.get("HARS_MEMORY_ENTITY_SCHEMA_PATH", str(DEFAULT_SCHEMA_PATH)))
     _schema = load_schema(_schema_path)
 
-    # Append domain guidance (naming normalisation, table handling, type
-    # discipline) to LightRAG's default extraction prompt.  Idempotent.
-    if _schema.guidance and _schema.guidance not in PROMPTS["entity_extraction_system_prompt"]:
-        PROMPTS["entity_extraction_system_prompt"] += _schema.guidance
+    # Universal extraction prompt: core vocabulary + this project's optional
+    # additions from the schema YAML (types, relations, guidance, examples).
+    # Replaces (not appends to) LightRAG's stock prompt, so it is idempotent.
+    # HARS_MEMORY_EXTRACTION_PROMPT=lightrag restores the stock prompt plus the
+    # legacy "append guidance" behaviour.
+    from hars_memory.schema.universal_prompt import (
+        apply_to_lightrag_prompts,
+        effective_entity_types,
+    )
+
+    if os.environ.get("HARS_MEMORY_EXTRACTION_PROMPT", "universal").strip().lower() == "lightrag":
+        _entity_types = list(_schema.entity_types)
+        if _schema.guidance and _schema.guidance not in PROMPTS["entity_extraction_system_prompt"]:
+            PROMPTS["entity_extraction_system_prompt"] += _schema.guidance
+    else:
+        _entity_types = effective_entity_types(_schema)
+        apply_to_lightrag_prompts(PROMPTS, _schema)
 
     # --- resolve config (param > env > default) ---
     _wdir = resolve_working_dir(working_dir)
@@ -595,7 +623,7 @@ def create_lightrag(
         max_total_tokens=_llm_max_extract_tokens,
         addon_params={
             "language": os.environ.get("HARS_MEMORY_EXTRACTION_LANGUAGE", "English"),
-            "entity_types": _schema.entity_types,
+            "entity_types": _entity_types,
         },
         max_parallel_insert=int(os.environ.get("HARS_MEMORY_MAX_PARALLEL_INSERT", "2")),
         # Concurrent LLM calls across all inserts.  MUST NOT exceed the number of

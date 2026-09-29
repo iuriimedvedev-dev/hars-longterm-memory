@@ -32,6 +32,10 @@ class Schema:
     relation_types: list[str]
     guidance: str
     entity_id_prefixes: dict[str, str] = field(default_factory=dict)
+    #: Extra worked examples appended to the built-in ones (optional).
+    examples: list[str] = field(default_factory=list)
+    #: Keep the universal core types/relations/examples (default). False = project vocabulary only.
+    include_core: bool = True
 
 
 def _validate_no_forbidden_chars(values: list[str], *, kind: str) -> None:
@@ -57,6 +61,8 @@ def load_schema(path: Path) -> Schema:
         relation_types=relation_types,
         guidance=raw.get("guidance", ""),
         entity_id_prefixes=raw.get("entity_id_prefixes", {}),
+        examples=[str(e) for e in raw.get("examples") or []],
+        include_core=bool(raw.get("include_core", True)),
     )
 
 
