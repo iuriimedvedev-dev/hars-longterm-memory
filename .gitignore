@@ -16,3 +16,6 @@ reports/
 !.env.example
 *.sqlite3
 hars-memory-artifacts/
+
+# local secrets (litellm key)
+config/live-llm-e2e.env
