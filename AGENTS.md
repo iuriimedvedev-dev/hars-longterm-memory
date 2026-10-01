@@ -40,7 +40,8 @@ hars_memory/
                         back-fill of chunk location metadata + opt-in dedupe)
                         batch.py backs `memory index-batch` (extraction through a
                         provider Batch API by priming LightRAG's LLM cache; phases
-                        collect/submit/status/apply, state in <index>/batch_state.json)
+                        collect/submit/status/apply/cancel, state in <index>/batch_state.json;
+                        stall detection + cancel + abandon -> sync fallback in wait())
   server/             — index.py (GPU-guarded CLI reindex entrypoint),
                         lightrag_init.py (wires LightRAG to the configured
                         embedder/extractor/query LLM/vector+graph storage),
@@ -104,7 +105,8 @@ re-index); do not flip it on a live index without that plan.
 ```bash
 export HARS_MEMORY_SOURCES_MANIFEST=/path/to/knowledge-sources.yaml
 scripts/build_index_md_v2.sh estimate        # no network, no cost: chunk + price round 1
-MAX_COST=20 scripts/build_index_md_v2.sh run # PAID. Resumable: re-run the same command (exit 4 = timeout)
+MAX_COST=20 scripts/build_index_md_v2.sh run # PAID. Resumable: re-run the same command
+scripts/build_index_md_v2.sh cancel          # give up on unfinished batches (manual)
 scripts/build_index_md_v2.sh status          # REFRESH=1 to poll the provider
 ```
 The script pins the build config (chunker=markdown, 512 tokens, min 200, gleaning 1,
@@ -116,6 +118,20 @@ default: `~/.local/share/hars-longterm-memory/index-<VARIANT>` (`VARIANT=md|md-m
 `MAX_COST` is cumulative over both rounds (gleaning is a second batch); set
 `MAX_INFLIGHT_TOKENS` if the provider has an enqueued-token quota. Evals (no LLM):
 `docs/index-v2-eval.md`.
+
+**Stragglers (batches stuck at N-1 of N).** `run` tracks `completed+failed` per part
+(`last_progress_at` in `batch_state.json`). No growth for `--stall-minutes` (default 20; env
+`HARS_MEMORY_BATCH_STALL_MINUTES`, script `STALL_MINUTES`; 0 disables) while at least
+`--stall-min-done-fraction` (0.5) is done => POST cancel. Then wait up to `--cancel-wait-minutes`
+(default 15, script `CANCEL_WAIT_MINUTES`): `cancelled` + output file => partial answers are applied;
+anything else (still `cancelling`, or cancelled without output) => part marked `abandoned`.
+Every request without an answer then goes through LightRAG's normal synchronous LLM call
+(logged: count, estimated cost at 2x batch price). `apply`/`run` check batch spend + that
+fallback estimate against `--max-cost` first and exit 3 without indexing if it would exceed it.
+`memory index-batch cancel --index-dir DIR` cancels all unfinished parts manually (the next `run` handles
+them the same way). `status` shows per part `done=/total`, last-progress age and
+`STALLED`/`CANCELLING`/`CANCELLED`/`ABANDONED`. Exit codes of `run`: 0 applied, 1 error, 3 cost guard,
+**4 = TIMEOUT** (`--timeout-minutes`, script default 600; nothing applied, re-run to resume).
 
 ## Consumer hook points (this package ships no defaults for these)
 

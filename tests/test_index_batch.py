@@ -90,6 +90,9 @@ class FakeBackend:
     def read(self, file_id: str) -> str:
         return self.files[file_id]
 
+    def cancel(self, batch_id: str) -> dict[str, Any]:
+        return {"id": batch_id, "status": "cancelling", "counts": {}}
+
     def _answer(self, jsonl: str) -> str:
         out = []
         for n, line in enumerate(jsonl.splitlines()):
@@ -348,3 +351,242 @@ def test_cli_refuses_live_and_foreign_index_dirs(tmp_path, monkeypatch) -> None:
     # a dir index-batch itself started stays usable (resumable)
     (foreign / "batch_state.json").write_text("{}")
     cli._check_not_live_index(foreign.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Stragglers: stall detection, cancel, abandon, sync fallback, exit codes
+# ---------------------------------------------------------------------------
+
+
+class StuckBackend(FakeBackend):
+    """Batch that sticks at N-1 of N; cancel => `cancelling` then (maybe) `cancelled` + partial output."""
+
+    def __init__(self, *, cancel_outcome: str = "partial", cancelling_polls: int = 2, stuck_done: int | None = None) -> None:
+        super().__init__()
+        self.cancel_outcome = cancel_outcome  # partial | no_output | never
+        self.cancelling_polls = cancelling_polls
+        self.stuck_done = stuck_done  # None => total - 1
+        self.cancel_calls: list[str] = []
+        self.cancelled_polls: dict[str, int] = {}
+
+    def _total(self, batch_id: str) -> int:
+        return len(self.files[self.batches[batch_id]["file_id"]].splitlines())
+
+    def get(self, batch_id: str) -> dict[str, Any]:
+        total = self._total(batch_id)
+        done = total - 1 if self.stuck_done is None else self.stuck_done
+        counts = {"total": total, "completed": done, "failed": 0}
+        if batch_id not in self.cancel_calls:
+            return {"id": batch_id, "status": "in_progress", "counts": counts}
+        n = self.cancelled_polls[batch_id] = self.cancelled_polls.get(batch_id, 0) + 1
+        if self.cancel_outcome == "never" or n <= self.cancelling_polls:
+            return {"id": batch_id, "status": "cancelling", "counts": counts}
+        if self.cancel_outcome == "no_output":
+            return {"id": batch_id, "status": "cancelled", "output_file_id": None, "counts": counts}
+        out_id = f"out-{batch_id}"
+        lines = self.files[self.batches[batch_id]["file_id"]].splitlines()[:done]
+        self.files[out_id] = self._answer("\n".join(lines) + "\n") if lines else ""
+        return {"id": batch_id, "status": "cancelled", "output_file_id": out_id, "counts": counts}
+
+    def cancel(self, batch_id: str) -> dict[str, Any]:
+        self.cancel_calls.append(batch_id)
+        return {"id": batch_id, "status": "cancelling", "counts": {}}
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _wait_stuck(idx, backend, clock, **kw):
+    args = dict(poll_seconds=60, timeout_seconds=6 * 3600, sleep=clock.sleep, clock=clock,
+                stall_seconds=20 * 60, stall_min_done_fraction=0.5, cancel_wait_seconds=15 * 60)
+    args.update(kw)
+    return batch.wait(idx, backend, **args)
+
+
+def _stuck_setup(tmp_path, docs, backend):
+    idx = _index(tmp_path)
+    batch.collect(idx, docs)
+    batch.submit(idx, backend)
+    return idx
+
+
+def test_stall_cancels_and_partial_output_is_applied_with_sync_fallback(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    n = batch.BatchState.load(idx).rounds["1"].parts[0].requests
+    state = _wait_stuck(idx, backend, clock)
+    part = state.rounds["1"].parts[0]
+    assert backend.cancel_calls == ["batch-1"]
+    assert part.status == "cancelled" and part.output_file_id and part.downloaded
+    assert part.cancel_requested_at is not None
+    answers, counts = batch.load_answers(idx)
+    assert counts["ok"] == n - 1
+    # finish the remaining rounds (round 2 is collected from the partial answers) and apply
+    backend.stuck_done = None
+    stats = _run_all_stuck(idx, docs, backend, clock)
+    assert stats["expected_sync_fallback"] > 0
+    assert len(lightrag_env) > 0  # the straggler (+ its gleaning) went through the sync LLM
+    assert batch.index_stats(idx)["docs_processed"] == 2
+
+
+def _run_all_stuck(idx, docs, backend, clock):
+    while True:
+        state = batch.BatchState.load(idx)
+        if batch.next_round(state) is not None:
+            batch.collect(idx, docs)
+        batch.submit(idx, backend)
+        state = _wait_stuck(idx, backend, clock)
+        assert all(r.terminal() for r in state.rounds.values())
+        if batch.next_round(state) is None:
+            return batch.apply(idx, docs)
+
+
+def test_cancel_that_never_finishes_abandons_part_and_falls_back_to_sync(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(cancel_outcome="never"), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    state = _wait_stuck(idx, backend, clock)
+    part = state.rounds["1"].parts[0]
+    assert part.status == "abandoned" and part.downloaded and "cancel requested" in part.abandoned_reason
+    assert state.rounds["1"].terminal()
+    assert "ABANDONED" in batch.format_status(state, now=clock())
+    # persisted: a fresh load (restarted run) sees the same
+    assert batch.BatchState.load(idx).rounds["1"].parts[0].status == "abandoned"
+    stats = _run_all_stuck(idx, docs, backend, clock)
+    assert stats["abandoned_parts"] >= 1 and stats["answered"] == 0
+    assert stats["missing_in_abandoned_parts"] == stats["total_requests"] > 0
+    assert len(lightrag_env) >= stats["total_requests"]  # every request answered synchronously
+    assert batch.index_stats(idx)["docs_processed"] == 2
+
+
+def test_cancelled_without_output_file_is_abandoned(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(cancel_outcome="no_output"), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    state = _wait_stuck(idx, backend, clock)
+    part = state.rounds["1"].parts[0]
+    assert part.status == "abandoned" and "without an output" in part.abandoned_reason
+
+
+def test_no_stall_cancel_below_done_fraction_or_when_disabled(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(stuck_done=0), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    state = _wait_stuck(idx, backend, clock, timeout_seconds=3 * 3600)
+    assert backend.cancel_calls == [] and not state.rounds["1"].terminal()
+
+    backend2, clock2 = StuckBackend(), Clock()
+    idx2 = _stuck_setup(tmp_path / "b", docs, backend2)
+    state = _wait_stuck(idx2, backend2, clock2, stall_seconds=0, timeout_seconds=3 * 3600)
+    assert backend2.cancel_calls == [] and not state.rounds["1"].terminal()
+
+
+def test_progress_resets_the_stall_clock(lightrag_env, docs, tmp_path) -> None:
+    class Creeping(StuckBackend):
+        def get(self, batch_id: str) -> dict[str, Any]:
+            info = super().get(batch_id)
+            total = info["counts"]["total"]
+            # one more request done every 10 minutes, never reaching total
+            info["counts"]["completed"] = min(total - 1, total // 2 + int(clock.now - t0) // 600)
+            return info
+
+    backend, clock = Creeping(), Clock()
+    t0 = clock.now
+    idx = _stuck_setup(tmp_path, docs, backend)
+    total = batch.BatchState.load(idx).rounds["1"].parts[0].requests
+    # progresses for (total/2 - 1) * 10 min; stall window is 20 min, so no cancel until it plateaus
+    _wait_stuck(idx, backend, clock, timeout_seconds=(total // 2 - 2) * 600)
+    assert backend.cancel_calls == []
+    _wait_stuck(idx, backend, clock, timeout_seconds=3 * 3600)
+    assert backend.cancel_calls == ["batch-1"]
+
+
+def test_status_shows_counts_age_and_flags(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(cancel_outcome="never"), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    state = _wait_stuck(idx, backend, clock, stall_seconds=0, timeout_seconds=30 * 60)
+    text = batch.format_status(state, now=clock(), stall_seconds=20 * 60)
+    assert "done=" in text and "last_progress=" in text and "STALLED" in text
+    batch.cancel_parts(idx, backend, clock=clock)
+    text = batch.format_status(batch.BatchState.load(idx), now=clock() + 300)
+    assert "CANCELLING(5m)" in text
+
+
+def test_cancel_parts_is_idempotent_and_skips_finished(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    assert len(batch.cancel_parts(idx, backend, clock=clock)) == 1
+    assert batch.cancel_parts(idx, backend, clock=clock) == []
+    assert backend.cancel_calls == ["batch-1"]
+
+
+def test_sync_fallback_respects_max_cost(lightrag_env, docs, tmp_path) -> None:
+    backend, clock = StuckBackend(cancel_outcome="never"), Clock()
+    idx = _stuck_setup(tmp_path, docs, backend)
+    _wait_stuck(idx, backend, clock)
+    batch.collect(idx, docs)  # no-op (round 2 needs answers) - keeps state consistent
+    with pytest.raises(batch.CostGuardError, match="cumulative"):
+        batch.apply(idx, docs, max_cost_usd=0.0)
+    assert lightrag_env == [] and not (idx / "kv_store_doc_status.json").exists()
+    plan = batch.fallback_plan(idx, batch.BatchState.load(idx), {})
+    assert plan["sync_cost_estimated_usd"] > 0
+    batch.apply(idx, docs, max_cost_usd=100.0)  # generous cap passes and still resumable
+
+
+def test_cli_run_timeout_exits_4_with_explicit_message(lightrag_env, docs, tmp_path, monkeypatch, capsys) -> None:
+    backend = FakeBackend(finish_after_polls=99)
+    monkeypatch.setattr(cli, "_batch_documents", lambda args: docs)
+    monkeypatch.setattr(batch, "make_backend_from_env", lambda: backend)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["index-batch", "run", "--index-dir", str(_index(tmp_path)), "--max-cost", "100",
+                  "--timeout-minutes", "0", "--poll-seconds", "0"])
+    assert exc.value.code == 4
+    err = capsys.readouterr().err
+    assert "TIMEOUT (exit 4)" in err and "resumable" in err
+
+
+def test_cli_run_stall_to_abandon_then_cost_guard_exit_3_then_resume(lightrag_env, docs, tmp_path, monkeypatch, capsys) -> None:
+    backend, clock = StuckBackend(cancel_outcome="never"), Clock()
+    monkeypatch.setattr(cli, "_batch_documents", lambda args: docs)
+    monkeypatch.setattr(batch, "make_backend_from_env", lambda: backend)
+    real_wait = batch.wait
+    monkeypatch.setattr(batch, "wait", lambda *a, **k: real_wait(*a, **{**k, "sleep": clock.sleep, "clock": clock}))
+    idx = _index(tmp_path)
+    argv = ["index-batch", "run", "--index-dir", str(idx), "--timeout-minutes", "600", "--poll-seconds", "60",
+            "--stall-minutes", "20", "--cancel-wait-minutes", "15"]
+    with pytest.raises(SystemExit) as exc:  # fallback does not fit the cap => 3, nothing indexed
+        cli.main([*argv, "--max-cost", "0.003"])
+    assert exc.value.code == 3
+    assert "cumulative" in capsys.readouterr().err
+    assert batch.BatchState.load(idx).rounds["1"].parts[0].status == "abandoned"
+    assert lightrag_env == []
+    with pytest.raises(SystemExit) as exc:
+        cli.main([*argv, "--max-cost", "100"])
+    assert exc.value.code in (0, None)
+    assert len(backend.cancel_calls) == 1  # abandoned part was not cancelled again on resume
+    assert batch.index_stats(idx)["docs_processed"] == 2
+
+
+def test_cli_cancel_subcommand(lightrag_env, docs, tmp_path, monkeypatch, capsys) -> None:
+    backend = StuckBackend()
+    monkeypatch.setattr(batch, "make_backend_from_env", lambda: backend)
+    idx = _stuck_setup(tmp_path, docs, backend)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["index-batch", "cancel", "--index-dir", str(idx)])
+    assert exc.value.code in (0, None)
+    assert backend.cancel_calls == ["batch-1"]
+    assert "cancel requested for 1 batch" in capsys.readouterr().out
+    assert batch.BatchState.load(idx).rounds["1"].parts[0].cancel_requested_at is not None
+
+
+def test_stall_minutes_env_default(monkeypatch) -> None:
+    monkeypatch.setenv("HARS_MEMORY_BATCH_STALL_MINUTES", "7")
+    assert cli._batch_minutes(None, "HARS_MEMORY_BATCH_STALL_MINUTES", 20.0) == 7.0
+    assert cli._batch_minutes(0.0, "HARS_MEMORY_BATCH_STALL_MINUTES", 20.0) == 0.0
+    monkeypatch.delenv("HARS_MEMORY_BATCH_STALL_MINUTES")
+    assert cli._batch_minutes(None, "HARS_MEMORY_BATCH_STALL_MINUTES", 20.0) == 20.0
