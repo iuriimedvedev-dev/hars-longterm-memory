@@ -1003,6 +1003,14 @@ async def _compute_hybrid_block(
         )
         from hars_memory.retrieval.tokenizer import extract_identifier_terms
 
+        from hars_memory.retrieval.chunk_location import location_for
+
+        # Location fields (heading_path/start_line/end_line/source_path) are
+        # additive: absent for chunks of an index not yet migrated.
+        chunk_wdir = getattr(rag, "working_dir", None)
+        if not isinstance(chunk_wdir, (str, os.PathLike)):
+            chunk_wdir = HARS_MEMORY_INDEX_DIR if project_id == "default" else None
+
         effective_fetch_top_k = fetch_top_k if fetch_top_k is not None else top_k
         pool_size = max(
             effective_fetch_top_k * HYBRID_CANDIDATE_POOL_MULTIPLIER, effective_fetch_top_k, top_k
@@ -1160,6 +1168,7 @@ async def _compute_hybrid_block(
                         "sparse_score": round(hit.score, 4),
                         "file_path": hit.file_path,
                         "snippet": hit.content[:HYBRID_SNIPPET_MAX_CHARS],
+                        **location_for(chunk_wdir, hit.chunk_id),
                     })
                 if len(identifier_matches) >= HYBRID_IDENTIFIER_LOOKUP_LIMIT:
                     break
@@ -1263,7 +1272,9 @@ async def _compute_hybrid_block(
                     "file_path": chunk.file_path,
                     "content": chunk.content,
                     "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
-                    "section": _extract_breadcrumb_from_content(chunk.content),
+                    **_chunk_location_fields(
+                        chunk_wdir, chunk.chunk_id, _extract_breadcrumb_from_content(chunk.content)
+                    ),
                 }
                 for chunk in fused
             ],
@@ -1346,6 +1357,48 @@ def _edge_relation_label(edge_data: dict[str, Any]) -> str:
 def _extract_answer(result: dict[str, Any]) -> str:
     llm_response = result.get("llm_response") or {}
     return str(llm_response.get("content") or "")
+
+
+def _chunk_location_fields(working_dir: object, chunk_id: str, breadcrumb: str) -> dict[str, Any]:
+    """`section` plus stored location fields for a fused chunk.
+
+    `section` stays the breadcrumb extracted from the chunk text (legacy
+    behaviour) and only falls back to the stored innermost heading when the
+    chunk text carries none, so existing consumers see no change.
+    """
+    from hars_memory.retrieval.chunk_location import location_for
+
+    fields = dict(location_for(working_dir, chunk_id))  # type: ignore[arg-type]
+    fields["section"] = breadcrumb or fields.get("section", "")
+    return fields
+
+
+def _compact_hybrid_block(hybrid: dict[str, Any], context: object) -> dict[str, Any]:
+    """Opt-in (`compact=true`) de-duplication of the `hybrid` block.
+
+    Drops text that repeats other fields of the same response: every
+    `snippet` (a prefix of `content`/the chunk itself) and the `content` of
+    fused chunks already present verbatim in `context`.  Location fields and
+    chunk ids are kept so a dropped body can still be pointed at.
+    """
+    compacted = dict(hybrid)
+    context_text = context if isinstance(context, str) else ""
+    fused_out: list[dict[str, Any]] = []
+    for chunk in hybrid.get("fused_chunks") or []:
+        slim = {k: v for k, v in chunk.items() if k != "snippet"}
+        body = str(slim.get("content") or "")
+        if body and context_text and body in context_text:
+            slim.pop("content", None)
+            slim["content_in_context"] = True
+        fused_out.append(slim)
+    if "fused_chunks" in hybrid:
+        compacted["fused_chunks"] = fused_out
+    matches = hybrid.get("identifier_matches")
+    if matches:
+        compacted["identifier_matches"] = [
+            {k: v for k, v in match.items() if k != "snippet"} for match in matches
+        ]
+    return compacted
 
 
 _SECTION_BREADCRUMB_RE = re.compile(r"^#{1,6}\s")
@@ -2074,6 +2127,16 @@ async def list_tools() -> list[Tool]:
                         "`context_priority_applied` in the response) for the answer-generation path."
                     ),
                 },
+                "compact": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Opt-in smaller response: omit `hybrid` text that repeats other "
+                                   "fields (every `snippet`, and fused chunk `content` already "
+                                   "contained verbatim in `context`, flagged content_in_context). "
+                                   "Chunk ids and location fields (heading_path, start_line, "
+                                   "end_line, source_path) are kept. Default false: response "
+                                   "unchanged.",
+                },
                 "debug": {
                     "type": "boolean",
                     "default": False,
@@ -2405,6 +2468,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return json_text({"ok": False, "error": fetch_top_k_source})
             context_only = bool(args.get("context_only", True))
             debug = bool(args.get("debug", False))
+            compact = bool(args.get("compact", False))
             context_priority = str(args.get("context_priority", DEFAULT_CONTEXT_PRIORITY))
             ll_keywords = [str(k) for k in (args.get("ll_keywords") or [])]
             hl_keywords = [str(k) for k in (args.get("hl_keywords") or [])]
@@ -2569,6 +2633,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                                 },
                             },
                         }
+                    if compact and not debug:
+                        response["hybrid"] = _compact_hybrid_block(hybrid_block, context_for_response)
                     return json_text(response)
                 graph_start = time.monotonic()
                 # LightRAG 1.5.6 does not support QueryParam.model_func.

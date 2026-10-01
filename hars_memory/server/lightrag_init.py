@@ -39,6 +39,14 @@ TIKTOKEN_ENCODING: Final[str] = "cl100k_base"
 #: is active.
 BYTE_FALLBACK_TOKEN_RATIO: Final[int] = 4
 
+#: Running token totals of every successful ``make_llm_func`` call in this
+#: process (provider-reported usage). Logged by the indexer at the end of a run
+#: so the real cost of a synchronous build can be compared with a Batch build.
+LLM_USAGE: Final[dict[str, int]] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+#: Valid HARS_MEMORY_CHUNKER values (see create_lightrag).
+CHUNKER_MODES: Final[frozenset[str]] = frozenset({"token", "markdown"})
+
 
 class _TiktokenTokenizer:
     """Token-based tokenizer compatible with LightRAG's Tokenizer wrapper.
@@ -325,6 +333,10 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
                 extra_body=extra_body or None,
             )
             message = response.choices[0].message
+            usage = getattr(response, "usage", None)
+            LLM_USAGE["calls"] += 1
+            LLM_USAGE["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            LLM_USAGE["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
             content = str(message.content or "")
             # Thinking models may leave content empty and put everything in
             # reasoning_content (server-side reasoning parsing), or emit
@@ -556,6 +568,22 @@ def create_lightrag(
         _ext_max_output_tokens,
     )
 
+    # HARS_MEMORY_CHUNKER: "token" (default) keeps LightRAG's own token splitter,
+    # so existing indexes stay consistent; "markdown" plugs in the structure-aware
+    # splitter.  chunk id = md5(chunk text), so switching on an existing index
+    # changes ids for re-chunked docs and needs re-extraction (see AGENTS.md).
+    _chunker = os.environ.get("HARS_MEMORY_CHUNKER", "token").strip().lower() or "token"
+    if _chunker not in CHUNKER_MODES:
+        raise ValueError(
+            f"HARS_MEMORY_CHUNKER={_chunker!r} is invalid; expected one of {sorted(CHUNKER_MODES)}"
+        )
+    _chunker_kwargs: dict[str, object] = {}
+    if _chunker == "markdown":
+        from hars_memory.ingest.chunker import lightrag_chunking_func
+
+        _chunker_kwargs["chunking_func"] = lightrag_chunking_func
+    logger.info("LightRAG chunker: %s", _chunker)
+
     rag = LightRAG(
         working_dir=_wdir,
         vector_storage=_vector_storage,
@@ -588,6 +616,7 @@ def create_lightrag(
         # Chunking — LightRAG is the sole chunker; index.py passes whole docs.
         chunk_token_size=_chunk_token_size,
         chunk_overlap_token_size=_chunk_overlap_tokens,
+        **_chunker_kwargs,
         # No-truncation guarantee: extraction prompt input is capped here.
         # This MUST be ≤ the llama-server per-slot context (-c / --parallel).
         # With -c 65536 --parallel 2 → 32768 tokens/slot; default 30720 is safe.
@@ -626,6 +655,7 @@ def create_query_model_func() -> object:
 
 __all__ = [
     "BYTE_FALLBACK_TOKEN_RATIO",
+    "CHUNKER_MODES",
     "TIKTOKEN_ENCODING",
     "resolve_tokenizer",
     "create_lightrag",

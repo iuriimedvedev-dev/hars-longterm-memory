@@ -235,10 +235,26 @@ def _cmd_recall(args: argparse.Namespace) -> int:
     async def _run() -> dict:
         rag = await _get_rag()
         hybrid_block = await _compute_hybrid_block(rag, question, top_k, ll_keywords)
+        # LightRAG >= 1.4 takes a QueryParam, not loose keyword arguments.
+        from lightrag import QueryParam
+
         if args.context_only:
-            result = await rag.aquery(question, mode=rag_mode, top_k=top_k, **kw_args)
+            result = await rag.aquery(
+                question,
+                param=QueryParam(mode=rag_mode, top_k=top_k, only_need_context=True, **kw_args),
+            )
         else:
-            result = await rag.aquery_llm(question, mode=rag_mode, top_k=top_k, **kw_args)
+            from hars_memory.server.lightrag_init import create_query_model_func
+
+            orig_llm_func = getattr(rag, "llm_model_func", None)
+            rag.llm_model_func = create_query_model_func()  # synthesis uses the query LLM
+            try:
+                result = await rag.aquery_llm(
+                    question,
+                    param=QueryParam(mode=rag_mode, top_k=top_k, **kw_args),
+                )
+            finally:
+                rag.llm_model_func = orig_llm_func
         return {
             "result": result,
             "hybrid": hybrid_block,
@@ -343,6 +359,147 @@ def _cmd_consolidate(args: argparse.Namespace) -> int:
         _os.environ["HARS_MEMORY_INDEX_DRY_RUN"] = "1"
     index_main()
     return 0
+
+
+def _cmd_migrate_index(args: argparse.Namespace) -> int:
+    """Back-fill chunk location metadata in an existing index (zero LLM calls)."""
+    from hars_memory.ingest.migrate import MigrationError, format_report, migrate_index
+
+    index_dir = _resolve_index_dir(args.index_dir)
+    root = args.root.expanduser() if args.root else Path.cwd()
+    if not root.is_dir():
+        print(f"error: --root {root} is not a directory", file=sys.stderr)
+        return 2
+    try:
+        report = migrate_index(index_dir, root=root, dry_run=args.dry_run, dedupe=args.dedupe)
+    except MigrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(format_report(report))
+    return 0
+
+
+def _batch_documents(args: argparse.Namespace) -> list:
+    """Walk the ingest roots like the synchronous indexer (sorted, optionally capped)."""
+    from hars_memory.ingest.walker import walk
+    from hars_memory.server.index import _resolve_ingest_paths
+
+    roots = _resolve_ingest_paths(args.paths, Path.cwd())
+    docs, _ = walk(roots)
+    docs.sort(key=lambda d: d.source_path)
+    if args.max_docs:
+        docs = docs[: args.max_docs]
+    return docs
+
+
+_LIVE_INDEX_MARKER = "kv_store_doc_status.json"
+
+
+def _check_not_live_index(index_dir: Path) -> None:
+    """Refuse to build into an index that is (or looks like) a live one.
+
+    Refused: the conventional live dir ``~/.local/share/hars-longterm-memory/index``,
+    the dir named by ``HARS_MEMORY_LIVE_INDEX_DIR`` and any directory that already
+    holds a LightRAG index (``kv_store_doc_status.json``) but was not created by
+    ``index-batch`` (no ``batch_state.json``).  A dir ``index-batch`` itself
+    started is fine, so a build stays resumable.
+    """
+    import os
+
+    live = {Path("~/.local/share/hars-longterm-memory/index").expanduser().resolve()}
+    extra = os.environ.get("HARS_MEMORY_LIVE_INDEX_DIR", "").strip()
+    if extra:
+        live.add(Path(extra).expanduser().resolve())
+    if index_dir in live:
+        raise SystemExit(f"error: refusing to use the live index {index_dir} as an index-batch target")
+    if (index_dir / _LIVE_INDEX_MARKER).exists() and not (index_dir / "batch_state.json").exists():
+        raise SystemExit(
+            f"error: {index_dir} already holds an index that index-batch did not create; "
+            "use a fresh --index-dir"
+        )
+
+
+def _cmd_index_batch(args: argparse.Namespace) -> int:
+    """Build an index with extraction through a provider Batch API (see ingest/batch.py)."""
+    import os
+
+    from hars_memory.ingest import batch
+
+    index_dir = _resolve_index_dir(args.index_dir).resolve()
+    if args.batch_action not in ("status", "compare"):
+        _check_not_live_index(index_dir)
+    os.environ["HARS_MEMORY_INDEX_DIR"] = str(index_dir)
+    action = args.batch_action
+    try:
+        if action == "compare":
+            print(batch.format_comparison(args.other, index_dir))
+            return 0
+        if action == "status":
+            state = batch.refresh(index_dir, batch.make_backend_from_env()) if args.refresh else batch.BatchState.load(index_dir)
+            print(batch.format_status(state))
+            return 0
+        if action in ("collect", "run"):
+            print(
+                "build config: chunker={} chunk_tokens={} overlap={} min_chunk_tokens={} gleaning={} "
+                "extractor={} index_dir={}".format(
+                    os.environ.get("HARS_MEMORY_CHUNKER", "token") or "token",
+                    os.environ.get("HARS_MEMORY_CHUNK_TOKEN_SIZE", "512"),
+                    os.environ.get("HARS_MEMORY_CHUNK_OVERLAP_TOKENS", "64"),
+                    os.environ.get("HARS_MEMORY_CHUNK_MIN_TOKENS", "200"),
+                    os.environ.get("HARS_MEMORY_MAX_GLEANING", "1"),
+                    os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", "?"),
+                    index_dir,
+                ),
+                file=sys.stderr,
+            )
+        prices = dict(
+            input_price=args.input_price, output_price=args.output_price,
+            est_output_tokens=args.est_output_tokens, max_cost_usd=args.max_cost,
+        )
+        submit_kw = dict(
+            max_tokens_param=args.max_tokens_param, max_tokens_per_batch=args.max_batch_tokens,
+            max_inflight_tokens=args.max_inflight_tokens,
+        )
+        if action == "collect":
+            rnd = batch.collect(index_dir, _batch_documents(args), dry_run=args.dry_run, **prices)
+            print("nothing to collect" if rnd is None else (
+                f"round {rnd.round}: {rnd.requests} request(s), ~{rnd.est_input_tokens} input tokens, "
+                f"estimated ${rnd.est_cost_usd:.4f}" + (" (dry run, nothing written)" if args.dry_run else "")))
+            return 0
+        if action == "submit":
+            parts = batch.submit(index_dir, batch.make_backend_from_env(), **submit_kw)
+            print(f"submitted {len(parts)} batch(es): " + ", ".join(p.batch_id or "?" for p in parts))
+            return 0
+        if action == "apply":
+            print(json.dumps(batch.apply(index_dir, _batch_documents(args)), indent=2))
+            return 0
+        # run: collect -> submit -> wait -> (gleaning round) -> apply, resumable at every step
+        backend = batch.make_backend_from_env()
+        docs = _batch_documents(args)
+        while True:
+            state = batch.BatchState.load(index_dir)
+            if batch.next_round(state) is not None:
+                rnd = batch.collect(index_dir, docs, **prices)
+                print(f"round {rnd.round}: {rnd.requests} request(s), estimated ${rnd.est_cost_usd:.4f}")
+            batch.submit(index_dir, backend, **submit_kw)
+            state = batch.wait(index_dir, backend, poll_seconds=args.poll_seconds,
+                               timeout_seconds=args.timeout_minutes * 60,
+                               after_poll=lambda: batch.submit(index_dir, backend, **submit_kw))
+            print(batch.format_status(state))
+            if not all(r.terminal() for r in state.rounds.values()):
+                print("not finished within --timeout-minutes; state is resumable: re-run the same command", file=sys.stderr)
+                return 4
+            if batch.next_round(state) is None:
+                break
+        print(json.dumps(batch.apply(index_dir, docs), indent=2))
+        print(json.dumps(batch.actual_cost(batch.BatchState.load(index_dir)), indent=2))
+        return 0
+    except batch.CostGuardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except batch.BatchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _format_size(num_bytes: int) -> str:
@@ -539,40 +696,40 @@ def _cmd_estimate_cost(args: argparse.Namespace) -> int:
 
     print(f"Model: {model} ({input_price}/{output_price} per 1M tok)")
     print()
-    print(f"Corpus:")
+    print("Corpus:")
     print(f"  Files:          {file_count}")
     print(f"  Total size:     {total_bytes / 1024:.1f} KB")
     print(f"  Est. tokens:    {_fmt_tok(total_tokens_est)}")
     print(f"  By extension:   {', '.join(f'{k}: {v}' for k, v in sorted(by_ext.items()))}")
     print()
-    print(f"Parameters:")
+    print("Parameters:")
     print(f"  Chunk size:     {chunk_size} (overlap {chunk_overlap})")
     print(f"  Batch size:     {batch_size}")
     print(f"  Max gleaning:   {max_gleaning}")
     print(f"  Est. chunks:    {estimated_chunks}")
     print()
-    print(f"LLM calls:")
+    print("LLM calls:")
     print(f"  Extract:        {extract_calls}")
     print(f"  Merge:          {merge_calls}")
     print(f"  Gleaning:       {gleaning_calls}")
     print(f"  Total:          {total_llm_calls}")
     print()
-    print(f"Tokens:")
+    print("Tokens:")
     print(f"  Input:          {_fmt_tok(total_input_tok)}")
     print(f"  Output:         {_fmt_tok(total_output_tok)}")
     print()
-    print(f"Estimated cost:")
+    print("Estimated cost:")
     print(f"  Input:          {_fmt_cost(input_cost)}")
     print(f"  Output:         {_fmt_cost(output_cost)}")
     print(f"  Total:          {_fmt_cost(total_cost)}")
     print(f"  Range:          {_fmt_cost(lower_cost)} – {_fmt_cost(upper_cost)}")
     print()
-    print(f"Notes:")
-    print(f"  - Actual cost depends on retry rate, gleaning cycles, and output")
-    print(f"  - LLM cache (LightRAG built-in) can reduce cost by 10-30%")
-    print(f"  - Large files produce more chunks and increase extract calls")
-    print(f"  - Use --max-gleaning=0 to disable expensive retry cycles")
-    print(f"  - Higher batch_size = fewer merge calls (but more per merge)")
+    print("Notes:")
+    print("  - Actual cost depends on retry rate, gleaning cycles, and output")
+    print("  - LLM cache (LightRAG built-in) can reduce cost by 10-30%")
+    print("  - Large files produce more chunks and increase extract calls")
+    print("  - Use --max-gleaning=0 to disable expensive retry cycles")
+    print("  - Higher batch_size = fewer merge calls (but more per merge)")
 
     return 0
 
@@ -914,6 +1071,64 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     import_p.add_argument("--force", action="store_true", help="Overwrite existing index")
     import_p.set_defaults(func=_cmd_import)
+
+    # -- Index migration --
+    migrate_p = sub.add_parser(
+        "migrate-index",
+        help="Back-fill chunk location metadata (heading_path, lines, real path) in an "
+        "existing index. Zero LLM calls; vectors are never re-embedded.",
+    )
+    migrate_p.add_argument(
+        "--index-dir", default=None,
+        help="Index directory (default: $HARS_MEMORY_INDEX_DIR)",
+    )
+    migrate_p.add_argument(
+        "--root", type=Path, default=None,
+        help="Repo / KB root to re-walk (.memoryignore applies) to recover real paths "
+        "(default: current directory)",
+    )
+    migrate_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Print counts only; write nothing.",
+    )
+    migrate_p.add_argument(
+        "--dedupe", action="store_true",
+        help="Also remove chunks of duplicate documents (identical body, different path), "
+        "keeping the canonical one.",
+    )
+    migrate_p.set_defaults(func=_cmd_migrate_index)
+
+    # -- Batch-API index build --
+    ib_p = sub.add_parser(
+        "index-batch",
+        help="Build an index with LLM extraction through a provider Batch API (50%% cheaper; "
+        "primes LightRAG's LLM cache, then indexes normally). Phases are resumable.",
+    )
+    ib_p.add_argument("batch_action", choices=["collect", "submit", "status", "apply", "run", "compare"],
+                      help="collect: build prompts (no network); submit: upload+create batches; "
+                      "status: show state; apply: prime cache + index; run: all of it; "
+                      "compare: --other DIR vs --index-dir")
+    ib_p.add_argument("--index-dir", default=None, help="Target index directory (default: $HARS_MEMORY_INDEX_DIR)")
+    ib_p.add_argument("--paths", nargs="+", default=None,
+                      help="Files/directories to index (default: knowledge-source manifest)")
+    ib_p.add_argument("--max-docs", type=int, default=0, help="Cap the number of documents (0 = no cap)")
+    ib_p.add_argument("--max-cost", type=float, default=0.50,
+                      help="Abort if the estimated cost (USD, batch prices) exceeds this (default: 0.50)")
+    ib_p.add_argument("--input-price", type=float, default=0.05, help="USD per 1M input tokens at BATCH price")
+    ib_p.add_argument("--output-price", type=float, default=0.25, help="USD per 1M output tokens at BATCH price")
+    ib_p.add_argument("--est-output-tokens", type=int, default=1500, help="Assumed output tokens per request")
+    ib_p.add_argument("--max-tokens-param", default="max_completion_tokens", choices=["max_tokens", "max_completion_tokens"])
+    ib_p.add_argument("--max-batch-tokens", type=int, default=0,
+                      help="submit: split a round into batches of at most this many estimated input tokens (0 = no split)")
+    ib_p.add_argument("--max-inflight-tokens", type=int, default=0,
+                      help="submit/run: keep at most this many estimated input tokens in unfinished batches "
+                      "(provider enqueued-token quota; 0 = no limit)")
+    ib_p.add_argument("--dry-run", action="store_true", help="collect: print the estimate, write nothing")
+    ib_p.add_argument("--refresh", action="store_true", help="status: poll the provider first")
+    ib_p.add_argument("--poll-seconds", type=float, default=30.0)
+    ib_p.add_argument("--timeout-minutes", type=float, default=30.0, help="run: stop waiting after this long")
+    ib_p.add_argument("--other", default=None, help="compare: the other index directory")
+    ib_p.set_defaults(func=_cmd_index_batch)
 
     # -- Estimate cost --
     estimate_p = sub.add_parser(

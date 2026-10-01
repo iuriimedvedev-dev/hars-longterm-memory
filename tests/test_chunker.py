@@ -197,3 +197,83 @@ class TestFrontmatterDocuments:
         assert "[Document: note.md" in first
         # The frontmatter fences are not mistaken for a Markdown section break.
         assert first.count("---") >= 2
+
+
+class TestLocationMetadata:
+    def test_line_ranges_and_heading_path_nested_to_h5(self) -> None:
+        text = (
+            "# Doc\n"  # line 1
+            "\n"
+            "## A\n"  # 3
+            "\n"
+            "### B\n"  # 5
+            "\n"
+            "#### C\n"  # 7
+            "\n"
+            "##### D\n"  # 9
+            "\n"
+            "deep body\n"  # 11
+        )
+
+        chunks = chunk_text(text, source_id="d1", chunk_size=2000)
+
+        deep = [c for c in chunks if "deep body" in c.text][0]
+        assert deep.start_line == 5  # the H3 section opens at "### B"
+        assert deep.end_line == 11
+        # heading_path is the path in effect where the chunk STARTS.
+        assert deep.heading_path == ("Doc", "A", "B")
+        assert deep.section == "B"
+
+    def test_heading_path_follows_chunk_start_inside_a_long_section(self) -> None:
+        body = "\n\n".join(f"para {i} " + "x" * 150 for i in range(8))
+        text = f"# Doc\n\n## A\n\n### B\n\n#### C\n\n##### D\n\n{body}\n"
+
+        chunks = chunk_text(text, source_id="d1", chunk_size=500, chunk_overlap=50)
+
+        assert len(chunks) > 1
+        # H1/H2/H3 open their own chunks; the long H3 body then splits and its
+        # later chunks start below the H4/H5 headings.
+        assert [c.heading_path for c in chunks[:3]] == [("Doc",), ("Doc", "A"), ("Doc", "A", "B")]
+        assert all(c.heading_path == ("Doc", "A", "B", "C", "D") for c in chunks[3:])
+        assert chunks[-1].section == "D"
+        lines = text.splitlines()
+        for chunk in chunks:
+            assert 1 <= chunk.start_line <= chunk.end_line <= len(lines)
+            # The first source line of the chunk's body is on its start_line.
+            body = chunk.text[len(chunk.breadcrumb) + 2 :] if chunk.breadcrumb else chunk.text
+            body_first_line = body.splitlines()[0]
+            assert lines[chunk.start_line - 1].startswith(body_first_line[:6])
+
+    def test_table_rows_and_fences_are_cut_on_line_boundaries_when_oversized(self) -> None:
+        rows = "\n".join(f"| row{i:03d} | value{i:03d} |" for i in range(80))
+        table = "| col a | col b |\n| --- | --- |\n" + rows
+        code = "```sh\n" + "\n".join(f"echo line_{i:03d}" for i in range(80)) + "\n```"
+        text = f"## T\n\n{table}\n\n## C\n\n{code}\n"
+
+        chunks = chunk_text(text, source_id="d1", chunk_size=400, chunk_overlap=50)
+
+        assert all(len(c.text) <= 400 for c in chunks)
+        for chunk in chunks:
+            body = chunk.text.split("\n\n", 1)[1]
+            for line in body.splitlines():
+                assert line.startswith(("| ", "echo ", "```", "## "))
+        joined = "\n".join(c.text for c in chunks)
+        assert "| row079 | value079 |" in joined and "echo line_079" in joined
+
+    def test_plain_window_text_and_offsets_are_unchanged_and_get_lines(self) -> None:
+        text = "\n".join(f"line {i} " + "q" * 40 for i in range(60))
+
+        chunks = chunk_text(text, source_id="d1", chunk_size=300, chunk_overlap=50)
+
+        stripped = text.strip()
+        for chunk in chunks:
+            assert chunk.text == stripped[chunk.start_char : chunk.end_char]
+            assert chunk.heading_path == () and chunk.section == "" and chunk.breadcrumb == ""
+            assert chunk.start_line == stripped.count("\n", 0, chunk.start_char) + 1
+        assert chunks[0].start_line == 1
+        assert chunks[-1].end_line == 60
+
+    def test_leading_whitespace_does_not_shift_line_numbers(self) -> None:
+        chunks = chunk_text("\n\n\nfirst\nsecond\n", source_id="d1")
+
+        assert (chunks[0].start_line, chunks[0].end_line) == (4, 5)
