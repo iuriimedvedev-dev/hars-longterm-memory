@@ -329,6 +329,20 @@ def _invalidate_bm25_cache() -> None:
         logger.warning("BM25 cache invalidation skipped (%s): %s", cache_dir, exc)
 
 
+def _unique_file_key(doc: Document) -> str:
+    """Unique per-document file key: the relative path with ``/`` -> ``-``.
+
+    Used as the ``file_paths`` entry so the basename LightRAG dedupes on is
+    unique (see ``_insert_all_batches``).  Shared with ``ingest/batch.py``.
+    """
+    rel = doc.metadata.get("relative_path", "") if doc.metadata else ""
+    if rel:
+        return rel.replace("/", "-")
+    # Fallback: use the last 3 path components joined by hyphens
+    parts = Path(doc.source_path).parts
+    return "-".join(parts[-3:]) if len(parts) >= 3 else Path(doc.source_path).name
+
+
 async def _insert_all_batches(
     rag: object,
     all_docs: list,
@@ -351,19 +365,7 @@ async def _insert_all_batches(
         batch = all_docs[i : i + batch_size]
         texts = [doc.content for doc in batch]
         ids = [doc.doc_id for doc in batch]
-        # Build a unique file key per document: use the relative path with
-        # path separators replaced by hyphens, so the basename is unique.
-        file_paths = []
-        for doc in batch:
-            rel = doc.metadata.get("relative_path", "") if doc.metadata else ""
-            if rel:
-                unique = rel.replace("/", "-")
-            else:
-                # Fallback: use the last 3 path components joined by hyphens
-                path = Path(doc.source_path)
-                parts = path.parts
-                unique = "-".join(parts[-3:]) if len(parts) >= 3 else path.name
-            file_paths.append(unique)
+        file_paths = [_unique_file_key(doc) for doc in batch]
         await rag.ainsert(texts, ids=ids, file_paths=file_paths)  # type: ignore[attr-defined]
         logger.info("Inserted batch %d/%d (last file: %s)", i // batch_size + 1, total_batches, file_paths[-1])
 
@@ -486,6 +488,12 @@ async def _run_indexing(args: argparse.Namespace) -> None:
         except Exception as exc:
             logger.warning("LightRAG storage finalization failed: %s", exc)
 
+    # Additive, no-LLM: stamp heading/line/path metadata onto the chunks just
+    # written (see ingest/migrate.py). Never fails the run.
+    from hars_memory.ingest.migrate import backfill_after_ingest
+
+    backfill_after_ingest(getattr(rag, "working_dir", None), all_docs)
+
     # Fingerprints are persisted ONLY after a fully successful insert: an
     # exception re-raises above and a cancellation lands in `interrupted`,
     # both of which leave the sidecar untouched so the next run re-detects
@@ -501,6 +509,12 @@ async def _run_indexing(args: argparse.Namespace) -> None:
         )
         sys.exit(130)
 
+    from hars_memory.server.lightrag_init import LLM_USAGE
+
+    logger.info(
+        "LLM usage this run: calls=%d prompt_tokens=%d completion_tokens=%d",
+        LLM_USAGE["calls"], LLM_USAGE["prompt_tokens"], LLM_USAGE["completion_tokens"],
+    )
     logger.info("Indexing complete.")
 
 
