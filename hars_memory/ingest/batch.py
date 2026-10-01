@@ -26,6 +26,10 @@ Phases (each resumable and idempotent; state in ``<index>/batch_state.json``)
              answer, so it can only be collected after round 1 has completed.
 ``submit``   write the OpenAI batch JSONL, upload it, create the batch(es).
 ``status``   poll; download the output of finished batches.
+``cancel``   (manual) cancel unfinished batches; ``run`` also cancels stalled ones
+             (no progress for ``--stall-minutes``) and abandons a part whose cancel
+             never finishes (``--cancel-wait-minutes``): its unanswered requests go
+             through the synchronous fallback, guarded by ``--max-cost``.
 ``apply``    prime the cache and run the normal indexing.  Requests that failed
              (error line, missing, expired batch) are simply not primed, so
              LightRAG answers them with the normal synchronous LLM call; the
@@ -71,9 +75,16 @@ DEFAULT_OUTPUT_PRICE: Final[float] = 0.25
 # pessimistic (a reasoning model also bills its hidden reasoning tokens).
 DEFAULT_EST_OUTPUT_TOKENS: Final[int] = 1500
 DEFAULT_MAX_COST_USD: Final[float] = 0.50
+# "abandoned" is ours, not the provider's: a part we gave up on (stalled, cancel never
+# finished or produced no output); its unanswered requests are answered synchronously.
 TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
-    {"completed", "failed", "expired", "cancelled"}
+    {"completed", "failed", "expired", "cancelled", "abandoned"}
 )
+DEFAULT_STALL_MINUTES: Final[float] = 20.0
+DEFAULT_STALL_MIN_DONE_FRACTION: Final[float] = 0.5
+DEFAULT_CANCEL_WAIT_MINUTES: Final[float] = 15.0
+# Synchronous calls cost about twice the batch price (batch = 50% discount).
+SYNC_PRICE_FACTOR: Final[float] = 2.0
 # Answer returned by the recording LLM; a request whose history contains it was
 # derived from an answer we do not have yet (gleaning of an unanswered chunk).
 _STUB: Final[str] = "<|COMPLETE|>"
@@ -102,6 +113,8 @@ class BatchBackend(Protocol):
     def get(self, batch_id: str) -> dict[str, Any]: ...
 
     def read(self, file_id: str) -> str: ...
+
+    def cancel(self, batch_id: str) -> dict[str, Any]: ...
 
 
 class OpenAIBatchBackend:
@@ -139,6 +152,9 @@ class OpenAIBatchBackend:
 
     def read(self, file_id: str) -> str:
         return self._client.files.content(file_id).text
+
+    def cancel(self, batch_id: str) -> dict[str, Any]:
+        return _batch_dict(self._client.batches.cancel(batch_id))
 
 
 def _batch_dict(batch: Any) -> dict[str, Any]:
@@ -332,6 +348,11 @@ class Part:
     downloaded: bool = False
     usage: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # progress / stall bookkeeping (persisted so a restarted `run` keeps the stall clock)
+    last_done: int = 0  # completed + failed at the last observed increase
+    last_progress_at: float | None = None
+    cancel_requested_at: float | None = None
+    abandoned_reason: str | None = None
 
 
 @dataclass
@@ -344,6 +365,8 @@ class RoundState:
     parts: list[Part] = field(default_factory=list)
 
     def terminal(self) -> bool:
+        if not self.requests:
+            return True  # e.g. a gleaning round with nothing collectable (round 1 abandoned)
         return bool(self.parts) and all(p.status in TERMINAL_STATUSES and p.downloaded for p in self.parts)
 
     def submitted(self) -> bool:
@@ -655,8 +678,17 @@ def _split_parts(
     flush()
 
 
-def refresh(index_dir: Path, backend: BatchBackend) -> BatchState:
-    """Poll every submitted, non-finished part; download output of finished ones."""
+def _done(counts: dict[str, Any]) -> int:
+    return int(counts.get("completed") or 0) + int(counts.get("failed") or 0)
+
+
+def refresh(
+    index_dir: Path, backend: BatchBackend, *, clock: Callable[[], float] = time.time
+) -> BatchState:
+    """Poll every submitted, non-finished part; download output of finished ones.
+
+    Also tracks progress (``completed + failed``) per part for stall detection.
+    """
     state = BatchState.load(index_dir)
     bdir = batch_dir(index_dir)
     for name, rnd in state.rounds.items():
@@ -670,8 +702,19 @@ def refresh(index_dir: Path, backend: BatchBackend) -> BatchState:
                 part.error_file_id = info.get("error_file_id")
                 part.counts = info.get("counts") or {}
                 part.errors = info.get("errors") or []
+                done = _done(part.counts)
+                if part.last_progress_at is None or done > part.last_done:
+                    part.last_done = done
+                    part.last_progress_at = clock()
+                if part.status == "cancelled" and not part.output_file_id:
+                    part.status = "abandoned"
+                    part.abandoned_reason = "cancelled without an output file"
+                    logger.warning(
+                        "round %s part %d (batch %s): cancelled without an output file => abandoned; "
+                        "its requests will be answered synchronously", name, part.part, part.batch_id,
+                    )
             if part.status in TERMINAL_STATUSES:
-                part.completed_at = part.completed_at or time.time()
+                part.completed_at = part.completed_at or clock()
                 stem = f"round-{name}.part-{part.part}"
                 if part.output_file_id:
                     text = backend.read(part.output_file_id)
@@ -680,6 +723,94 @@ def refresh(index_dir: Path, backend: BatchBackend) -> BatchState:
                 if part.error_file_id:
                     (bdir / f"{stem}.errors.jsonl").write_text(backend.read(part.error_file_id), encoding="utf-8")
                 part.downloaded = True
+        state.save(index_dir)
+    return state
+
+
+def _request_cancel(part: Part, backend: BatchBackend, name: str, now: float) -> bool:
+    """POST cancel for *part*; record it. Returns False when the call failed (retried next poll)."""
+    assert part.batch_id
+    try:
+        info = backend.cancel(part.batch_id)
+    except Exception as exc:  # network / provider error: keep waiting, try again next poll
+        logger.warning("round %s part %d: cancel of batch %s failed: %s", name, part.part, part.batch_id, exc)
+        return False
+    part.status = info.get("status") or "cancelling"
+    part.cancel_requested_at = now
+    return True
+
+
+def cancel_parts(
+    index_dir: Path, backend: BatchBackend, *, clock: Callable[[], float] = time.time
+) -> list[Part]:
+    """Cancel every submitted, unfinished part (manual ``index-batch cancel``).
+
+    The next ``run`` / ``status --refresh`` downloads the partial output of a part
+    that becomes ``cancelled`` and abandons one that never does
+    (``--cancel-wait-minutes``).  Idempotent.
+    """
+    state = BatchState.load(index_dir)
+    cancelled: list[Part] = []
+    for name, rnd in state.rounds.items():
+        for part in rnd.parts:
+            if not part.batch_id or part.downloaded or part.status in TERMINAL_STATUSES:
+                continue
+            if part.cancel_requested_at is not None:
+                continue
+            if _request_cancel(part, backend, name, clock()):
+                logger.warning("round %s part %d: cancel requested for batch %s (manual)", name, part.part, part.batch_id)
+                cancelled.append(part)
+    state.save(index_dir)
+    return cancelled
+
+
+def _handle_stalls(
+    index_dir: Path,
+    backend: BatchBackend,
+    *,
+    stall_seconds: float,
+    min_done_fraction: float,
+    cancel_wait_seconds: float,
+    clock: Callable[[], float],
+) -> BatchState:
+    """Cancel stalled parts; abandon parts whose cancel never finished."""
+    state = BatchState.load(index_dir)
+    now = clock()
+    changed = False
+    for name, rnd in state.rounds.items():
+        for part in rnd.parts:
+            if not part.batch_id or part.downloaded or part.status in TERMINAL_STATUSES:
+                continue
+            total = int(part.counts.get("total") or part.requests or 0)
+            done = _done(part.counts)
+            if part.cancel_requested_at is not None:
+                waited = now - part.cancel_requested_at
+                if waited >= cancel_wait_seconds:
+                    last_status = part.status
+                    part.status = "abandoned"
+                    part.downloaded = True
+                    part.completed_at = now
+                    part.abandoned_reason = (
+                        f"cancel requested {waited / 60:.0f} min ago, still {last_status!r} "
+                        f"with no output ({done}/{total} done)"
+                    )
+                    logger.warning(
+                        "round %s part %d (batch %s): ABANDONED, cancel did not finish within %.0f min; "
+                        "requests without an answer will be answered synchronously",
+                        name, part.part, part.batch_id, cancel_wait_seconds / 60,
+                    )
+                    changed = True
+                continue
+            if stall_seconds <= 0 or not total or done >= total:
+                continue
+            idle = now - (part.last_progress_at if part.last_progress_at is not None else now)
+            if done / total >= min_done_fraction and idle >= stall_seconds:
+                logger.warning(
+                    "round %s part %d (batch %s): STALLED at %d/%d done, no progress for %.0f min => cancelling",
+                    name, part.part, part.batch_id, done, total, idle / 60,
+                )
+                changed |= _request_cancel(part, backend, name, now)
+    if changed:
         state.save(index_dir)
     return state
 
@@ -717,7 +848,25 @@ def actual_cost(state: BatchState) -> dict[str, float]:
     }
 
 
-def format_status(state: BatchState) -> str:
+def part_flags(p: Part, *, now: float, stall_seconds: float = 0.0) -> list[str]:
+    """Human flags for a part: stalled / cancelling / cancelled / abandoned."""
+    flags: list[str] = []
+    if p.status == "abandoned":
+        flags.append("ABANDONED")
+    elif p.status == "cancelled":
+        flags.append("CANCELLED(partial output)" if p.output_file_id else "CANCELLED")
+    elif p.cancel_requested_at is not None and p.status not in TERMINAL_STATUSES:
+        flags.append(f"CANCELLING({(now - p.cancel_requested_at) / 60:.0f}m)")
+    elif (
+        stall_seconds > 0 and p.batch_id and p.status not in TERMINAL_STATUSES
+        and p.last_progress_at is not None and now - p.last_progress_at >= stall_seconds
+    ):
+        flags.append("STALLED")
+    return flags
+
+
+def format_status(state: BatchState, *, now: float | None = None, stall_seconds: float = 0.0) -> str:
+    now = time.time() if now is None else now
     lines = [
         f"model={state.model or '?'} chunker={state.chunker} gleaning={state.gleaning} docs={len(state.doc_ids)}"
     ]
@@ -728,10 +877,22 @@ def format_status(state: BatchState) -> str:
             f"{'done' if rnd.terminal() else 'in progress'}"
         )
         for p in rnd.parts:
+            total = p.counts.get("total") or p.requests
+            progress = (
+                f"done={_done(p.counts)}/{total} (failed={p.counts.get('failed') or 0})"
+                if p.counts else f"done=-/{p.requests}"
+            )
+            age = (
+                f" last_progress={(now - p.last_progress_at) / 60:.0f}m ago"
+                if p.last_progress_at is not None and p.status not in TERMINAL_STATUSES else ""
+            )
+            flags = part_flags(p, now=now, stall_seconds=stall_seconds)
             lines.append(
-                f"  part {p.part}: batch={p.batch_id or '-'} status={p.status} "
-                f"counts={p.counts or '-'} usage={p.usage or '-'}"
+                f"  part {p.part}: batch={p.batch_id or '-'} status={p.status} {progress}{age} "
+                f"usage={p.usage or '-'}"
+                + (f" [{' '.join(flags)}]" if flags else "")
                 + (f" errors={p.errors}" if p.errors else "")
+                + (f" reason={p.abandoned_reason}" if p.abandoned_reason else "")
             )
     if state.applied:
         lines.append(f"applied: {json.dumps(state.applied)}")
@@ -746,24 +907,39 @@ def wait(
     timeout_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
     after_poll: Callable[[], object] | None = None,
+    stall_seconds: float = 0.0,
+    stall_min_done_fraction: float = DEFAULT_STALL_MIN_DONE_FRACTION,
+    cancel_wait_seconds: float = DEFAULT_CANCEL_WAIT_MINUTES * 60,
+    clock: Callable[[], float] = time.time,
 ) -> BatchState:
     """Poll until every part is terminal or the timeout passes.
 
     *after_poll* runs after each refresh (``run`` uses it to submit parts that
-    waited for in-flight capacity).
+    waited for in-flight capacity).  With ``stall_seconds > 0`` a part whose
+    ``completed + failed`` has not grown for that long (and which is at least
+    *stall_min_done_fraction* done) is cancelled; if the cancel does not reach a
+    terminal state within *cancel_wait_seconds* the part is marked ``abandoned``.
+    The caller checks ``RoundState.terminal()``; the timeout is not an error here.
     """
-    deadline = time.monotonic() + timeout_seconds
+    deadline = clock() + timeout_seconds
     while True:
-        state = refresh(index_dir, backend)
+        refresh(index_dir, backend, clock=clock)
+        state = _handle_stalls(
+            index_dir, backend, stall_seconds=stall_seconds, min_done_fraction=stall_min_done_fraction,
+            cancel_wait_seconds=cancel_wait_seconds, clock=clock,
+        )
         if after_poll is not None:
             after_poll()
             state = BatchState.load(index_dir)
         pending = [p for r in state.rounds.values() for p in r.parts if not p.downloaded]
         if not pending:
             return state
-        if time.monotonic() >= deadline:
+        if clock() >= deadline:
             return state
-        logger.info("waiting: %s", ", ".join(f"{p.batch_id}={p.status}" for p in pending))
+        logger.info(
+            "waiting: %s",
+            ", ".join(f"{p.batch_id}={p.status}({_done(p.counts)}/{p.counts.get('total') or p.requests})" for p in pending),
+        )
         sleep(poll_seconds)
 
 
@@ -772,18 +948,72 @@ def wait(
 # ---------------------------------------------------------------------------
 
 
-async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, str]) -> dict[str, Any]:
-    from lightrag.utils import statistic_data
-
-    from hars_memory.server.index import _insert_all_batches
-    from hars_memory.server.lightrag_init import create_lightrag
-
+def _load_requests(index_dir: Path) -> dict[str, BatchRequest]:
     requests: dict[str, BatchRequest] = {}
     for path in sorted(batch_dir(index_dir).glob("round-*.requests.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 row = json.loads(line)
                 requests[row["key"]] = BatchRequest(**row)
+    return requests
+
+
+def spent_cost(state: BatchState) -> float:
+    """USD spent on batches so far: measured usage where known, else the estimate share."""
+    ip = state.prices.get("input", DEFAULT_INPUT_PRICE)
+    op = state.prices.get("output", DEFAULT_OUTPUT_PRICE)
+    total = 0.0
+    for rnd in state.rounds.values():
+        for p in rnd.parts:
+            if p.usage:
+                total += (p.usage.get("prompt_tokens", 0) * ip + p.usage.get("completion_tokens", 0) * op) / 1_000_000
+            elif p.batch_id and rnd.requests:
+                total += rnd.est_cost_usd * p.requests / rnd.requests
+    return total
+
+
+def fallback_plan(index_dir: Path, state: BatchState, answers: dict[str, str]) -> dict[str, Any]:
+    """What the synchronous fallback will have to answer, and what it will cost.
+
+    Counts every request without an answer (error lines, missing, abandoned or
+    partially cancelled parts).  When gleaning is on, an unanswered round-1
+    request also costs a gleaning call (its round-2 prompt could not be batched);
+    that second call is approximated with the same token size.
+    """
+    requests = _load_requests(index_dir)
+    missing = [r for k, r in requests.items() if k not in answers]
+    abandoned_keys: set[str] = set()
+    for rnd in state.rounds.values():
+        for p in rnd.parts:
+            if p.status == "abandoned":
+                path = batch_dir(index_dir) / p.input_file
+                if path.is_file():
+                    abandoned_keys.update(
+                        json.loads(line)["custom_id"] for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+                    )
+    extra = [r for r in missing if r.round == 1] if state.gleaning > 0 else []
+    calls = len(missing) + len(extra)
+    tokens = sum(r.est_input_tokens for r in missing) + sum(r.est_input_tokens for r in extra)
+    ip = state.prices.get("input", DEFAULT_INPUT_PRICE)
+    op = state.prices.get("output", DEFAULT_OUTPUT_PRICE)
+    out = int(state.prices.get("est_output_tokens", DEFAULT_EST_OUTPUT_TOKENS))
+    cost = SYNC_PRICE_FACTOR * estimate_cost(calls, tokens, input_price=ip, output_price=op, est_output_tokens=out)
+    return {
+        "missing_requests": len(missing),
+        "missing_in_abandoned_parts": sum(1 for r in missing if r.key in abandoned_keys),
+        "sync_calls_estimated": calls,
+        "sync_cost_estimated_usd": round(cost, 6),
+        "spent_usd": round(spent_cost(state), 6),
+    }
+
+
+async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, str]) -> dict[str, Any]:
+    from lightrag.utils import statistic_data
+
+    from hars_memory.server.index import _insert_all_batches
+    from hars_memory.server.lightrag_init import create_lightrag
+
+    requests = _load_requests(index_dir)
 
     rag = create_lightrag(working_dir=str(index_dir))
     await rag.initialize_storages()  # type: ignore[attr-defined]
@@ -820,8 +1050,14 @@ async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, 
     return {"primed": len(entries), "cache_hits": hits, "sync_llm_calls": calls}
 
 
-def apply(index_dir: Path, docs: list[Any]) -> dict[str, Any]:
-    """Prime LightRAG's cache from downloaded answers and run the normal indexing."""
+def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None) -> dict[str, Any]:
+    """Prime LightRAG's cache from downloaded answers and run the normal indexing.
+
+    Requests without an answer are answered synchronously by LightRAG.  With
+    *max_cost_usd* set, raises CostGuardError (before indexing anything) when
+    batch spend so far plus the estimated synchronous fallback (2x batch price)
+    would exceed it.
+    """
     state = BatchState.load(index_dir)
     if not state.rounds:
         raise BatchError("nothing to apply: run collect/submit first")
@@ -832,12 +1068,30 @@ def apply(index_dir: Path, docs: list[Any]) -> dict[str, Any]:
         )
     answers, counts = load_answers(index_dir)
     total_requests = sum(r.requests for r in state.rounds.values())
+    plan = fallback_plan(index_dir, state, answers)
+    abandoned = sum(1 for r in state.rounds.values() for p in r.parts if p.status == "abandoned")
+    if plan["missing_requests"]:
+        logger.warning(
+            "sync fallback: %d of %d request(s) have no batch answer (%d in %d abandoned part(s)); "
+            "~%d synchronous call(s), estimated $%.4f at 2x batch price (batch spend so far $%.4f)",
+            plan["missing_requests"], total_requests, plan["missing_in_abandoned_parts"], abandoned,
+            plan["sync_calls_estimated"], plan["sync_cost_estimated_usd"], plan["spent_usd"],
+        )
+        cumulative = plan["spent_usd"] + plan["sync_cost_estimated_usd"]
+        if max_cost_usd is not None and cumulative > max_cost_usd:
+            raise CostGuardError(
+                f"sync fallback for {plan['missing_requests']} unanswered request(s) would bring the cumulative cost to "
+                f"${cumulative:.4f} (batch ${plan['spent_usd']:.4f} + sync ${plan['sync_cost_estimated_usd']:.4f}), "
+                f"over --max-cost ${max_cost_usd:.2f}; nothing indexed (state is resumable: raise --max-cost and re-run)"
+            )
     stats = asyncio.run(_prime_and_index(index_dir, docs, answers))
     stats.update(
         total_requests=total_requests,
         answered=counts["ok"],
         error_lines=counts["error_lines"],
         expected_sync_fallback=total_requests - counts["ok"],
+        abandoned_parts=abandoned,
+        missing_in_abandoned_parts=plan["missing_in_abandoned_parts"],
     )
     state.applied = stats
     state.save(index_dir)

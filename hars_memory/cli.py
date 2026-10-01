@@ -419,6 +419,16 @@ def _check_not_live_index(index_dir: Path) -> None:
         )
 
 
+def _batch_minutes(value: float | None, env: str, default: float) -> float:
+    """CLI value, else env var, else default (minutes)."""
+    import os
+
+    if value is not None:
+        return value
+    raw = os.environ.get(env, "").strip()
+    return float(raw) if raw else default
+
+
 def _cmd_index_batch(args: argparse.Namespace) -> int:
     """Build an index with extraction through a provider Batch API (see ingest/batch.py)."""
     import os
@@ -434,9 +444,18 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
         if action == "compare":
             print(batch.format_comparison(args.other, index_dir))
             return 0
+        stall_seconds = _batch_minutes(args.stall_minutes, "HARS_MEMORY_BATCH_STALL_MINUTES", batch.DEFAULT_STALL_MINUTES) * 60
+        cancel_wait_seconds = _batch_minutes(
+            args.cancel_wait_minutes, "HARS_MEMORY_BATCH_CANCEL_WAIT_MINUTES", batch.DEFAULT_CANCEL_WAIT_MINUTES) * 60
         if action == "status":
             state = batch.refresh(index_dir, batch.make_backend_from_env()) if args.refresh else batch.BatchState.load(index_dir)
-            print(batch.format_status(state))
+            print(batch.format_status(state, stall_seconds=stall_seconds))
+            return 0
+        if action == "cancel":
+            cancelled = batch.cancel_parts(index_dir, batch.make_backend_from_env())
+            print(f"cancel requested for {len(cancelled)} batch(es): " + ", ".join(p.batch_id or "?" for p in cancelled)
+                  + "\nre-run `index-batch run` (or `status --refresh`) to collect partial output; "
+                  "parts still not cancelled after --cancel-wait-minutes are abandoned (sync fallback)")
             return 0
         if action in ("collect", "run"):
             print(
@@ -471,7 +490,7 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
             print(f"submitted {len(parts)} batch(es): " + ", ".join(p.batch_id or "?" for p in parts))
             return 0
         if action == "apply":
-            print(json.dumps(batch.apply(index_dir, _batch_documents(args)), indent=2))
+            print(json.dumps(batch.apply(index_dir, _batch_documents(args), max_cost_usd=args.max_cost), indent=2))
             return 0
         # run: collect -> submit -> wait -> (gleaning round) -> apply, resumable at every step
         backend = batch.make_backend_from_env()
@@ -484,14 +503,22 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
             batch.submit(index_dir, backend, **submit_kw)
             state = batch.wait(index_dir, backend, poll_seconds=args.poll_seconds,
                                timeout_seconds=args.timeout_minutes * 60,
-                               after_poll=lambda: batch.submit(index_dir, backend, **submit_kw))
-            print(batch.format_status(state))
+                               after_poll=lambda: batch.submit(index_dir, backend, **submit_kw),
+                               stall_seconds=stall_seconds, stall_min_done_fraction=args.stall_min_done_fraction,
+                               cancel_wait_seconds=cancel_wait_seconds)
+            print(batch.format_status(state, stall_seconds=stall_seconds))
             if not all(r.terminal() for r in state.rounds.values()):
-                print("not finished within --timeout-minutes; state is resumable: re-run the same command", file=sys.stderr)
+                unfinished = sum(1 for r in state.rounds.values() for p in r.parts if not p.downloaded)
+                print(
+                    f"TIMEOUT (exit 4): {unfinished} batch part(s) not finished within --timeout-minutes="
+                    f"{args.timeout_minutes:g}; nothing was applied. State is saved and resumable: re-run the same "
+                    "command (or `index-batch cancel` to give up on the stragglers).",
+                    file=sys.stderr,
+                )
                 return 4
             if batch.next_round(state) is None:
                 break
-        print(json.dumps(batch.apply(index_dir, docs), indent=2))
+        print(json.dumps(batch.apply(index_dir, docs, max_cost_usd=args.max_cost), indent=2))
         print(json.dumps(batch.actual_cost(batch.BatchState.load(index_dir)), indent=2))
         return 0
     except batch.CostGuardError as exc:
@@ -1104,9 +1131,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Build an index with LLM extraction through a provider Batch API (50%% cheaper; "
         "primes LightRAG's LLM cache, then indexes normally). Phases are resumable.",
     )
-    ib_p.add_argument("batch_action", choices=["collect", "submit", "status", "apply", "run", "compare"],
+    ib_p.add_argument("batch_action", choices=["collect", "submit", "status", "apply", "run", "cancel", "compare"],
                       help="collect: build prompts (no network); submit: upload+create batches; "
                       "status: show state; apply: prime cache + index; run: all of it; "
+                      "cancel: cancel unfinished batches (manual); "
                       "compare: --other DIR vs --index-dir")
     ib_p.add_argument("--index-dir", default=None, help="Target index directory (default: $HARS_MEMORY_INDEX_DIR)")
     ib_p.add_argument("--paths", nargs="+", default=None,
@@ -1126,7 +1154,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ib_p.add_argument("--dry-run", action="store_true", help="collect: print the estimate, write nothing")
     ib_p.add_argument("--refresh", action="store_true", help="status: poll the provider first")
     ib_p.add_argument("--poll-seconds", type=float, default=30.0)
-    ib_p.add_argument("--timeout-minutes", type=float, default=30.0, help="run: stop waiting after this long")
+    ib_p.add_argument("--timeout-minutes", type=float, default=30.0,
+                      help="run: stop waiting after this long and exit 4 (resumable)")
+    ib_p.add_argument("--stall-minutes", type=float, default=None,
+                      help="run: cancel a batch whose completed+failed has not grown for this long "
+                      "(default 20; env HARS_MEMORY_BATCH_STALL_MINUTES; 0 disables)")
+    ib_p.add_argument("--stall-min-done-fraction", type=float, default=0.5,
+                      help="run: only treat a batch as stalled once at least this fraction is done (default 0.5)")
+    ib_p.add_argument("--cancel-wait-minutes", type=float, default=None,
+                      help="run: after a cancel, wait this long for a terminal state before abandoning the part "
+                      "and answering its requests synchronously (default 15; env HARS_MEMORY_BATCH_CANCEL_WAIT_MINUTES)")
     ib_p.add_argument("--other", default=None, help="compare: the other index directory")
     ib_p.set_defaults(func=_cmd_index_batch)
 
