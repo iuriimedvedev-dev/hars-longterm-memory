@@ -251,6 +251,10 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
     finally:
         if initialized:
             await rag.finalize_storages()
+            if to_insert:
+                from hars_memory.ingest.migrate import backfill_after_ingest
+
+                backfill_after_ingest(getattr(rag, "working_dir", None), to_insert)
 
     return IngestResult(
         documents_written=written,

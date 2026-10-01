@@ -9,6 +9,8 @@ import tarfile
 import types
 from pathlib import Path
 
+import pytest
+
 from hars_memory import cli
 
 
