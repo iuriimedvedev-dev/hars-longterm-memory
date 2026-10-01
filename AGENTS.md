@@ -35,7 +35,12 @@ hars_memory/
   ingest/             — walker (.memoryignore-aware glob), chunker, change
                         detection (content-fingerprint sidecar), and the
                         public ingest_documents() API a consumer calls
-                        directly for non-filesystem sources (e.g. Postgres)
+                        directly for non-filesystem sources (e.g. Postgres);
+                        migrate.py backs `memory migrate-index` (zero-LLM
+                        back-fill of chunk location metadata + opt-in dedupe)
+                        batch.py backs `memory index-batch` (extraction through a
+                        provider Batch API by priming LightRAG's LLM cache; phases
+                        collect/submit/status/apply, state in <index>/batch_state.json)
   server/             — index.py (GPU-guarded CLI reindex entrypoint),
                         lightrag_init.py (wires LightRAG to the configured
                         embedder/extractor/query LLM/vector+graph storage),
@@ -70,6 +75,47 @@ config/.env.example     — full env-var reference with inline rationale
 Dockerfile.service      — production HTTP index-service image
 tests/                  — 583 passing tests plus 6 opt-in/environment skips, pytest
 ```
+
+## Chunking mode (`HARS_MEMORY_CHUNKER`)
+
+`token` (default) uses LightRAG's own token splitter. `markdown` plugs
+`ingest/chunker.py::lightrag_chunking_func` into `LightRAG(chunking_func=...)`
+(wired in `server/lightrag_init.py`): H1-H6 sections with full breadcrumbs,
+atomic tables/fences/lists/blockquotes, oversized ones split by row/line
+(table header repeated, fences re-balanced); non-Markdown files fall back to
+the token splitter. Chunks also carry `heading_path`/`section`/`start_line`/
+`end_line` (+ `part` for split pieces) in `kv_store_text_chunks.json`.
+Undersized chunks (< `HARS_MEMORY_CHUNK_MIN_TOKENS`, default 200, 0 = off) are merged
+into a neighbour of the same top-level section (heading below a sole H1), never across
+an oversized-block cut and never past `HARS_MEMORY_CHUNK_TOKEN_SIZE`; the record keeps
+each part in `merged_from` (`heading_path`, `start_line`, `end_line`). The walker's
+`[Document: ...]` header is no longer emitted as a standalone chunk.
+**Baseline parity** (measured read-only on the live index: 5533 gleaning prompts for
+5534 chunk ids in `kv_store_llm_response_cache.json`, 1726 of 3111 neighbouring chunks
+share exactly 64 tokens, max chunk 512 tokens): the baseline is token chunker, 512/64,
+`HARS_MEMORY_MAX_GLEANING=1` -- identical to the code defaults, so v2 only changes the
+chunker (markdown mode applies no overlap) unless env overrides.
+**Chunk id = md5(chunk text)**: turning `markdown` on for an existing index
+changes the ids of re-chunked docs, so those docs need re-extraction (LLM
+re-index); do not flip it on a live index without that plan.
+
+## Building / comparing the markdown "v2" index (Batch API)
+
+```bash
+export HARS_MEMORY_SOURCES_MANIFEST=/path/to/knowledge-sources.yaml
+scripts/build_index_md_v2.sh estimate        # no network, no cost: chunk + price round 1
+MAX_COST=20 scripts/build_index_md_v2.sh run # PAID. Resumable: re-run the same command (exit 4 = timeout)
+scripts/build_index_md_v2.sh status          # REFRESH=1 to poll the provider
+```
+The script pins the build config (chunker=markdown, 512 tokens, min 200, gleaning 1,
+`openai/gpt-6-luna`, temperature 1.0), reads `HARS_MEMORY_LLM_API_KEY` from
+`$HARS_ENV_FILE` (default `config/live-llm-e2e.env`) and refuses the live index. Target
+default: `~/.local/share/hars-longterm-memory/index-<VARIANT>` (`VARIANT=md|md-merge`, default `md-merge`; `INDEX_DIR=` to change).
+`memory index-batch` itself also refuses `~/.local/share/hars-longterm-memory/index`,
+`$HARS_MEMORY_LIVE_INDEX_DIR` and any dir holding an index it did not create.
+`MAX_COST` is cumulative over both rounds (gleaning is a second batch); set
+`MAX_INFLIGHT_TOKENS` if the provider has an enqueued-token quota. Evals (no LLM):
+`docs/index-v2-eval.md`.
 
 ## Consumer hook points (this package ships no defaults for these)
 
