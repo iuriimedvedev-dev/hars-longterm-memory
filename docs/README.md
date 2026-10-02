@@ -10,11 +10,11 @@ and CPU-only embeddings.
 |---|---|
 | [Architecture](architecture.md) / [Configuration](configuration.md) / [Indexing](indexing.md) | Modules, env vars, indexing modes |
 | [MCP tools](mcp-tools.md) / [Retrieval](retrieval.md) / [Evaluation](evaluation.md) / [Auth](auth.md) | Tool args, retrieval pipeline, metrics, RBAC |
-| [MCP tool reference](mcp-reference.md) | All 7 MCP tools: `memory_recall`, `memory_remember`, `memory_entities`, `memory_related`, `memory_status`, `memory_consolidate`, `memory_forget` — parameters, response shapes, examples |
+| [MCP tool reference](mcp-reference.md) | The MCP tools: `memory_recall`, `memory_remember`, `memory_entities`, `memory_related`, `memory_status`, `memory_consolidate`, `memory_forget` — parameters, response shapes, examples |
 | [Configuration reference](configuration.md) | All environment variables, their defaults, and semantics |
 | [Architecture](architecture.md) | Module map, data flow, component relationships, retrieval pipeline |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
-| [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
+| [gRPC reference](grpc-reference.md) | gRPC service — RPCs, client usage, configuration, health check |
 
 ### CLI Reference
 
