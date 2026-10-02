@@ -447,6 +447,65 @@ except ValueError as exc:
 if not math.isfinite(HARS_MEMORY_RERANK_TIMEOUT_S) or HARS_MEMORY_RERANK_TIMEOUT_S <= 0:
     raise ValueError("HARS_MEMORY_RERANK_TIMEOUT_S must be > 0")
 
+ROUTING_MODES = ("off", "lang")
+HARS_MEMORY_ROUTING = os.environ.get("HARS_MEMORY_ROUTING", "off")
+if HARS_MEMORY_ROUTING not in ROUTING_MODES:
+    raise ValueError(
+        f"HARS_MEMORY_ROUTING={HARS_MEMORY_ROUTING!r} must be one of "
+        f"{', '.join(repr(mode) for mode in ROUTING_MODES)}"
+    )
+
+
+def _routing_profile(name: str, allowed: tuple[str, ...], default: str) -> str:
+    value = os.environ.get(name, default)
+    if value not in allowed:
+        raise ValueError(f"{name}={value!r} must be one of {', '.join(repr(item) for item in allowed)}")
+    return value
+
+
+HARS_MEMORY_ROUTING_PROFILE_EN = _routing_profile(
+    "HARS_MEMORY_ROUTING_PROFILE_EN", ("base", "3way"), "3way"
+)
+HARS_MEMORY_ROUTING_PROFILE_RU = _routing_profile(
+    "HARS_MEMORY_ROUTING_PROFILE_RU", ("base", "3way", "3way_twin"), "3way_twin"
+)
+HARS_MEMORY_ROUTING_SIDECAR_DIR = os.environ.get("HARS_MEMORY_ROUTING_SIDECAR_DIR")
+HARS_MEMORY_ROUTING_SIDECAR_MODEL = os.environ.get(
+    "HARS_MEMORY_ROUTING_SIDECAR_MODEL", "Qwen/Qwen3-Embedding-0.6B"
+)
+try:
+    HARS_MEMORY_ROUTING_WEIGHTS = tuple(
+        float(weight.strip())
+        for weight in os.environ.get("HARS_MEMORY_ROUTING_WEIGHTS", "0.2,0.4,0.4").split(",")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_ROUTING_WEIGHTS must be three comma-separated numbers") from exc
+if (
+    len(HARS_MEMORY_ROUTING_WEIGHTS) != 3
+    or any(not math.isfinite(weight) or weight < 0 for weight in HARS_MEMORY_ROUTING_WEIGHTS)
+    or sum(HARS_MEMORY_ROUTING_WEIGHTS) <= 0
+):
+    raise ValueError("HARS_MEMORY_ROUTING_WEIGHTS must contain three finite non-negative values with a positive sum")
+try:
+    HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S = float(
+        os.environ.get("HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S", "6")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S must be a number") from exc
+if not math.isfinite(HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S) or HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S <= 0:
+    raise ValueError("HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S must be > 0")
+try:
+    HARS_MEMORY_ROUTING_MIN_COVERAGE = float(
+        os.environ.get("HARS_MEMORY_ROUTING_MIN_COVERAGE", "0.95")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_ROUTING_MIN_COVERAGE must be a number") from exc
+if (
+    not math.isfinite(HARS_MEMORY_ROUTING_MIN_COVERAGE)
+    or not 0 <= HARS_MEMORY_ROUTING_MIN_COVERAGE <= 1
+):
+    raise ValueError("HARS_MEMORY_ROUTING_MIN_COVERAGE must be between 0 and 1")
+
 # Each hybrid channel (dense, sparse) retrieves top_k * this many candidates
 # BEFORE fusion — the fused/ranked pool must be wider than the tool's declared
 # top_k so fusion (and a downstream reranker, not implemented here) has real
@@ -940,6 +999,105 @@ async def _get_flat_dense_index(rag: object) -> tuple[Any, str]:
         return _flat_dense_cache, cache_status
 
 
+_routing_query_embedders: dict[str, Any] = {}
+
+
+def _get_routing_query_embedder(model: str) -> Any:
+    """Return one lazily initialized local Qwen query embedder per model."""
+    if model not in _routing_query_embedders:
+        from hars_memory.retrieval.dense_sidecar import SidecarQueryEmbedder
+
+        _routing_query_embedders[model] = SidecarQueryEmbedder(model=model)
+    return _routing_query_embedders[model]
+
+
+def _routing_sidecar_dir(index_dir: Path) -> Path:
+    """Resolve the configured sidecar or the newest complete child sidecar."""
+    if HARS_MEMORY_ROUTING_SIDECAR_DIR:
+        configured = Path(HARS_MEMORY_ROUTING_SIDECAR_DIR).expanduser()
+        return configured if configured.is_absolute() else (index_dir / configured).resolve()
+    root = index_dir / "dense_sidecar"
+    candidates = [
+        path for path in root.iterdir()
+        if path.is_dir() and all((path / name).is_file() for name in ("ids.json", "vecs.npy", "meta.json"))
+    ] if root.is_dir() else []
+    if not candidates:
+        raise FileNotFoundError("no_complete_sidecar")
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def _routing_minmax(scores: dict[str, float]) -> dict[str, float]:
+    if not scores:
+        return {}
+    low, high = min(scores.values()), max(scores.values())
+    if high <= low:
+        return {chunk_id: 0.5 for chunk_id in scores}
+    return {chunk_id: (score - low) / (high - low) for chunk_id, score in scores.items()}
+
+
+def _fuse_routing_channels(
+    channels: list[dict[str, float]],
+    dense_hits: dict[str, Any],
+    sparse_hits: dict[str, Any],
+    bm25_index: Any,
+    pool_size: int,
+) -> list[Any]:
+    """Build normal downstream-compatible chunks from Gemma/Qwen/BM25 scores."""
+    from hars_memory.retrieval.fusion import (
+        FusedChunk,
+        HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV,
+        HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV,
+        _sub_flag_enabled,
+        _supersession_scoring_enabled,
+        apply_supersession_scoring,
+    )
+    from hars_memory.retrieval.multi_fusion import wsum_n, wsum_scores
+
+    scores = wsum_scores(channels, HARS_MEMORY_ROUTING_WEIGHTS, pool_size)
+    ordered_ids = wsum_n(channels, HARS_MEMORY_ROUTING_WEIGHTS, pool_size)
+    dense_norm = _routing_minmax(channels[0])
+    sparse_norm = _routing_minmax(channels[2])
+    chunk_meta = getattr(bm25_index, "chunk_meta", {})
+    fused: list[Any] = []
+    for chunk_id in ordered_ids:
+        dense_hit = dense_hits.get(chunk_id)
+        sparse_hit = sparse_hits.get(chunk_id)
+        metadata = chunk_meta.get(chunk_id, {}) if isinstance(chunk_meta, dict) else {}
+        content = (
+            (dense_hit.content if dense_hit else "")
+            or (sparse_hit.content if sparse_hit else "")
+            or str(metadata.get("content", ""))
+        )
+        file_path = (
+            (dense_hit.file_path if dense_hit else "")
+            or (sparse_hit.file_path if sparse_hit else "")
+            or str(metadata.get("file_path", metadata.get("source_path", "")))
+        )
+        fused.append(
+            FusedChunk(
+                chunk_id=chunk_id,
+                fused_score=scores[chunk_id],
+                dense_score=dense_hit.score if dense_hit else None,
+                sparse_score=sparse_hit.score if sparse_hit else None,
+                dense_norm=dense_norm.get(chunk_id, 0.0),
+                sparse_norm=sparse_norm.get(chunk_id, 0.0),
+                content=content,
+                file_path=file_path,
+            )
+        )
+    if _supersession_scoring_enabled():
+        fused = apply_supersession_scoring(
+            fused,
+            enable_marker_penalty=_sub_flag_enabled(
+                HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV, default=True
+            ),
+            enable_recency_discount=_sub_flag_enabled(
+                HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV, default=False
+            ),
+        )
+    return fused
+
+
 def _select_diverse_fused_chunks(
     fused: list[Any], limit: int, *, max_per_source: int = MAX_CHUNKS_PER_SOURCE
 ) -> list[Any]:
@@ -1025,6 +1183,30 @@ async def _compute_hybrid_block(
     response, and its own failure (e.g. bm25s not installed, index not built
     yet) must never break the primary memory_recall contract that predates it.
     """
+    routing_started = time.monotonic()
+    routing_status: dict[str, Any] | None = None
+    requested_profile = "base"
+    retrieval_query = question
+    qwen_scores: dict[str, float] = {}
+    if HARS_MEMORY_ROUTING == "lang":
+        from hars_memory.retrieval.lang_route import detect_lang
+
+        route_lang = detect_lang(question)
+        requested_profile = (
+            HARS_MEMORY_ROUTING_PROFILE_RU if route_lang == "ru" else HARS_MEMORY_ROUTING_PROFILE_EN
+        )
+        routing_status = {
+            "mode": "lang",
+            "lang": route_lang,
+            "profile_requested": requested_profile,
+            "profile_applied": "base",
+            "channels": ["gemma", "bm25"],
+            "twin": None,
+            "sidecar": None,
+            "latency_ms": {"total": None, "twin": None, "qwen_embed": None},
+            "fallback_reason": None,
+        }
+
     rerank_func = getattr(rag, "rerank_model_func", None)
     rerank_backend = HARS_MEMORY_RERANK_BACKEND
     if rerank_backend is None and rerank_func:
@@ -1038,11 +1220,19 @@ async def _compute_hybrid_block(
     }
 
     if not HARS_MEMORY_HYBRID_ENABLED:
-        return {
+        disabled = {
             "enabled": False,
             "reason": "HARS_MEMORY_HYBRID_ENABLED=0",
             "rerank": rerank_status,
         }
+        if routing_status is not None:
+            routing_status["channels"] = []
+            routing_status["fallback_reason"] = "hybrid_disabled"
+            routing_status["latency_ms"]["total"] = round(
+                (time.monotonic() - routing_started) * 1000.0, 2
+            )
+            disabled["routing"] = routing_status
+        return disabled
 
     from hars_memory.retrieval.bm25_index import BM25IndexUnavailableError
 
@@ -1073,12 +1263,95 @@ async def _compute_hybrid_block(
         )
 
         bm25_index, bm25_cache_status = await _get_bm25_index(project_id)
+
+        # Opt-in Qwen sidecar and query-twin preparation. Every failure in this
+        # auxiliary path falls back to the unchanged two-channel query below.
+        sidecar = None
+        twin_text: str | None = None
+        if routing_status is not None and requested_profile != "base":
+            try:
+                from hars_memory.retrieval.dense_sidecar import coverage, load_sidecar
+
+                effective_index_dir = Path(chunk_wdir or HARS_MEMORY_INDEX_DIR).expanduser()
+                sidecar_dir = _routing_sidecar_dir(effective_index_dir)
+                sidecar = load_sidecar(sidecar_dir)
+                sidecar_coverage = coverage(
+                    sidecar,
+                    getattr(bm25_index, "chunk_ids", list(getattr(bm25_index, "chunk_meta", {}))),
+                )
+                routing_status["sidecar"] = {
+                    "model": sidecar.meta.get("model"),
+                    "n": len(sidecar.ids),
+                    "coverage": round(sidecar_coverage, 6),
+                }
+                if sidecar.meta.get("model") != HARS_MEMORY_ROUTING_SIDECAR_MODEL:
+                    raise ValueError("sidecar_model_mismatch")
+                if sidecar_coverage < HARS_MEMORY_ROUTING_MIN_COVERAGE:
+                    raise ValueError("stale_sidecar_coverage")
+                if sidecar.vecs.ndim != 2 or sidecar.vecs.shape[1] != int(sidecar.meta.get("dim", -1)):
+                    raise ValueError("sidecar_dimension_mismatch")
+
+                if requested_profile == "3way_twin":
+                    from hars_memory.retrieval.query_twin import make_twin
+
+                    twin_started = time.monotonic()
+                    twin_text, twin_reason = await make_twin(
+                        getattr(rag, "llm_model_func", None),
+                        question,
+                        HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S,
+                    )
+                    routing_status["latency_ms"]["twin"] = round(
+                        (time.monotonic() - twin_started) * 1000.0, 2
+                    )
+                    routing_status["twin"] = {
+                        "used": twin_text is not None,
+                        "text": twin_text,
+                        "latency_ms": routing_status["latency_ms"]["twin"],
+                        "fallback_reason": twin_reason,
+                    }
+                    if twin_text:
+                        retrieval_query = f"{question} {twin_text}"
+
+                qwen_started = time.monotonic()
+                query_embedder = _get_routing_query_embedder(HARS_MEMORY_ROUTING_SIDECAR_MODEL)
+                qvec = await asyncio.to_thread(query_embedder.embed, retrieval_query)
+                routing_status["latency_ms"]["qwen_embed"] = round(
+                    (time.monotonic() - qwen_started) * 1000.0, 2
+                )
+                query_dimension = int(qvec.size) if hasattr(qvec, "size") else len(qvec)
+                if query_dimension != sidecar.vecs.shape[1]:
+                    raise ValueError("query_sidecar_dimension_mismatch")
+                qwen_hits = sidecar.search(qvec, pool_size)
+                qwen_scores = {str(chunk_id): float(score) for chunk_id, score in qwen_hits}
+                routing_status["profile_applied"] = requested_profile
+                routing_status["channels"] = ["gemma", "qwen", "bm25"]
+                if routing_status["twin"] is not None:
+                    routing_status["twin"]["used"] = twin_text is not None
+            except Exception as exc:
+                reason = str(exc)
+                if reason in {
+                    "stale_sidecar_coverage", "sidecar_model_mismatch",
+                    "sidecar_dimension_mismatch", "query_sidecar_dimension_mismatch",
+                }:
+                    routing_status["fallback_reason"] = reason
+                elif isinstance(exc, FileNotFoundError):
+                    routing_status["fallback_reason"] = "sidecar_unavailable"
+                else:
+                    routing_status["fallback_reason"] = f"qwen_path_error:{type(exc).__name__}"
+                routing_status["profile_applied"] = "base"
+                routing_status["channels"] = ["gemma", "bm25"]
+                retrieval_query = question
+                qwen_scores = {}
+                if routing_status["twin"] is not None:
+                    routing_status["twin"]["used"] = False
+                logger.info("Multilingual retrieval fell back to base: %s", routing_status["fallback_reason"])
+
         sparse_start = time.monotonic()
-        sparse_search_hits = await bm25_index.asearch(question, pool_size)
+        sparse_search_hits = await bm25_index.asearch(retrieval_query, pool_size)
         sparse_elapsed_ms = (time.monotonic() - sparse_start) * 1000
 
         dense_start = time.monotonic()
-        dense_raw = await rag.chunks_vdb.query(question, top_k=pool_size)  # type: ignore[attr-defined]
+        dense_raw = await rag.chunks_vdb.query(retrieval_query, top_k=pool_size)  # type: ignore[attr-defined]
         dense_elapsed_ms = (time.monotonic() - dense_start) * 1000
 
         sparse_hits = {
@@ -1100,7 +1373,19 @@ async def _compute_hybrid_block(
         # already be in the first top_k dense/sparse slots (which, by
         # definition of "off-index", it never is). Sliced to top_k right
         # before being returned, whichever path runs.
-        fused_pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
+        if routing_status is not None and routing_status["profile_applied"] in {"3way", "3way_twin"}:
+            routed_channels = [
+                {chunk_id: hit.score for chunk_id, hit in dense_hits.items()},
+                qwen_scores,
+                {chunk_id: hit.score for chunk_id, hit in sparse_hits.items()},
+            ]
+            # Use the same pool cutoff for each channel and preserve score
+            # order from each retriever before the deterministic fusion sort.
+            fused_pool = _fuse_routing_channels(
+                routed_channels, dense_hits, sparse_hits, bm25_index, pool_size
+            )
+        else:
+            fused_pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
 
         # Ripgrep channel (retrieval/ripgrep_channel.py) — additive gate over
         # the dense+sparse fusion above, NOT a third convex weight; see
@@ -1317,7 +1602,11 @@ async def _compute_hybrid_block(
         # Legacy local rerank errors are fail-soft; HTTP client failures are
         # represented by rerank_status and never change the original ordering.
 
-        return {
+        if routing_status is not None:
+            routing_status["latency_ms"]["total"] = round(
+                (time.monotonic() - routing_started) * 1000.0, 2
+            )
+        result = {
             "enabled": True,
             "alpha": HARS_MEMORY_HYBRID_ALPHA,
             "alpha_status": "MEASURED 2026-07-29 empirical optimum (ndcg@10=0.7216 on the "
@@ -1374,16 +1663,32 @@ async def _compute_hybrid_block(
                 for chunk in fused
             ],
         }
+        if routing_status is not None:
+            result["routing"] = routing_status
+        return result
     except BM25IndexUnavailableError as exc:
-        return {"enabled": False, "reason": str(exc), "rerank": rerank_status}
+        result = {"enabled": False, "reason": str(exc), "rerank": rerank_status}
+        if routing_status is not None:
+            routing_status["fallback_reason"] = "bm25_unavailable"
+            routing_status["latency_ms"]["total"] = round(
+                (time.monotonic() - routing_started) * 1000.0, 2
+            )
+            result["routing"] = routing_status
+        return result
     except Exception as exc:
         logger.warning("Hybrid retrieval failed (non-fatal, additive field only): %s", exc)
-        return {
+        result = {
             "enabled": False,
             "error_type": type(exc).__name__,
             "error": str(exc),
             "rerank": rerank_status,
         }
+        if routing_status is not None:
+            routing_status["latency_ms"]["total"] = round(
+                (time.monotonic() - routing_started) * 1000.0, 2
+            )
+            result["routing"] = routing_status
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1519,7 +1824,7 @@ def _lean_recall_response(
     if isinstance(hybrid, dict):
         lean_hybrid: dict[str, Any] = {
             key: hybrid[key]
-            for key in ("enabled", "reason", "error_type", "error", "confidence", "rerank")
+            for key in ("enabled", "reason", "error_type", "error", "confidence", "rerank", "routing")
             if key in hybrid
         }
         fused_chunks: list[dict[str, Any]] = []
@@ -1581,7 +1886,7 @@ def _lean_recall_response(
         lean["hybrid"] = lean_hybrid
 
         kept_hybrid_fields = {
-            "enabled", "reason", "error_type", "error", "confidence", "rerank", "fused_chunks",
+            "enabled", "reason", "error_type", "error", "confidence", "rerank", "routing", "fused_chunks",
             "ripgrep_hits",
         }
         omitted.extend(f"hybrid.{key}" for key in hybrid if key not in kept_hybrid_fields)

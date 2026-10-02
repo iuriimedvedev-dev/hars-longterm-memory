@@ -171,6 +171,35 @@ them the same way). `status` shows per part `done=/total`, last-progress age and
   `docs/search-research-2026-10-02.md` H1: +0.09 file_hit@1, +0.08 fact@3,
   +0.07 MRR on 120 cases, +4s/query.
 
+### Multilingual retrieval routing (opt-in)
+
+Caveat: the query twin is produced with `rag.llm_model_func`, i.e. the LightRAG extractor LLM (`HARS_MEMORY_LLM_*` extractor model), not the query model; point the extractor model at a fast cheap model or accept its latency (measured 2.2 s median / $0.00006 per Russian query with gpt-6-luna). Evidence: docs/multilingual-retrieval-2026-10-02.md.
+
+Unset or `HARS_MEMORY_ROUTING=off` leaves recall output unchanged and omits
+`routing`. `lang` detects Russian by Cyrillic-letter share / word count and
+selects the language profile.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `HARS_MEMORY_ROUTING` | `off` | `off` or `lang` |
+| `HARS_MEMORY_ROUTING_PROFILE_EN` | `3way` | `base` or `3way` |
+| `HARS_MEMORY_ROUTING_PROFILE_RU` | `3way_twin` | `base`, `3way`, or `3way_twin` |
+| `HARS_MEMORY_ROUTING_WEIGHTS` | `0.2,0.4,0.4` | Gemma dense, Qwen sidecar, BM25 weights |
+| `HARS_MEMORY_ROUTING_SIDECAR_DIR` | newest complete sidecar | Optional explicit sidecar directory |
+| `HARS_MEMORY_ROUTING_SIDECAR_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Local query embedding model |
+| `HARS_MEMORY_ROUTING_TWIN_TIMEOUT_S` | `6` | Query-twin timeout in seconds |
+| `HARS_MEMORY_ROUTING_MIN_COVERAGE` | `0.95` | Minimum current-chunk sidecar coverage |
+
+Three-way fusion combines existing Gemma dense, local Qwen dense sidecar, and
+BM25. The twin profile asks the configured query LLM for an English twin and
+appends it to all three channel queries. Build a sidecar with
+`uv run memory build-dense-sidecar --index-dir DIR`. Rebuild/re-run after
+ingesting new chunks: stale coverage falls back to base. Missing/unloadable
+sidecar, model/dimension errors, and Qwen failures also fall back to base;
+twin timeout/error uses the original question. See
+`docs/multilingual-retrieval-2026-10-02.md` for experiment evidence and
+trade-offs.
+
 ## Build / test locally
 
 ```bash

@@ -223,3 +223,28 @@ def test_consolidate_passes_explicit_argv_to_indexer(monkeypatch) -> None:
     captured.clear()
     assert cli._cmd_consolidate(argparse.Namespace(paths=["/tmp/staging"], dry_run=False)) == 0
     assert captured["argv"] == ["--paths", "/tmp/staging"]
+
+
+def test_build_dense_sidecar_cli_parser_and_json_handler(tmp_path: Path, monkeypatch, capsys) -> None:
+    from hars_memory.retrieval import dense_sidecar
+
+    monkeypatch.setattr(
+        dense_sidecar,
+        "build_sidecar",
+        lambda *args, **kwargs: {
+            "n": 3,
+            "seconds": 1.0,
+            "chunks_per_second": 3.0,
+            "out_dir": str(tmp_path / "sidecar"),
+        },
+    )
+    args = cli._build_parser().parse_args([
+        "build-dense-sidecar", "--index-dir", str(tmp_path), "--json"
+    ])
+
+    assert args.model == "Qwen/Qwen3-Embedding-0.6B"
+    assert args.max_seq_length == 512
+    assert args.batch_size == 16
+    assert args.device == "auto"
+    assert args.func(args) == 0
+    assert '"n": 3' in capsys.readouterr().out
