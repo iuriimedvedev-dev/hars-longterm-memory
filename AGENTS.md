@@ -77,6 +77,8 @@ Dockerfile.service      — production HTTP index-service image
 tests/                  — 583 passing tests plus 6 opt-in/environment skips, pytest
 ```
 
+`memory_recall` defaults to its existing full response. Set `HARS_MEMORY_RECALL_VIEW=lean` or pass `view="lean"` for top_k fused chunks, compact ripgrep hits, and metadata without the LightRAG context blob; `debug=true` always returns full detail.
+
 ## Chunking mode (`HARS_MEMORY_CHUNKER`)
 
 `token` (default) uses LightRAG's own token splitter. `markdown` plugs

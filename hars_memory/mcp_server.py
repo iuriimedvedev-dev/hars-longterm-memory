@@ -407,6 +407,18 @@ if _context_priority_default_raw not in (CONTEXT_PRIORITY_LIGHTRAG, CONTEXT_PRIO
     )
 DEFAULT_CONTEXT_PRIORITY = _context_priority_default_raw
 
+# memory_recall response views. Full remains the compatibility default; an
+# operator may choose a server-wide default and callers may override it.
+RECALL_VIEW_FULL = "full"
+RECALL_VIEW_LEAN = "lean"
+_recall_view_default_raw = os.environ.get("HARS_MEMORY_RECALL_VIEW", RECALL_VIEW_FULL)
+if _recall_view_default_raw not in (RECALL_VIEW_FULL, RECALL_VIEW_LEAN):
+    raise ValueError(
+        f"HARS_MEMORY_RECALL_VIEW={_recall_view_default_raw!r} must be one of "
+        f"{RECALL_VIEW_FULL!r} or {RECALL_VIEW_LEAN!r}"
+    )
+DEFAULT_RECALL_VIEW = _recall_view_default_raw
+
 # Each hybrid channel (dense, sparse) retrieves top_k * this many candidates
 # BEFORE fusion — the fused/ranked pool must be wider than the tool's declared
 # top_k so fusion (and a downstream reranker, not implemented here) has real
@@ -1401,6 +1413,107 @@ def _compact_hybrid_block(hybrid: dict[str, Any], context: object) -> dict[str, 
     return compacted
 
 
+def _lean_recall_response(
+    response: dict[str, Any], *, top_k: int, include_answer: bool
+) -> dict[str, Any]:
+    """Return the small, metadata-preserving `memory_recall` response view."""
+    kept_fields = {
+        "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "top_k",
+        "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
+        "staleness_warning",
+    }
+    if not include_answer:
+        kept_fields.discard("answer")
+    lean: dict[str, Any] = {key: value for key, value in response.items() if key in kept_fields}
+    omitted = [key for key in response if key not in kept_fields and key != "hybrid"]
+
+    hybrid = response.get("hybrid")
+    if isinstance(hybrid, dict):
+        lean_hybrid: dict[str, Any] = {
+            key: hybrid[key]
+            for key in ("enabled", "reason", "error_type", "error", "confidence")
+            if key in hybrid
+        }
+        fused_chunks: list[dict[str, Any]] = []
+        ripgrep_hits: list[dict[str, Any]] = []
+        chunk_keys: set[str] = set()
+
+        def append_ripgrep_hit(path: object, line: object, snippet: object) -> None:
+            text = str(snippet or "")
+            ripgrep_hits.append({
+                "path": path,
+                "line": line,
+                "snippet": text[:HYBRID_SNIPPET_MAX_CHARS],
+            })
+
+        for hit in hybrid.get("ripgrep_hits") or []:
+            if isinstance(hit, dict):
+                append_ripgrep_hit(
+                    hit.get("path") or hit.get("file_path"),
+                    hit.get("line") or hit.get("start_line"),
+                    hit.get("snippet") or hit.get("content"),
+                )
+
+        for chunk in hybrid.get("fused_chunks") or []:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_keys.update(chunk)
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if chunk_id.startswith("ripgrep:"):
+                path = chunk.get("source_path") or chunk.get("file_path") or chunk.get("path")
+                content = str(chunk.get("content") or chunk.get("text") or chunk.get("snippet") or "")
+                segments = re.split(r"\s+…\s+", content)
+                parsed = False
+                for segment in segments:
+                    match = re.match(r"^L(?P<line>\d+):\s*(?P<snippet>.*)$", segment, re.DOTALL)
+                    if match:
+                        append_ripgrep_hit(path, int(match.group("line")), match.group("snippet"))
+                        parsed = True
+                if not parsed:
+                    append_ripgrep_hit(path, chunk.get("line") or chunk.get("start_line"), content)
+                continue
+
+            if len(fused_chunks) >= top_k:
+                continue
+            text = chunk.get("content", chunk.get("text", ""))
+            fused_chunks.append({
+                "chunk_id": chunk.get("chunk_id"),
+                "text": text if isinstance(text, str) else str(text),
+                "score": chunk.get("fused_score", chunk.get("score")),
+                "source_path": chunk.get("source_path") or chunk.get("file_path"),
+                "heading_path": chunk.get("heading_path"),
+                "start_line": chunk.get("start_line"),
+                "end_line": chunk.get("end_line"),
+                "section": chunk.get("section"),
+            })
+
+        lean_hybrid["fused_chunks"] = fused_chunks
+        if ripgrep_hits:
+            lean_hybrid["ripgrep_hits"] = ripgrep_hits
+        lean["hybrid"] = lean_hybrid
+
+        kept_hybrid_fields = {
+            "enabled", "reason", "error_type", "error", "confidence", "fused_chunks", "ripgrep_hits",
+        }
+        omitted.extend(f"hybrid.{key}" for key in hybrid if key not in kept_hybrid_fields)
+        represented_chunk_fields = {
+            "chunk_id", "content", "text", "fused_score", "score", "source_path", "file_path",
+            "path", "heading_path", "start_line", "end_line", "section", "line", "snippet",
+            "dense_score", "sparse_score", "ripgrep_score",
+        }
+        omitted.extend(
+            f"hybrid.fused_chunks[].{key}"
+            for key in chunk_keys
+            if key not in represented_chunk_fields
+        )
+        if "snippet" in chunk_keys:
+            omitted.append("hybrid.fused_chunks[].snippet")
+
+    lean["view"] = RECALL_VIEW_LEAN
+    lean["omitted"] = sorted(set(omitted))
+    return lean
+
+
 _SECTION_BREADCRUMB_RE = re.compile(r"^#{1,6}\s")
 
 def _extract_breadcrumb_from_content(content: str) -> str:
@@ -2042,6 +2155,8 @@ async def list_tools() -> list[Tool]:
                 "returns empty on a no-answer question (measured no_answer_hit_rate stays 0.9-1.0 across "
                 "every retrieval channel here), so a low_confidence=true marker is the only signal that "
                 "distinguishes a real answer from confident-sounding noise."
+                " Pass `view='lean'` for the smaller metadata/chunk response; `view='full'` "
+                "returns all sections, and HARS_MEMORY_RECALL_VIEW sets the default."
             ),
             {
                 "question": {"type": "string", "description": "Natural language question."},
@@ -2136,6 +2251,18 @@ async def list_tools() -> list[Tool]:
                                    "Chunk ids and location fields (heading_path, start_line, "
                                    "end_line, source_path) are kept. Default false: response "
                                    "unchanged.",
+                },
+                "view": {
+                    "type": "string",
+                    "enum": [RECALL_VIEW_FULL, RECALL_VIEW_LEAN],
+                    "default": DEFAULT_RECALL_VIEW,
+                    "description": (
+                        "Response detail. `full` preserves the existing response; `lean` keeps the "
+                        "answer/metadata and compact hybrid chunks while omitting the context blob "
+                        "and duplicate/debug-like fields. Override the server default with "
+                        "HARS_MEMORY_RECALL_VIEW. `debug=true` always returns full detail. "
+                        "Re-request with `view='full'` for omitted sections."
+                    ),
                 },
                 "debug": {
                     "type": "boolean",
@@ -2469,6 +2596,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             context_only = bool(args.get("context_only", True))
             debug = bool(args.get("debug", False))
             compact = bool(args.get("compact", False))
+            view = str(args.get("view", DEFAULT_RECALL_VIEW))
+            if view not in (RECALL_VIEW_FULL, RECALL_VIEW_LEAN):
+                return json_text({
+                    "ok": False,
+                    "error": f"view must be '{RECALL_VIEW_FULL}' or '{RECALL_VIEW_LEAN}'",
+                })
             context_priority = str(args.get("context_priority", DEFAULT_CONTEXT_PRIORITY))
             ll_keywords = [str(k) for k in (args.get("ll_keywords") or [])]
             hl_keywords = [str(k) for k in (args.get("hl_keywords") or [])]
@@ -2633,6 +2766,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                                 },
                             },
                         }
+                    if view == RECALL_VIEW_LEAN and not debug:
+                        return json_text(_lean_recall_response(
+                            response, top_k=top_k, include_answer=not context_only
+                        ))
                     if compact and not debug:
                         response["hybrid"] = _compact_hybrid_block(hybrid_block, context_for_response)
                     return json_text(response)
@@ -2711,6 +2848,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         },
                         "raw_lightrag_result": _sanitize_for_json(result),
                     }
+                if view == RECALL_VIEW_LEAN and not debug:
+                    return json_text(_lean_recall_response(
+                        response, top_k=top_k, include_answer=not context_only
+                    ))
                 return json_text(response)
             except Exception as exc:
                 logger.warning(
