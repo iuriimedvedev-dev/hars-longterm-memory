@@ -155,6 +155,21 @@ them the same way). `status` shows per part `done=/total`, last-progress age and
   no-op when unset. A consumer that renamed its own env vars in the past can
   list forbidden prefixes (comma-separated) here to fail closed at startup
   instead of silently reading stale values.
+- **Recall reranking** (`HARS_MEMORY_RERANK_BACKEND`): unset preserves the
+  current behavior (use LightRAG's local `rerank_model_func` if configured;
+  otherwise no reranking). Set to `off` to skip all reranking, `local` to use
+  that callback explicitly, or `http` to opt into the HTTP reranker. HTTP
+  and `off` also disable LightRAG's native rerank pass for the recall call;
+  unset/local preserve its existing default. HTTP options are
+  `HARS_MEMORY_RERANK_HTTP_URL` (default
+  `http://127.0.0.1:8081/v1/rerank`; a host or `/v1` base URL is accepted),
+  `HARS_MEMORY_RERANK_HTTP_MODEL` (default `x`), `HARS_MEMORY_RERANK_POOL`
+  (default 20 candidates; the remaining fused chunks retain their order),
+  and `HARS_MEMORY_RERANK_TIMEOUT_S` (default 8 seconds). Every hybrid block
+  includes `rerank: {backend, applied, latency_ms, fallback_reason, pool}`;
+  failed HTTP reranks keep the original order. Measured placeholder from
+  `docs/search-research-2026-10-02.md` H1: +0.09 file_hit@1, +0.08 fact@3,
+  +0.07 MRR on 120 cases, +4s/query.
 
 ## Build / test locally
 

@@ -40,6 +40,13 @@ def _hybrid_fixture() -> dict[str, Any]:
             "threshold": 0.28,
             "note": "Confidence explanation.",
         },
+        "rerank": {
+            "backend": None,
+            "applied": False,
+            "latency_ms": None,
+            "fallback_reason": None,
+            "pool": 0,
+        },
         "fused_chunks": fused_chunks,
         "identifier_matches": [{"chunk_id": "chunk-0", "snippet": "duplicate match"}],
         "ripgrep": {"enabled": True, "available": True, "hits_count": 1},
@@ -94,6 +101,8 @@ def test_lean_view_keeps_required_metadata_and_omits_context(monkeypatch: Any) -
     assert data["question"] == "What is in the guide?"
     assert "context" not in data
     assert data["hybrid"]["confidence"]["low_confidence"] is False
+    assert data["hybrid"]["rerank"]["backend"] is None
+    assert data["hybrid"]["rerank"]["applied"] is False
     assert data["hybrid"]["fused_chunks"] == [
         {
             "chunk_id": f"chunk-{index}",
