@@ -30,6 +30,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -418,6 +419,33 @@ if _recall_view_default_raw not in (RECALL_VIEW_FULL, RECALL_VIEW_LEAN):
         f"{RECALL_VIEW_FULL!r} or {RECALL_VIEW_LEAN!r}"
     )
 DEFAULT_RECALL_VIEW = _recall_view_default_raw
+
+# Reranking backend. An unset backend preserves the historical behavior:
+# use LightRAG's local rerank_model_func when one is configured, otherwise skip.
+RERANK_BACKENDS = ("off", "local", "http")
+_rerank_backend_raw = os.environ.get("HARS_MEMORY_RERANK_BACKEND")
+if _rerank_backend_raw is not None and _rerank_backend_raw not in RERANK_BACKENDS:
+    raise ValueError(
+        f"HARS_MEMORY_RERANK_BACKEND={_rerank_backend_raw!r} must be one of "
+        f"{', '.join(repr(backend) for backend in RERANK_BACKENDS)}"
+    )
+HARS_MEMORY_RERANK_BACKEND: str | None = _rerank_backend_raw
+HARS_MEMORY_RERANK_HTTP_URL = os.environ.get(
+    "HARS_MEMORY_RERANK_HTTP_URL", "http://127.0.0.1:8081/v1/rerank"
+)
+HARS_MEMORY_RERANK_HTTP_MODEL = os.environ.get("HARS_MEMORY_RERANK_HTTP_MODEL", "x")
+try:
+    HARS_MEMORY_RERANK_POOL = int(os.environ.get("HARS_MEMORY_RERANK_POOL", "20"))
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_RERANK_POOL must be an integer") from exc
+if HARS_MEMORY_RERANK_POOL < 0:
+    raise ValueError("HARS_MEMORY_RERANK_POOL must be >= 0")
+try:
+    HARS_MEMORY_RERANK_TIMEOUT_S = float(os.environ.get("HARS_MEMORY_RERANK_TIMEOUT_S", "8"))
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_RERANK_TIMEOUT_S must be a number") from exc
+if not math.isfinite(HARS_MEMORY_RERANK_TIMEOUT_S) or HARS_MEMORY_RERANK_TIMEOUT_S <= 0:
+    raise ValueError("HARS_MEMORY_RERANK_TIMEOUT_S must be > 0")
 
 # Each hybrid channel (dense, sparse) retrieves top_k * this many candidates
 # BEFORE fusion — the fused/ranked pool must be wider than the tool's declared
@@ -997,8 +1025,24 @@ async def _compute_hybrid_block(
     response, and its own failure (e.g. bm25s not installed, index not built
     yet) must never break the primary memory_recall contract that predates it.
     """
+    rerank_func = getattr(rag, "rerank_model_func", None)
+    rerank_backend = HARS_MEMORY_RERANK_BACKEND
+    if rerank_backend is None and rerank_func:
+        rerank_backend = "local"
+    rerank_status: dict[str, Any] = {
+        "backend": rerank_backend,
+        "applied": False,
+        "latency_ms": None,
+        "fallback_reason": None,
+        "pool": 0,
+    }
+
     if not HARS_MEMORY_HYBRID_ENABLED:
-        return {"enabled": False, "reason": "HARS_MEMORY_HYBRID_ENABLED=0"}
+        return {
+            "enabled": False,
+            "reason": "HARS_MEMORY_HYBRID_ENABLED=0",
+            "rerank": rerank_status,
+        }
 
     from hars_memory.retrieval.bm25_index import BM25IndexUnavailableError
 
@@ -1207,33 +1251,71 @@ async def _compute_hybrid_block(
 
         # Apply diversity after both additive gates so the public result is the
         # actual bounded, source-diverse fused selection.
+        if rerank_backend == "http":
+            # HTTP reranking needs the full pre-truncation dense/sparse pool;
+            # retain only exclusive additive-channel entries after that pool.
+            fused_pool_ids = {chunk.chunk_id for chunk in fused_pool}
+            additive_tail = [chunk for chunk in fused if chunk.chunk_id not in fused_pool_ids]
+            fused = list(fused_pool) + additive_tail
         fused = _select_diverse_fused_chunks(fused, len(fused))
 
-        # Cross-encoder Reranking if configured (e.g. HARS_MEMORY_RERANK_MODEL)
-        rerank_func = getattr(rag, "rerank_model_func", None)
+        # Cross-encoder reranking is opt-in for HTTP and remains compatible
+        # with the historical local LightRAG callback when backend is unset.
         rerank_elapsed_ms = None
-        if rerank_func and fused:
-            rerank_start = time.monotonic()
-            try:
-                pool_to_rerank = fused[:pool_size]
-                docs = [c.content for c in pool_to_rerank]
-                scored = await rerank_func(question, docs, top_n=top_k)
+        if rerank_backend == "http":
+            pool_to_rerank = fused[:HARS_MEMORY_RERANK_POOL]
+            rerank_status["pool"] = len(pool_to_rerank)
+            if not pool_to_rerank:
+                rerank_status["fallback_reason"] = "empty_pool"
+            else:
+                from hars_memory.retrieval.http_rerank import rerank_http
+
+                rerank_start = time.monotonic()
+                indices, fallback_reason = await rerank_http(
+                    question,
+                    [chunk.content for chunk in pool_to_rerank],
+                    url=HARS_MEMORY_RERANK_HTTP_URL,
+                    model=HARS_MEMORY_RERANK_HTTP_MODEL,
+                    timeout_s=HARS_MEMORY_RERANK_TIMEOUT_S,
+                )
                 rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
-                if scored:
-                    reranked_pool: list[Any] = []
-                    seen_cids: set[str] = set()
-                    for item in scored:
-                        idx = int(item["index"])
-                        if 0 <= idx < len(pool_to_rerank):
-                            candidate = pool_to_rerank[idx]
-                            reranked_pool.append(candidate)
-                            seen_cids.add(candidate.chunk_id)
-                    for candidate in fused:
-                        if candidate.chunk_id not in seen_cids:
-                            reranked_pool.append(candidate)
-                    fused = reranked_pool
-            except Exception as exc:
-                logger.warning("Reranking candidate pool failed: %s", exc)
+                rerank_status["latency_ms"] = round(rerank_elapsed_ms, 2)
+                rerank_status["fallback_reason"] = fallback_reason
+                if indices is not None:
+                    fused = [pool_to_rerank[index] for index in indices] + fused[len(pool_to_rerank):]
+                    rerank_status["applied"] = True
+        elif rerank_backend == "local" and rerank_func:
+            pool_to_rerank = fused[:pool_size]
+            rerank_status["pool"] = len(pool_to_rerank)
+            if pool_to_rerank:
+                rerank_start = time.monotonic()
+                try:
+                    docs = [c.content for c in pool_to_rerank]
+                    scored = await rerank_func(question, docs, top_n=top_k)
+                    rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
+                    rerank_status["latency_ms"] = round(rerank_elapsed_ms, 2)
+                    if scored:
+                        reranked_pool: list[Any] = []
+                        seen_cids: set[str] = set()
+                        for item in scored:
+                            idx = int(item["index"])
+                            if 0 <= idx < len(pool_to_rerank):
+                                candidate = pool_to_rerank[idx]
+                                reranked_pool.append(candidate)
+                                seen_cids.add(candidate.chunk_id)
+                        for candidate in fused:
+                            if candidate.chunk_id not in seen_cids:
+                                reranked_pool.append(candidate)
+                        fused = reranked_pool
+                        rerank_status["applied"] = True
+                except Exception as exc:
+                    rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
+                    rerank_status["latency_ms"] = round(rerank_elapsed_ms, 2)
+                    rerank_status["fallback_reason"] = "rerank_error"
+                    logger.warning("Reranking candidate pool failed: %s", exc)
+
+        # Legacy local rerank errors are fail-soft; HTTP client failures are
+        # represented by rerank_status and never change the original ordering.
 
         return {
             "enabled": True,
@@ -1255,6 +1337,7 @@ async def _compute_hybrid_block(
                 "flat_dense_channel": flat_report.get("latency_ms"),
                 "rerank_channel": round(rerank_elapsed_ms, 2) if rerank_elapsed_ms is not None else None,
             },
+            "rerank": rerank_status,
             "ripgrep": ripgrep_report,
             "flat_dense": flat_report,
             "confidence": {
@@ -1292,10 +1375,15 @@ async def _compute_hybrid_block(
             ],
         }
     except BM25IndexUnavailableError as exc:
-        return {"enabled": False, "reason": str(exc)}
+        return {"enabled": False, "reason": str(exc), "rerank": rerank_status}
     except Exception as exc:
         logger.warning("Hybrid retrieval failed (non-fatal, additive field only): %s", exc)
-        return {"enabled": False, "error_type": type(exc).__name__, "error": str(exc)}
+        return {
+            "enabled": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "rerank": rerank_status,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1431,7 +1519,7 @@ def _lean_recall_response(
     if isinstance(hybrid, dict):
         lean_hybrid: dict[str, Any] = {
             key: hybrid[key]
-            for key in ("enabled", "reason", "error_type", "error", "confidence")
+            for key in ("enabled", "reason", "error_type", "error", "confidence", "rerank")
             if key in hybrid
         }
         fused_chunks: list[dict[str, Any]] = []
@@ -1493,7 +1581,8 @@ def _lean_recall_response(
         lean["hybrid"] = lean_hybrid
 
         kept_hybrid_fields = {
-            "enabled", "reason", "error_type", "error", "confidence", "fused_chunks", "ripgrep_hits",
+            "enabled", "reason", "error_type", "error", "confidence", "rerank", "fused_chunks",
+            "ripgrep_hits",
         }
         omitted.extend(f"hybrid.{key}" for key in hybrid if key not in kept_hybrid_fields)
         represented_chunk_fields = {
@@ -2677,6 +2766,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 from hars_memory.server.lightrag_init import create_query_model_func
 
                 query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
+                query_param_options = dict(kw_args)
+                if HARS_MEMORY_RERANK_BACKEND in {"off", "http"}:
+                    query_param_options["enable_rerank"] = False
                 if context_only:
                     # No local answer LLM: return the retrieved graph context and let
                     # the calling agent synthesise the answer itself.
@@ -2691,7 +2783,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                                 only_need_context=True,
                                 max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
                                 max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
-                                **kw_args,
+                                **query_param_options,
                             ),
                         ),
                         timeout=query_timeout,
@@ -2792,7 +2884,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                                     include_references=True,
                                     max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
                                     max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
-                                    **kw_args,
+                                    **query_param_options,
                                 ),
                             ),
                             timeout=query_timeout,
