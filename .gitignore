@@ -19,3 +19,7 @@ hars-memory-artifacts/
 
 # local secrets (litellm key)
 config/live-llm-e2e.env
+
+# search-research caches (large, reproducible)
+experiments/search-2026-10/cache/
+experiments/search-2026-10/*.log
