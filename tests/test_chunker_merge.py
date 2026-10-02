@@ -36,7 +36,8 @@ class TestHeaderOnly:
         chunks = chunk_markdown_structured(DOC, "d", 400)
         assert chunks
         assert all(c.text.strip() != HEADER.strip() for c in chunks)
-        assert not any(c.text.startswith("[Document:") for c in chunks)
+        first = next(c for c in chunks if "[Document:" in c.text)
+        assert "intro." in first.text
 
     def test_header_inside_front_matter_preamble_is_kept(self) -> None:
         text = HEADER + "---\ntitle: x\n---\n\n# T\n\nbody\n"
@@ -69,10 +70,11 @@ class TestMerge:
             ("Title", "A", "A1"),
             ("Title", "A", "A2"),
         ]
-        assert merged.heading_path == ("Title",)  # the title intro joins the first group
+        assert merged.heading_path == ()  # the folded document header is the source start
+        assert merged.start_line == 1
         lines = [(s, e) for _, s, e in merged.member_locations]
         assert lines == sorted(lines)
-        assert merged.start_line == lines[0][0] and merged.end_line == lines[-1][1]
+        assert merged.start_line == 1 and merged.end_line == lines[-1][1]
         # each member's own heading survives in the text
         assert "### A1" in merged.text and "### A2" in merged.text
 

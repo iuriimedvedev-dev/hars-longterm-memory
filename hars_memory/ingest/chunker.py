@@ -780,6 +780,197 @@ def _hard_split(text: str, budget: int, measure: Measure) -> list[tuple[int, int
     return spans
 
 
+def _is_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    before = index - 1
+    while before >= 0 and text[before] == "\\":
+        backslashes += 1
+        before -= 1
+    return backslashes % 2 == 1
+
+
+def _table_cells(row: str) -> list[str]:
+    """Split a pipe-table row without treating escaped/code-span pipes as delimiters."""
+    pipes: list[int] = []
+    code_ticks = 0
+    index = 0
+    while index < len(row):
+        if row[index] == "`" and not _is_escaped(row, index):
+            end = index + 1
+            while end < len(row) and row[end] == "`":
+                end += 1
+            run = end - index
+            if not code_ticks:
+                code_ticks = run
+            elif code_ticks == run:
+                code_ticks = 0
+            index = end
+            continue
+        if row[index] == "|" and not code_ticks:
+            if not _is_escaped(row, index):
+                pipes.append(index)
+        index += 1
+
+    if not pipes:
+        return [row.strip()]
+    starts = [0] + [pipe + 1 for pipe in pipes]
+    ends = pipes + [len(row)]
+    cells = [row[start:end].strip() for start, end in zip(starts, ends, strict=True)]
+    if row.lstrip().startswith("|"):
+        cells.pop(0)
+    if row.rstrip().endswith("|"):
+        cells.pop()
+    return cells
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    delimiter = 0
+    index = 0
+    while index < len(text):
+        if text[index] != "`" or _is_escaped(text, index):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] == "`":
+            end += 1
+        run = end - index
+        if not delimiter:
+            start, delimiter = index, run
+        elif delimiter == run:
+            spans.append((start if start is not None else index, end))
+            start, delimiter = None, 0
+        index = end
+    return spans
+
+
+def _split_table_cell(
+    value: str,
+    cells: list[str],
+    column: int,
+    header: str,
+    avail: int,
+    measure: Measure,
+) -> list[str]:
+    """Cut one cell at semantic boundaries, keeping the key and table columns."""
+    if not value:
+        return [value]
+
+    code_spans = _code_spans(value)
+
+    def safe(cut: int) -> bool:
+        return not any(start < cut < end for start, end in code_spans)
+
+    def render(fragment: str) -> str:
+        row = [""] * len(cells)
+        row[0] = cells[0]
+        row[column] = fragment
+        return header + "| " + " | ".join(row) + " |"
+
+    def max_end(position: int) -> int:
+        lo, hi = position + 1, len(value)
+        if lo > hi or measure(render(value[position:])) <= avail:
+            return len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if measure(render(value[position:mid])) <= avail:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo if measure(render(value[position:lo])) <= avail else position
+
+    breaks: list[list[int]] = [[], [], []]
+    for match in re.finditer(r"(?i)<br\s*/?>", value):
+        if safe(match.end()):
+            breaks[0].append(match.end())
+    for match in _SENTENCE_END_RE.finditer(value):
+        if safe(match.end()):
+            breaks[1].append(match.end())
+    for match in re.finditer(r"\s+", value):
+        if safe(match.end()):
+            breaks[2].append(match.end())
+
+    pieces: list[str] = []
+    position = 0
+    while position < len(value):
+        if measure(render(value[position:])) <= avail:
+            pieces.append(value[position:])
+            break
+        end = max_end(position)
+        if end <= position:
+            raise ValueError("table header and row key leave no budget for a table cell")
+        cut = next(
+            (
+                max((candidate for candidate in candidates if position < candidate <= end), default=0)
+                for candidates in breaks
+                if any(position < candidate <= end for candidate in candidates)
+            ),
+            0,
+        )
+        if not cut:
+            cut = max((candidate for candidate in range(position + 1, end + 1) if safe(candidate)), default=end)
+        pieces.append(value[position:cut])
+        position = cut
+    return pieces
+
+
+def _split_table_row(
+    row: str, head: str, head_sep: str, avail: int, measure: Measure
+) -> list[str]:
+    """Split an oversized table row while repeating its key and header."""
+    cells = _table_cells(row)
+    if not cells:
+        return [row]
+    header = head + head_sep if head else ""
+
+    def render(values: list[str]) -> str:
+        return header + "| " + " | ".join(values) + " |"
+
+    empty_row = [""] * len(cells)
+    empty_row[0] = cells[0]
+    if header and measure(render(empty_row)) > avail // 2:
+        header = ""
+
+    def fits(values: list[str]) -> bool:
+        return measure(render(values)) <= avail
+
+    if not fits(empty_row):
+        raise ValueError("table row key exceeds the available chunk budget")
+
+    pieces: list[str] = []
+    current = empty_row.copy()
+
+    def flush() -> None:
+        nonlocal current
+        if any(current[1:]):
+            pieces.append(render(current))
+            current = empty_row.copy()
+
+    for column, value in enumerate(cells[1:], start=1):
+        if not value:
+            continue
+        candidate = current.copy()
+        candidate[column] = value
+        if fits(candidate):
+            current = candidate
+            continue
+        flush()
+        candidate = empty_row.copy()
+        candidate[column] = value
+        if fits(candidate):
+            current = candidate
+            continue
+        for fragment in _split_table_cell(value, cells, column, header, avail, measure):
+            split_row = empty_row.copy()
+            split_row[column] = fragment
+            pieces.append(render(split_row))
+    flush()
+    if not pieces:
+        pieces.append(render(cells))
+    return pieces
+
+
 def _line_units(text: str) -> list[tuple[int, int]]:
     units: list[tuple[int, int]] = []
     pos = 0
@@ -894,6 +1085,10 @@ def _split_oversized(text: str, kind: str, avail: int, measure: Measure) -> list
         start, end = group[0][0], group[-1][1]
         body = text[start:end]
         if len(group) == 1 and measure(body) > inner:
+            if kind == "table":
+                for row_piece in _split_table_row(body, head, head_sep, avail, measure):
+                    pieces.append(_Piece(start, end, row_piece))
+                continue
             for s, e in _hard_split(body, inner, measure):
                 pieces.append(_Piece(start + s, start + e, build(body[s:e].strip("\n"))))
         else:
@@ -1091,6 +1286,115 @@ def _enforce_budget(chunks: list[Chunk], chunk_size: int, measure: Measure) -> l
     return [replace(c, chunk_index=i) for i, c in enumerate(out) if c.text.strip()]
 
 
+@dataclass(frozen=True, slots=True)
+class _LeadingMetadata:
+    prefix: str
+    document_headers: tuple[str, ...]
+    content_start: int
+    header_start: int
+
+
+def _leading_metadata(text: str) -> _LeadingMetadata | None:
+    """Find leading YAML front matter and walker headers before document content."""
+    lines = text.splitlines(keepends=True)
+    yaml_seen = False
+    headers: list[tuple[int, str]] = []
+    position = 0
+    index = 0
+    found = False
+    while index < len(lines):
+        line = lines[index]
+        plain = line.rstrip("\r\n")
+        if not plain.strip():
+            if not found:
+                break
+            position += len(line)
+            index += 1
+            continue
+        if _DOC_HEADER_LINE_RE.fullmatch(plain.strip()):
+            headers.append((position, plain.strip()))
+            found = True
+            position += len(line)
+            index += 1
+            continue
+        if plain.strip() == "---" and not yaml_seen:
+            end = index + 1
+            while end < len(lines) and lines[end].strip() != "---":
+                end += 1
+            if end == len(lines):
+                break
+            yaml_seen = True
+            found = True
+            while index <= end:
+                position += len(lines[index])
+                index += 1
+            continue
+        break
+    if not found or not text[position:].strip():
+        return None
+    header_text = tuple(header for _, header in headers)
+    return _LeadingMetadata(
+        prefix=text[:position],
+        document_headers=header_text,
+        content_start=position,
+        header_start=min((start for start, _ in headers), default=position),
+    )
+
+
+def _fold_leading_metadata(
+    chunks: list[Chunk],
+    metadata: _LeadingMetadata,
+    chunk_size: int,
+    measure: Measure,
+) -> list[Chunk]:
+    """Fold metadata into the first content chunk, dropping YAML on overflow."""
+    if not chunks:
+        return chunks
+    first = chunks[0]
+    leading = metadata.prefix.rstrip()
+    combined = f"{leading}\n\n{first.text}" if leading else first.text
+    if measure(combined) <= chunk_size:
+        return [replace(first, text=combined, start_char=0), *chunks[1:]]
+
+    document_header = "\n".join(metadata.document_headers)
+    if not document_header:
+        return chunks
+    breadcrumb_prefix = f"{first.breadcrumb}\n\n" if first.breadcrumb else ""
+    header_prefix = f"{document_header}\n\n"
+    body = first.text[len(breadcrumb_prefix) :]
+    if measure(header_prefix + breadcrumb_prefix) >= chunk_size:
+        raise ValueError("document header and heading breadcrumb exceed the chunk budget")
+    split: list[Chunk] = []
+    offset = 0
+    while offset < len(body):
+        prefix = header_prefix if not split else ""
+        output_prefix = prefix + breadcrumb_prefix
+        spans = _hard_split(
+            body[offset:],
+            chunk_size,
+            lambda part: measure(output_prefix + part),
+        )
+        start, end = spans[0]
+        if end <= start:
+            raise ValueError("document metadata leaves no budget for content")
+        piece_text = output_prefix + body[offset + start : offset + end].strip()
+        split.append(
+            replace(
+                first,
+                text=piece_text,
+                start_char=metadata.header_start if not split else first.start_char + offset + start,
+                end_char=min(first.end_char, first.start_char + offset + end),
+                part_index=len(split) + 1,
+            )
+        )
+        offset += end
+    if len(split) > 1:
+        split = [replace(chunk, part_count=len(split)) for chunk in split]
+    elif split:
+        split[0] = replace(split[0], part_index=first.part_index, part_count=first.part_count)
+    return [*split, *chunks[1:]]
+
+
 def chunk_markdown_structured(
     text: str,
     source_id: str,
@@ -1107,8 +1411,9 @@ def chunk_markdown_structured(
     its own rows or lines (see ``_split_oversized``).  Returns ``[]`` for blank
     input.  Deterministic: same input, same output.
 
-    A heading-less preamble that only holds the walker's ``[Document: ...]``
-    header is dropped (it would be a standalone, information-free chunk).
+    Leading YAML front matter and the walker's ``[Document: ...]`` header are
+    folded into the first content chunk when they fit; YAML is dropped if it
+    would make that chunk exceed the budget. A metadata-only document is kept.
     *min_size* > 0 merges chunks measuring less than that into a neighbour of
     the same top-level section (see ``_merge_small``); the merged chunk keeps
     each part's location in ``Chunk.member_locations``.
@@ -1118,8 +1423,15 @@ def chunk_markdown_structured(
     stripped = text.strip()
     if not stripped:
         return []
+    metadata = _leading_metadata(stripped)
+    section_text = stripped[metadata.content_start :] if metadata is not None else stripped
+    section_offset = metadata.content_start if metadata is not None else 0
     sections = _drop_bare_ancestors(
-        [s for s in _split_sections(stripped, _ALL_LEVELS) if not _is_header_only(s)]
+        [
+            replace(section, start_char=section.start_char + section_offset)
+            for section in _split_sections(section_text, _ALL_LEVELS)
+            if not _is_header_only(section)
+        ]
     )
     entries: list[tuple[str, tuple[str, ...], Chunk]] = []
     for section, group in zip(sections, _section_groups(sections), strict=True):
@@ -1131,6 +1443,9 @@ def chunk_markdown_structured(
     else:
         chunks = [chunk for _, _, chunk in entries]
     chunks = _enforce_budget(chunks, chunk_size, measure)
+    if metadata is not None:
+        chunks = _fold_leading_metadata(chunks, metadata, chunk_size, measure)
+        chunks = [replace(chunk, chunk_index=index) for index, chunk in enumerate(chunks)]
     return _annotate_locations(text, stripped, chunks, scan_headings(stripped))
 
 
