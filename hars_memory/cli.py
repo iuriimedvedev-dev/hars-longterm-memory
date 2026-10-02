@@ -403,6 +403,33 @@ def _cmd_migrate_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_dense_sidecar(args: argparse.Namespace) -> int:
+    """Build a Qwen dense sidecar without modifying the LightRAG index."""
+    from hars_memory.retrieval.dense_sidecar import build_sidecar
+
+    try:
+        result = build_sidecar(
+            _resolve_index_dir(args.index_dir),
+            model=args.model,
+            out_dir=args.out_dir,
+            max_seq_length=args.max_seq_length,
+            batch_size=args.batch_size,
+            device=args.device,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"error: could not build dense sidecar: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Built dense sidecar: {result['n']} chunks")
+        print(f"  seconds={result['seconds']:.3f}")
+        print(f"  chunks_per_second={result['chunks_per_second']:.2f}")
+        print(f"  out_dir={result['out_dir']}")
+    return 0
+
+
 def _batch_documents(args: argparse.Namespace) -> list:
     """Walk the ingest roots like the synchronous indexer (sorted, optionally capped)."""
     from hars_memory.ingest.walker import walk
@@ -1210,6 +1237,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "keeping the canonical one.",
     )
     migrate_p.set_defaults(func=_cmd_migrate_index)
+
+    sidecar_p = sub.add_parser(
+        "build-dense-sidecar",
+        help="Build an opt-in Qwen dense embedding sidecar without touching LightRAG index files.",
+    )
+    sidecar_p.add_argument("--index-dir", default=None, help="Index directory (default: $HARS_MEMORY_INDEX_DIR)")
+    sidecar_p.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B")
+    sidecar_p.add_argument("--out-dir", type=Path, default=None)
+    sidecar_p.add_argument("--max-seq-length", type=int, default=512)
+    sidecar_p.add_argument("--batch-size", type=int, default=16)
+    sidecar_p.add_argument("--device", default="auto")
+    sidecar_p.add_argument("--limit", type=int, default=None)
+    sidecar_p.add_argument("--json", action="store_true")
+    sidecar_p.set_defaults(func=_cmd_build_dense_sidecar)
 
     # -- Batch-API index build --
     ib_p = sub.add_parser(
