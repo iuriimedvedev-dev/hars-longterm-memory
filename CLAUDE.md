@@ -67,3 +67,10 @@ with `uv run pytest -q` before considering it done.
   in `pyproject.toml`) — `mcp` 2.x renamed the `Server.list_tools()`
   decorator API this package's `mcp_server.py` uses. Do not bump it without
   re-verifying the whole MCP server against the new API.
+
+## Using the hars-memory MCP in this repo
+
+- Prefer `memory_recall` (supply `ll_keywords`/`hl_keywords`) before grepping the SRE KB, then open the cited file at `start_line`.
+- Write the query and keywords in **English** even if the user writes Russian (ru→en-docs recall is ~49% vs ~78% for en→en); keep identifiers verbatim; add Russian keywords only for the ~5% Russian documents.
+- The only project is `default` (the shared SRE KB): do not `memory_remember` notes about this tool into it without asking.
+- The MCP process is long-lived: after changing retrieval code or the index, ask the user to reconnect `/mcp` before testing against the live server.
