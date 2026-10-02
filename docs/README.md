@@ -8,11 +8,11 @@ and CPU-only embeddings.
 
 | Document | What it covers |
 |---|---|
+| [Architecture](architecture.md) / [Configuration](configuration.md) / [Indexing](indexing.md) | Modules, env vars, indexing modes |
+| [MCP tools](mcp-tools.md) / [Retrieval](retrieval.md) / [Evaluation](evaluation.md) / [Auth](auth.md) | Tool args, retrieval pipeline, metrics, RBAC |
 | [MCP tool reference](mcp-reference.md) | All 7 MCP tools: `memory_recall`, `memory_remember`, `memory_entities`, `memory_related`, `memory_status`, `memory_consolidate`, `memory_forget` — parameters, response shapes, examples |
 | [Configuration reference](configuration.md) | All environment variables, their defaults, and semantics |
 | [Architecture](architecture.md) | Module map, data flow, component relationships, retrieval pipeline |
-| [Integration guide](integration-guide.md) | How to consume this package from another project — install from GitLab registry, set up MCP server, configure Qdrant, use the skill |
-| [Release process](release-process.md) | How to publish a new version — PyPI package, container image, CI/CD |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
 | [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
 

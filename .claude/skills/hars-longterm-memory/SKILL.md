@@ -19,9 +19,7 @@ exposed two ways: an **MCP server** (`hars-longterm-memory-mcp` /
 `memory-mcp`, stdio transport) for direct use by an AI agent inside a coding
 session, and a **CLI** (`memory`, plus the standalone `memory-index` /
 `memory-eval-battle` scripts) for scripting, CI, and one-off maintenance.
-Published to a private GitLab Package Registry — package name
-`hars-longterm-memory`, GitLab project id `14`
-(`https://registry.example.com/hars/hars-longterm-memory`).
+Package name `hars-longterm-memory` (install from source or from your own package index).
 
 **Full documentation** is available in the `docs/` directory of the source
 repo: MCP tool reference, configuration reference, architecture, integration
@@ -52,7 +50,7 @@ dependencies = [
 
 [[tool.uv.index]]
 name = "hars-longterm-memory"
-url = "https://registry.example.com/api/v4/projects/14/packages/pypi/simple"
+url = "https://your-registry.example.com/simple"  # your package index, if you publish one
 explicit = true   # only used when a package explicitly requests this index —
                    # keeps every OTHER dependency resolving off plain PyPI
 
@@ -200,8 +198,7 @@ Trigger incremental (re)ingest. Params: `paths` (array of strings, optional
 — defaults to `[".plans", "docs"]`), `since` (ISO8601 string, optional —
 only reindex files newer than this), `dry_run` (bool, default `true`).
 Relative `paths` resolve against the **MCP server process's own current
-working directory** at invocation time (fixed in v0.1.3 — see the parent
-repo's `AGENTS.md` "Known parked bug" section for the history). Blocked by
+working directory** at invocation time (fixed in v0.1.3). Blocked by
 the GPU guard (if configured) unless `dry_run=true`.
 
 ```json
@@ -242,9 +239,8 @@ Console scripts (`[project.scripts]` in `pyproject.toml`):
 
 ## Credentials
 
-Consumers authenticate to the registry index with a **read-only deploy
-token**, obtained from the GitLab project's Settings → Repository → Deploy
-tokens (scope: `read_package_registry`). Configure it as environment
+If your private package index requires authentication, use a **read-only
+token** from your registry. Configure it as environment
 variables matching the named index above:
 
 ```bash
