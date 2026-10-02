@@ -242,11 +242,12 @@ Any other MCP client (stdio):
 
 ### Tips
 
-1. **Always supply `ll_keywords` / `hl_keywords`.** With no keywords the mode becomes `naive` automatically; supplied keywords also skip the keyword-extraction LLM call.
-2. Read `hybrid.fused_chunks`: each has `source_path`, `heading_path`, `start_line`.
-3. Check `hybrid.confidence` (look for `low_confidence`); if low, rephrase or add keywords.
-4. **Then open the file at `start_line`** to read the authoritative text instead of trusting the snippet.
-5. Prefer `view=lean` to save context.
+1. **Write the query in English.** The corpus is mostly English; an English question finds the fact in the top-5 noticeably more often than the same question in another language (in our measurement 78% vs 49% for Russian). Keep identifiers verbatim, and for non-English documents add keywords in their language or repeat the query in that language.
+2. **Always supply `ll_keywords` / `hl_keywords`.** With no keywords the mode becomes `naive` automatically; supplied keywords also skip the keyword-extraction LLM call.
+3. Read `hybrid.fused_chunks`: each has `source_path`, `heading_path`, `start_line`.
+4. Check `hybrid.confidence` (look for `low_confidence`); if low, rephrase or add keywords.
+5. **Then open the file at `start_line`** to read the authoritative text instead of trusting the snippet.
+6. Prefer `view=lean` to save context.
 
 ### Which tool when
 
