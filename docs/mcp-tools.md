@@ -27,7 +27,7 @@ Responses are JSON with an `ok` flag; failures carry an `error` string.
 
 ## memory_recall
 
-> **Query language.** Write `question` and the keywords in English when the corpus is mostly English, even if the user asked in another language (measured: a Russian question over English documents finds the fact in the top-5 about 49% of the time, an English one about 78%). Keep identifiers verbatim. For the few non-English documents add keywords in their language or repeat the query in that language.
+> **Query language.** Write `question` and the keywords in the language of the documents you expect to match, not the language the user asked in. English corpus: English (measured: a Russian question over English documents finds the fact in the top-5 about 49% of the time, an English one about 78%). Russian corpus: Russian (never worse than English there). Mixed corpus: add keywords in both languages or repeat the query. Keep identifiers verbatim.
 
 | Arg | Type | Default | Description |
 |---|---|---|---|
