@@ -146,7 +146,7 @@ All seven tools, grounded in `hars_memory/mcp_server.py`'s `list_tools()`.
 
 ### `memory_recall`
 
-**Query language rule:** the corpus is mostly English. Always write `question`, `ll_keywords` and `hl_keywords` in English, even when the user asked in another language; keep identifiers, field names and error codes verbatim. For the few non-English documents, add keywords in their language or repeat the query in that language. (Measured: Russian question over English docs finds the fact in the top-5 ~49% of the time vs ~78% for English.)
+**Query language rule:** write `question`, `ll_keywords` and `hl_keywords` in the language of the documents you expect to match, not the language the user asked in. English corpus: English (a Russian question over English docs finds the fact in the top-5 ~49% of the time vs ~78% for English). Russian corpus: Russian (a Russian question was never worse than English there). Mixed: add keywords in both languages or repeat the query. Keep identifiers, field names and error codes verbatim.
 Primary query workhorse. Params: `question` (string, **required**), `mode`
 (`local`|`global`|`hybrid`|`naive`, default `hybrid`), `top_k` (int, default
 20, 1-50 — result-count knob), `fetch_top_k` (int, 1-200, optional —

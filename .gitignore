@@ -24,3 +24,6 @@ config/live-llm-e2e.env
 experiments/search-2026-10/cache/
 experiments/search-2026-10/*.log
 experiments/search-2026-10/ru/cache/
+# derived experiment data (indexes, candidate caches, result dumps): code and configs only
+experiments/**/cache/
+experiments/**/results/

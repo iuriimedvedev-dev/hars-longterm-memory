@@ -71,6 +71,6 @@ with `uv run pytest -q` before considering it done.
 ## Using the hars-memory MCP in this repo
 
 - Prefer `memory_recall` (supply `ll_keywords`/`hl_keywords`) before grepping the SRE KB, then open the cited file at `start_line`.
-- Write the query and keywords in **English** even if the user writes Russian (ru→en-docs recall is ~49% vs ~78% for en→en); keep identifiers verbatim; add Russian keywords only for the ~5% Russian documents.
+- Write the query and keywords in the language of the documents you expect to match: **English for the (mostly English) SRE KB** even if the user writes Russian (ru→en-docs recall ~49% vs ~78% for en→en), Russian for a Russian corpus; keep identifiers verbatim; for the ~5% Russian documents of the SRE KB add Russian keywords.
 - The only project is `default` (the shared SRE KB): do not `memory_remember` notes about this tool into it without asking.
 - The MCP process is long-lived: after changing retrieval code or the index, ask the user to reconnect `/mcp` before testing against the live server.
