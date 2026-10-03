@@ -27,3 +27,5 @@ experiments/search-2026-10/ru/cache/
 # derived experiment data (indexes, candidate caches, result dumps): code and configs only
 experiments/**/cache/
 experiments/**/results/
+# session notes are local working notes: never tracked, never shipped
+.session/

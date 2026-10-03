@@ -20,6 +20,7 @@ with `uv run pytest -q` before considering it done.
 - Before starting non-trivial work, check `.session/` (most recent files
   first) for prior context — decisions already made, things already tried
   and rejected, gotchas already hit.
+- `.session/` is LOCAL ONLY: it is gitignored, removed from the repo and excluded from the sdist. Write notes there if useful, never `git add -f` them.
 - After any significant session (a bug fix, a new feature, an investigation
   with a real conclusion), write `.session/YYYY-MM-DD_topic.md` summarizing:
   what was decided, what changed, what's left. Compact, factual, English.

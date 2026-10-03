@@ -101,6 +101,10 @@ memory-strategy-bench = "hars_memory.eval.strategy_bench:main"
 memory-grpc = "hars_memory.cli:grpc_main"
 hars-longterm-memory-grpc = "hars_memory.grpc.server:main"
 
+[tool.hatch.build.targets.sdist]
+# local working notes and experiment data must never ship in the source archive
+exclude = [".session", ".plans", "experiments", "docs/research"]
+
 [tool.hatch.build.targets.wheel]
 # This is an application, not a library.  Packages are declared explicitly to
 # prevent hatchling from scanning for a matching package name.
