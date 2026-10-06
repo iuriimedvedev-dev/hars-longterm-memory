@@ -6,6 +6,7 @@ No LLM calls here.  This layer is fully GPU-free.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -114,9 +115,32 @@ def file_stable_id(path: Path) -> str:
     >>> staged == archived
     True
     """
-    normalized = _strip_archive_dir(path.resolve())
+    normalized = _remap_id_path(_strip_archive_dir(path.resolve()))
     digest = hashlib.sha256(str(normalized).encode()).hexdigest()[:12]
     return f"file:{digest}"
+
+
+#: Optional ``ACTUAL=LOGICAL`` prefix mappings (``os.pathsep``-separated) applied
+#: to a resolved path before it is hashed. Document ids are the hash of the
+#: ABSOLUTE path of the machine that first indexed a file; this lets a refresh
+#: run from a different checkout location (a CI clone, a git worktree, a temp
+#: dir) reproduce the ids already stored in an existing index. Unset = no-op.
+ID_PATH_MAP_ENV: Final[str] = "HARS_MEMORY_ID_PATH_MAP"
+
+
+def _remap_id_path(path: Path) -> Path:
+    raw = os.environ.get(ID_PATH_MAP_ENV, "").strip()
+    if not raw:
+        return path
+    text = str(path)
+    for entry in raw.split(os.pathsep):
+        actual, sep, logical = entry.partition("=")
+        actual, logical = actual.rstrip("/"), logical.rstrip("/")
+        if not sep or not actual:
+            raise ValueError(f"{ID_PATH_MAP_ENV} entry {entry!r} is not ACTUAL=LOGICAL")
+        if text == actual or text.startswith(actual + "/"):
+            return Path(logical + text[len(actual):])
+    return path
 
 
 def build_source_header(*, document_name: str, section: str, date: str) -> str:
