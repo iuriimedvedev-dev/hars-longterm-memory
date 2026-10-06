@@ -48,6 +48,13 @@ def _compare(name: str, left_label: str, left: set, right_label: str, right: set
     return Check(name, ok, detail, only_l[:20], only_r[:20])
 
 
+def _rel_ids(edge: frozenset[str]) -> set[str]:
+    from lightrag.utils import compute_mdhash_id
+
+    a, b = sorted(edge)
+    return {compute_mdhash_id(a + b, prefix="rel-"), compute_mdhash_id(b + a, prefix="rel-")}
+
+
 def _scroll(client: Any, collection: str, workspace: str, fields: list[str]) -> list[tuple[Any, dict[str, Any]]]:
     from qdrant_client import models
 
@@ -103,7 +110,6 @@ def audit_index(
     (``None`` = the unprefixed names LightRAG itself reads; ``"pier_kb"`` = the copies
     ``memory_status`` reports). Returns a JSON-serialisable report with ``ok``."""
     import networkx as nx
-
     index_dir = Path(index_dir)
     full_docs = _read(index_dir, "kv_store_full_docs.json")
     status = _read(index_dir, "kv_store_doc_status.json")
@@ -168,6 +174,7 @@ def audit_index(
     )
 
     qdrant_report: dict[str, Any] = {}
+    collisions: dict[str, list[str]] = {}
     digests: dict[str, dict[str, str]] = {}
     for prefix in prefixes:
         view = qdrant_snapshot_view(client, workspace, prefix)
@@ -181,9 +188,25 @@ def audit_index(
         q_chunks = [p.get("id") for _, p in pts["chunks"]]
         q_ents = [p.get("entity_name") for _, p in pts["entities"]]
         q_rels = [_pair(p.get("src_id"), p.get("tgt_id")) for _, p in pts["relationships"]]
+        # LightRAG derives a relationship's point id from md5(src + tgt): two different pairs whose names concatenate to the
+        # same string ("a/b/" + "c.yaml" vs "a/" + "b/c.yaml") share one point id, so one of them has no vector of its own.
+        # That is a property of LightRAG's id scheme, not drift: an edge without a point is tolerated (and listed) when
+        # another graph edge maps to one of its two candidate ids.
+        missing = edges - set(q_rels)
+        clash: set[frozenset[str]] = set()
+        if missing:
+            owners: dict[str, set[frozenset[str]]] = {}
+            for e in edges:
+                for rid in _rel_ids(e):
+                    owners.setdefault(rid, set()).add(e)
+            clash = {e for e in missing if any(owners[rid] - {e} for rid in _rel_ids(e))}
+        collisions[label] = sorted("<->".join(sorted(e)) for e in clash)
         checks.append(_compare(f"[{label}] qdrant chunks == text_chunks", "qdrant", set(q_chunks), "kv", chunk_ids))
         checks.append(_compare(f"[{label}] qdrant entities == graph nodes", "qdrant", set(q_ents), "graph", nodes))
-        checks.append(_compare(f"[{label}] qdrant relationships == graph edges", "qdrant", set(q_rels), "graph", edges))
+        rel_check = _compare(f"[{label}] qdrant relationships == graph edges", "qdrant", set(q_rels), "graph", edges - clash)
+        if clash:
+            rel_check.detail += f" (+{len(clash)} edge(s) sharing a point id with another edge: LightRAG md5(src+tgt) clash)"
+        checks.append(rel_check)
         for ns, ids in (("chunks", q_chunks), ("entities", q_ents), ("relationships", q_rels)):
             checks.append(Check(f"[{label}] {ns} no duplicate points", len(ids) == len(set(ids)), f"points={len(ids)} unique={len(set(ids))}"))
     if len(prefixes) > 1:
@@ -207,6 +230,7 @@ def audit_index(
             "graph_edges": len(edges),
         },
         "qdrant": qdrant_report,
+        "relationship_id_collisions": collisions,
         "qdrant_digests": digests,
         "checks": [c.__dict__ for c in checks],
         "failed": [c.name for c in checks if not c.ok],
