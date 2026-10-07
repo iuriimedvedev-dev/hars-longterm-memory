@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
@@ -176,7 +177,15 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
     return isinstance(exc, openai.APIConnectionError)
 
 
-def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float) -> object:
+def make_llm_func(
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    *,
+    api_key: str | None = None,
+    extra_body: Mapping[str, object] | None = None,
+) -> object:
     """Return an async LLM function compatible with LightRAG (OpenAI-compatible).
 
     This is a thin adapter over the official OpenAI SDK's ``AsyncOpenAI``
@@ -262,7 +271,9 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
     # (raising KeyError if unset) whenever api_key is falsy, so this must
     # always be a non-empty string. A real OpenAI-compatible provider that
     # does require auth can set HARS_MEMORY_LLM_API_KEY.
-    api_key = os.environ.get("HARS_MEMORY_LLM_API_KEY") or "not-needed"
+    # An explicit ``api_key`` (extractor backend config, e.g. OpenRouter) wins.
+    api_key = api_key or os.environ.get("HARS_MEMORY_LLM_API_KEY") or "not-needed"
+    static_extra_body = dict(extra_body or {})
 
     # One AsyncOpenAI client per llm_func closure, reused across every call —
     # real connection pooling from the SDK, instead of the pre-SDK
@@ -322,7 +333,11 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
         forwarded = {k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)}
         call_max_tokens = forwarded.get("max_tokens", max_tokens)
         call_temperature = forwarded.get("temperature", temperature)
-        extra_body = {k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS}
+        # Static backend fields (e.g. reasoning effort) first; per-call primitives override.
+        extra_body = {
+            **static_extra_body,
+            **{k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS},
+        }
 
         async def _complete_once() -> str:
             response = await client.chat.completions.create(
@@ -341,7 +356,10 @@ def make_llm_func(base_url: str, model: str, max_tokens: int, temperature: float
             # Thinking models may leave content empty and put everything in
             # reasoning_content (server-side reasoning parsing), or emit
             # inline <think> blocks. Recover the actual result either way.
-            reasoning_content = getattr(message, "reasoning_content", None)
+            # OpenRouter names the same field ``reasoning``.
+            reasoning_content = getattr(message, "reasoning_content", None) or getattr(
+                message, "reasoning", None
+            )
             if not content.strip() and reasoning_content:
                 content = str(reasoning_content)
             if "<think>" in content:
@@ -449,8 +467,12 @@ def create_lightrag(
 
     # --- resolve config (param > env > default) ---
     _wdir = resolve_working_dir(working_dir)
-    _ext_url = extractor_base_url or os.environ.get("HARS_MEMORY_EXTRACTOR_BASE_URL", "http://localhost:8080/v1")
-    _ext_model = extractor_model or os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", "Qwen3.6-27B-Q4_K_M")
+    from hars_memory.server.extractor_config import resolve_extractor_backend
+
+    _ext = resolve_extractor_backend(
+        os.environ, base_url=extractor_base_url, model=extractor_model
+    )
+    _ext_url, _ext_model = _ext.base_url, _ext.model
     _qry_url = query_base_url or os.environ.get("HARS_MEMORY_QUERY_BASE_URL", "http://localhost:8081/v1")
     _qry_model = query_model or os.environ.get("HARS_MEMORY_QUERY_MODEL", "Qwen3.5-4B-Q4_K_M")
     _emb_model = embed_model or os.environ.get("HARS_MEMORY_EMBED_MODEL", "unsloth/embeddinggemma-300m")
@@ -596,6 +618,8 @@ def create_lightrag(
             temperature=float(
                 os.environ.get("HARS_MEMORY_EXTRACTOR_TEMPERATURE", "0.1")
             ),
+            api_key=_ext.api_key if _ext.provider != "local" else None,
+            extra_body=_ext.extra_body,
         ),
         llm_model_name=_ext_model,
         embedding_func=EmbeddingFunc(

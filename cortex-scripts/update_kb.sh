@@ -66,6 +66,20 @@ for _arg in "$@"; do
     esac
 done
 
+# --- extractor provider (config-driven; default = unchanged local GPU path) --
+# HARS_MEMORY_EXTRACTOR_PROVIDER=local (default) : start gemma-4-12b via llama.cpp (GPU).
+# HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter      : hosted model, NO GPU, NO local server.
+#   Needs HARS_MEMORY_OPENROUTER_MODEL (model id) and the API key in the env var
+#   named by HARS_MEMORY_EXTRACTOR_API_KEY_ENV (default OPENROUTER_API_KEY), e.g.
+#   (set -a; . cortex/.env.secrets; set +a;
+#    HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter HARS_MEMORY_OPENROUTER_MODEL=<id> update_kb.sh)
+# See hars_memory/server/extractor_config.py for every knob.
+PROVIDER="${HARS_MEMORY_EXTRACTOR_PROVIDER:-local}"
+case "$PROVIDER" in
+    local|openrouter) ;;
+    *) echo "ERROR: HARS_MEMORY_EXTRACTOR_PROVIDER must be local|openrouter, got '$PROVIDER'" >&2; exit 1 ;;
+esac
+
 HF_HOME="${HF_HOME:-/mnt/datasets/models/.hf_home}"
 STAGING="${HARS_MEMORY_STAGING_DIR:-/mnt/datasets/graphrag/staging}"
 INDEX="${HARS_MEMORY_INDEX_DIR:-}"
@@ -143,6 +157,8 @@ fi
 # `assert_gpu_free(api_base_url)`, which is called and must not raise.
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "dry-run: skipping GPU guard (no GPU is taken)."
+elif [[ "$PROVIDER" != "local" ]]; then
+    echo "provider=$PROVIDER: no local GPU extractor is started — GPU guard not applicable."
 elif [[ -n "${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH:-}" ]]; then
     echo "GPU guard: checking ${HARS_MEMORY_GPU_GUARD_SCRIPT_PATH} ..."
     if ! "$PYTHON_BIN" - "$HARS_MEMORY_GPU_GUARD_SCRIPT_PATH" "${HARS_API_BASE_URL:-http://localhost:8765}" <<'PYEOF'
@@ -170,7 +186,7 @@ else
     echo "HARS_MEMORY_GPU_GUARD_SCRIPT_PATH not set — skipping GPU guard check (proceeding without GPU-concurrency verification)."
 fi
 
-cleanup() { pkill -9 -f "llama-server.*$PORT" 2>/dev/null || true; }
+cleanup() { [[ "$PROVIDER" == "local" ]] && { pkill -9 -f "llama-server.*$PORT" 2>/dev/null || true; }; return 0; }
 trap cleanup EXIT
 
 # --- extractor concurrency: DO NOT raise beyond 6 -------------------------
@@ -180,6 +196,10 @@ trap cleanup EXIT
 # ctx 61440/6) is a CALCULATION from GGUF metadata, not a measurement, and
 # headroom shrinks as both --parallel and CTX_SIZE grow. Leave at 6.
 PARALLEL=6
+# Hosted provider: no slot limit; concurrency is an explicit env knob.
+if [[ "$PROVIDER" != "local" ]]; then
+    PARALLEL="${HARS_MEMORY_LLM_MAX_ASYNC:-8}"
+fi
 
 # --- per-slot context sizing (fixes latent ctx-size/--parallel bug) -------
 # llama.cpp DIVIDES --ctx-size across --parallel slots — it is NOT shared.
@@ -218,7 +238,9 @@ CTX_SIZE=$(( REQUIRED_PER_SLOT * PARALLEL ))
 
 echo "ctx-size sizing: system_prompt=${SYSTEM_PROMPT_TOKENS}t + input<=${INPUT_TOKENS_EST}t (${HARS_MEMORY_LLM_MAX_TOKEN_SIZE}B @ ${BYTES_PER_TOKEN_CONSERVATIVE}B/tok) + output=${HARS_MEMORY_EXTRACTOR_MAX_TOKENS}t + overhead=${CHAT_TEMPLATE_OVERHEAD_TOKENS}t -> required/slot=${REQUIRED_PER_SLOT}t x parallel=${PARALLEL} -> ctx-size=${CTX_SIZE}"
 
-if [[ $DRY_RUN -eq 0 ]]; then
+if [[ $DRY_RUN -eq 0 && "$PROVIDER" != "local" ]]; then
+    echo "provider=$PROVIDER: skipping local extractor start (async=$PARALLEL)."
+elif [[ $DRY_RUN -eq 0 ]]; then
 echo "starting extractor (gemma-4-12b, $PARALLEL slots, ctx-size=$CTX_SIZE)..."
 # Prompt-prefix caching for the ~4,000-token constant LightRAG extraction
 # system prompt (byte-identical on every chunk, ~85% of every request):
@@ -288,10 +310,20 @@ INDEX_ARGS=(--paths "${PATHS[@]}")
 if [[ $DRY_RUN -eq 1 ]]; then
     INDEX_ARGS+=(--dry-run)
 fi
+# Extractor endpoint/model: only forced to the local server for provider=local;
+# for hosted providers extractor_config.py resolves them from HARS_MEMORY_OPENROUTER_*.
+EXTRACTOR_ENV=()
+if [[ "$PROVIDER" == "local" ]]; then
+    EXTRACTOR_ENV=(
+        HARS_MEMORY_EXTRACTOR_BASE_URL="http://localhost:$PORT/v1"
+        HARS_MEMORY_EXTRACTOR_MODEL=gemma-4-12b
+    )
+fi
+env \
+HARS_MEMORY_EXTRACTOR_PROVIDER="$PROVIDER" \
+"${EXTRACTOR_ENV[@]}" \
 HARS_MEMORY_VECTOR_STORAGE="$HARS_MEMORY_VECTOR_STORAGE" \
 HARS_MEMORY_INDEX_DIR="$INDEX" \
-HARS_MEMORY_EXTRACTOR_BASE_URL="http://localhost:$PORT/v1" \
-HARS_MEMORY_EXTRACTOR_MODEL=gemma-4-12b \
 HARS_MEMORY_EXTRACTOR_MAX_TOKENS="$HARS_MEMORY_EXTRACTOR_MAX_TOKENS" \
 HARS_MEMORY_LLM_MAX_TOKEN_SIZE="$HARS_MEMORY_LLM_MAX_TOKEN_SIZE" \
 HARS_MEMORY_CHUNK_TOKEN_SIZE=2048 \
@@ -300,8 +332,8 @@ HARS_MEMORY_MAX_PARALLEL_INSERT="$PARALLEL" \
 HARS_MEMORY_INSERT_BATCH_SIZE=99999 \
 HARS_MEMORY_LLM_MAX_ASYNC="$PARALLEL" \
 HARS_MEMORY_MAX_GLEANING=0 \
-HARS_MEMORY_LLM_TIMEOUT_SECONDS=600 \
-LLM_TIMEOUT=600 \
+HARS_MEMORY_LLM_TIMEOUT_SECONDS="${HARS_MEMORY_LLM_TIMEOUT_SECONDS:-600}" \
+LLM_TIMEOUT="${LLM_TIMEOUT:-600}" \
 HARS_MEMORY_EMBED_MODEL=unsloth/embeddinggemma-300m \
 HARS_MEMORY_EMBED_DEVICE=cpu \
 HARS_MEMORY_EMBED_LOCAL_FILES_ONLY=1 \
@@ -310,9 +342,17 @@ HF_HOME="$HF_HOME" \
     "${INDEX_ARGS[@]}" > "$LOG" 2>&1
 
 if [[ $DRY_RUN -eq 0 ]]; then
-    echo "indexing done; archiving ingested notes..."
-    mkdir -p "$STAGING/ingested"
-    find "$STAGING" -maxdepth 1 -name '*.md' -exec mv {} "$STAGING/ingested/" \;
+    # Archive ONLY notes whose LightRAG doc_status is "processed". A failed or
+    # never-ingested note stays in staging (it used to be mv'd unconditionally
+    # and silently lost). Non-zero exit if anything was left behind.
+    echo "indexing done; archiving successfully ingested notes..."
+    ARCHIVE_RC=0
+    "$PYTHON_BIN" -m hars_memory.scripts.archive_ingested \
+        --index-dir "$INDEX" --staging "$STAGING" || ARCHIVE_RC=$?
+    if [[ $ARCHIVE_RC -ne 0 ]]; then
+        echo "KB update INCOMPLETE (archive rc=$ARCHIVE_RC): see 'NOT ARCHIVED' lines; failed notes remain in $STAGING. Log: $LOG" >&2
+        exit 1
+    fi
     echo "KB update complete. Log: $LOG"
 else
     echo "dry-run complete; nothing written, nothing archived. Log: $LOG"
