@@ -135,3 +135,20 @@ async def test_llm_func_sends_key_and_reasoning_and_reads_reasoning_field(
     assert seen["auth"] == f"Bearer {FAKE_CRED}"
     assert seen["body"]["reasoning"] == {"effort": "low"}
     assert seen["body"]["model"] == "v/m"
+
+
+def test_key_falls_back_to_dotenv_file_only_when_env_unset(tmp_path) -> None:
+    f = tmp_path / "secrets.env"
+    f.write_text("# c\nOTHER=x\nexport OPENROUTER_API_KEY=\"from-file\"\n", encoding="utf-8")
+    base = {
+        "HARS_MEMORY_EXTRACTOR_PROVIDER": "openrouter",
+        "HARS_MEMORY_OPENROUTER_MODEL": "v/m",
+        "HARS_MEMORY_EXTRACTOR_API_KEY_FILE": str(f),
+    }
+    assert resolve_extractor_backend(base).api_key == "from-file"
+    assert resolve_extractor_backend({**base, "OPENROUTER_API_KEY": "env-wins"}).api_key == "env-wins"
+    with pytest.raises(ExtractorConfigError, match="API_KEY_FILE"):
+        resolve_extractor_backend({**base, "HARS_MEMORY_EXTRACTOR_API_KEY_FILE": str(tmp_path / "nope")})
+    f.write_text("OTHER=x\n", encoding="utf-8")
+    with pytest.raises(ExtractorConfigError, match="OPENROUTER_API_KEY"):
+        resolve_extractor_backend(base)

@@ -11,6 +11,9 @@ Provider ``openrouter``
     ``HARS_MEMORY_OPENROUTER_BASE_URL``  optional, default :data:`OPENROUTER_BASE_URL`.
     ``HARS_MEMORY_EXTRACTOR_API_KEY_ENV`` NAME of the env var holding the key
         (default ``OPENROUTER_API_KEY``). The key value is never logged/printed.
+    ``HARS_MEMORY_EXTRACTOR_API_KEY_FILE``  optional dotenv-style file consulted ONLY when that
+        env var is unset/empty (lets an MCP launched without the secrets exported still
+        authenticate; only the one named variable is read, never logged).
     The generic ``HARS_MEMORY_EXTRACTOR_BASE_URL``/``_MODEL`` are deliberately
     ignored here: they keep pointing at the local server so flipping the provider
     never inherits a local model name.
@@ -30,6 +33,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final
 
 PROVIDER_LOCAL: Final[str] = "local"
@@ -68,6 +72,24 @@ def _clean(env: Mapping[str, str], name: str) -> str:
     return (env.get(name) or "").strip()
 
 
+def _key_from_file(path: str, name: str) -> str:
+    """Return ``NAME`` from a dotenv-style file ('' if no file/var). Never logs values."""
+    if not path:
+        return ""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ExtractorConfigError(f"cannot read HARS_MEMORY_EXTRACTOR_API_KEY_FILE {path!r}: {exc.strerror}") from exc
+    prefix = f"{name}="
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip("\"'")
+    return ""
+
+
 def resolve_extractor_backend(
     env: Mapping[str, str],
     *,
@@ -95,7 +117,7 @@ def resolve_extractor_backend(
             )
         resolved_url = base_url or _clean(env, "HARS_MEMORY_OPENROUTER_BASE_URL") or OPENROUTER_BASE_URL
         key_env = _clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_ENV") or DEFAULT_OPENROUTER_KEY_ENV
-        api_key = _clean(env, key_env)
+        api_key = _clean(env, key_env) or _key_from_file(_clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_FILE"), key_env)
         if not api_key:
             raise ExtractorConfigError(
                 f"HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter requires an API key in the environment "
