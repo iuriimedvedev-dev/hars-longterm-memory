@@ -29,6 +29,29 @@ inline rationale).
 | `HARS_MEMORY_EXTRACTOR_EXTRA_HEADERS` | — | JSON object of extra HTTP headers for the extractor endpoint |
 | `HARS_MEMORY_QUERY_EXTRA_HEADERS` | — | JSON object of extra HTTP headers for the query endpoint |
 
+## Extractor provider (local or hosted)
+
+Selects the entity-extraction LLM backend (`hars_memory/server/extractor_config.py`). The default `local` provider keeps the behaviour of the two `HARS_MEMORY_EXTRACTOR_*` variables above. No model id or key is baked into the code.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HARS_MEMORY_EXTRACTOR_PROVIDER` | `local` | `local` (llama.cpp / any OpenAI-compatible server on the GPU) or `openrouter` (hosted, no GPU). An empty value means `local`; anything else fails fast |
+| `HARS_MEMORY_OPENROUTER_MODEL` | — | Required for `openrouter`: the hosted model id. The generic `HARS_MEMORY_EXTRACTOR_BASE_URL` / `_MODEL` are ignored for this provider |
+| `HARS_MEMORY_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Endpoint of the hosted provider |
+| `HARS_MEMORY_EXTRACTOR_API_KEY_ENV` | `OPENROUTER_API_KEY` | NAME of the environment variable that holds the API key (the key itself is never logged) |
+| `HARS_MEMORY_EXTRACTOR_API_KEY_FILE` | — | Optional dotenv-style file (`NAME=value` or `export NAME=value`) read only when the variable named above is unset or empty; lets an MCP server started without exported secrets authenticate |
+| `HARS_MEMORY_EXTRACTOR_REASONING_EFFORT` | `low` for `openrouter`, not sent for `local` | Sent as `reasoning.effort`; `unset` disables sending, `none` turns reasoning off (measured worse on the hosted model) |
+| `HARS_MEMORY_EXTRACTOR_EXTRA_BODY_JSON` | — | JSON object merged into every extractor request body |
+
+Timeout, retries and concurrency reuse `HARS_MEMORY_LLM_TIMEOUT_SECONDS`, `HARS_MEMORY_LLM_RETRY_*` and `HARS_MEMORY_LLM_MAX_ASYNC`. With a hosted provider `memory_consolidate` and `cortex-scripts/update_kb.sh` skip the local GPU guard and do not start a local extractor. `update_kb.sh` archives a staged note only after its LightRAG `doc_status` is `processed` (`hars_memory.scripts.archive_ingested`); failed notes stay in staging and the script exits non-zero.
+
+## Incremental refresh
+
+| Variable | Default | Description |
+|---|---|---|
+| `HARS_MEMORY_ID_PATH_MAP` | — | `ACTUAL=LOGICAL` path-prefix mappings (`os.pathsep`-separated) applied before document ids are hashed, so a refresh run from another checkout location reproduces the ids stored in the index. See [incremental refresh](incremental-refresh.md) |
+| `HARS_MEMORY_FINGERPRINT_STORE` | `<index dir>/doc_fingerprints.json` | Fingerprint sidecar used by `incremental_refresh` |
+
 ## Vector storage
 
 | Variable | Default | Description |
