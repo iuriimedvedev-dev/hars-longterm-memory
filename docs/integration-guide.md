@@ -30,7 +30,7 @@ Store these in a gitignored secrets file, never committed.
 ```toml
 [project]
 dependencies = [
-    "hars-longterm-memory>=0.2.0",
+    "hars-longterm-memory>=0.5.0",
 ]
 
 [tool.uv.sources]

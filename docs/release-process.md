@@ -13,7 +13,7 @@ Both use the GitLab project at `code.knotgate.com/hars/hars-longterm-memory`
 ## Versioning
 
 The package uses [semantic versioning](https://semver.org/). Current version is
-in `pyproject.toml` (`version = "0.2.0"`).
+in `pyproject.toml` (`version = "0.5.0"`).
 
 ---
 
@@ -142,7 +142,7 @@ url = "https://code.knotgate.com/api/v4/projects/14/packages/pypi/simple"
 explicit = true
 
 [project]
-dependencies = ["hars-longterm-memory>=0.2.0"]
+dependencies = ["hars-longterm-memory>=0.5.0"]
 
 [tool.uv.sources]
 hars-longterm-memory = { index = "hars-longterm-memory" }

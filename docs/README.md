@@ -12,6 +12,7 @@ and CPU-only embeddings.
 | [Configuration reference](configuration.md) | All environment variables, their defaults, and semantics |
 | [Architecture](architecture.md) | Module map, data flow, component relationships, retrieval pipeline |
 | [Integration guide](integration-guide.md) | How to consume this package from another project — install from GitLab registry, set up MCP server, configure Qdrant, use the skill |
+| [Incremental refresh](incremental-refresh.md) | `plan / apply / audit / repair-orphans` CLI for refreshing a large LightRAG index without a full rebuild |
 | [Release process](release-process.md) | How to publish a new version — PyPI package, container image, CI/CD |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
 | [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
