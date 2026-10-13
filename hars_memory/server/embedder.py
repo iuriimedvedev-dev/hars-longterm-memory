@@ -42,6 +42,88 @@ HARS_MEMORY_EMBED_QUERY_PROMPT_NAME
     the document-side prompt WOULD require a full re-embed — see
     embeddinggemma's "document" prompt ("title: none | text: ") for the
     theoretically-correct (but re-embed-requiring) setting.
+
+HTTP / shared-embedder mode (HARS_MEMORY_EMBED_PROVIDER=http)
+-------------------------------------------------------------
+By default this module loads sentence-transformers IN-PROCESS.  Setting
+HARS_MEMORY_EMBED_PROVIDER=http instead sends texts to an OpenAI-compatible
+remote embedding endpoint (POST {HARS_MEMORY_EMBED_BASE_URL}/embeddings) —
+e.g. a shared llama.cpp embed server (`llama-server --embeddings --port 8791`)
+or a hosted API speaking the same protocol (OpenAI, Mistral, Jina, Gemini's
+OpenAI-compatible endpoint, SiliconFlow).  Several services can then share
+ONE embedder process instead of each loading its own ~300–600 MB copy.
+
+Prompt parity: a remote endpoint embeds the RAW strings it receives — it
+knows nothing about sentence-transformers prompt dicts.  To byte-match the
+in-process behaviour, the query prompt string is applied CLIENT-SIDE before
+the request is sent (and HARS_MEMORY_EMBED_DOC_PREFIX to document-context
+texts, exactly as in local mode).  The rest of http mode:
+
+HARS_MEMORY_EMBED_PROVIDER
+    "local" (default) | "http".  Empty/unset means local.  Any other value
+    RAISES — a typo must not silently fall back to a different backend.
+HARS_MEMORY_EMBED_BASE_URL
+    OpenAI-compatible base URL, e.g. "http://127.0.0.1:8791/v1".  Required
+    in http mode (fails loudly if missing).  Prefer the direct embed port
+    over any proxy so memory availability is not coupled to the proxy.
+HARS_MEMORY_EMBED_API_KEY
+    Optional; sent as "Authorization: Bearer <key>" (hosted APIs).
+HARS_MEMORY_EMBED_HTTP_MODEL
+    Server-side model id in the request body.  Default: the value of
+    HARS_MEMORY_EMBED_MODEL.  (A llama.cpp server typically exposes the GGUF
+    as "google/embeddinggemma-300m" while HARS_MEMORY_EMBED_MODEL stays
+    "unsloth/embeddinggemma-300m" — set this var to the server's id.)
+HARS_MEMORY_EMBED_HTTP_TIMEOUT
+    Per-request timeout in seconds.  Default: 60.
+HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT
+    Prompt string prepended CLIENT-SIDE to query-context texts
+    (context="query"), reproducing ST's prompt_name="query" behaviour.
+    Default: "task: search result | query: " (embeddinggemma's "query"
+    prompt — the exact string ST applies for the default in-process setup).
+HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS
+    "1" (default) applies the client-side query prompt + doc prefix.  MUST
+    be set to "0" for any NON-embeddinggemma remote model (mistral-embed,
+    text-embedding-*, jina-embeddings-*): those models are trained on RAW
+    input, and prepending embeddinggemma's task prefix would silently
+    degrade them.  The dimension check (below) is the second line of
+    defence against leaving this on by mistake.
+HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST
+    Max inputs per HTTP request (hosted APIs cap this).  Default: 128.
+    Effective per-request chunking = min(HARS_MEMORY_EMBED_BATCH_SIZE, this).
+    On a 400 response that clearly indicates a batch/token-size overflow
+    the batch is automatically HALVED and retried (max 2 halvings, then a
+    loud error pointing at chunk-size env vars).
+HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS
+    Optional client-side pacing between requests to stay under RPM limits.
+    Default: 0 (off).  429 responses honour the server's Retry-After header
+    (with exponential backoff as fallback); 5xx/timeout get 2 retries with
+    short backoff — then a loud error naming the env vars above.
+HARS_MEMORY_EMBED_PROMPT_NAME
+    NOT supported in http mode (a named prompt is a sentence-transformers
+    client-side concept).  Setting it while provider=http raises at startup
+    instead of silently changing the vector space — reproduce its effect
+    with HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT / HARS_MEMORY_EMBED_DOC_PREFIX.
+
+Dimension safety: on the first response the server's vector dimension is
+checked against _KNOWN_DIMS for HARS_MEMORY_EMBED_MODEL /
+HARS_MEMORY_EMBED_HTTP_MODEL (embeddinggemma=768, mistral-embed=1024,
+text-embedding-3-small=1536, jina-embeddings-v3=1024, ...) and every later
+response is checked for consistency; lightrag_init's
+validate_embedder_against_index() still guards the dim baked into an
+existing vdb_*.json / Qdrant collection.  Any mismatch raises with a
+message saying WHICH side is wrong.
+
+Cost visibility: every response's ``usage.prompt_tokens`` is logged at
+DEBUG and a cumulative per-run summary (requests / texts / prompt tokens)
+at INFO.
+
+Safe-switch rule of thumb: query-side settings (query prompt text, toggle)
+only affect freshly computed query embeddings — safe to change any time
+PROVIDED the model is identical to the one the index was built with.  Any
+change that affects DOCUMENT-side vectors (doc prefix, prompt toggle — and
+above all A DIFFERENT MODEL, which is a different vector space entirely)
+requires a full re-embed.  See README "Swapping models" for ready-to-paste
+env blocks (local shared server + hosted remote embedders).
 """
 
 from __future__ import annotations
@@ -60,6 +142,568 @@ logger = logging.getLogger(__name__)
 
 # LightRAG expects an async embedding function:
 #   async def embed_func(texts: list[str]) -> numpy.ndarray  (shape: n_texts × dim, dtype float32)
+
+# embeddinggemma's built-in "query" prompt (config_sentence_transformers.json).
+# In local mode sentence-transformers looks this up by prompt_name; in http
+# mode WE are the client, so the string itself ships here and is prepended
+# to query-context texts before POSTing (HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT
+# defaults to exactly this).
+_EMBEDDING_GEMMA_QUERY_PROMPT = "task: search result | query: "
+
+# Model → output dimension.  Authoritative fast-path so configuration can be
+# validated WITHOUT loading a model or calling the network (the fallback
+# order in embedding_dimension() is: load the model → this table → raise).
+# Includes hosted OpenAI-compatible embedding models so HARS_MEMORY_EMBED_
+# PROVIDER=http setups get the same offline dim validation as local ones:
+#   embeddinggemma 768 | mistral-embed 1024 | text-embedding-3-small 1536 |
+#   text-embedding-3-large 3072 | jina-embeddings-v3 1024
+_KNOWN_DIMS: dict[str, int] = {
+    "intfloat/e5-large-v2": 1024,
+    "intfloat/e5-base-v2": 768,
+    "intfloat/e5-small-v2": 384,
+    "BAAI/bge-m3": 1024,
+    "nomic-ai/nomic-embed-text-v1": 768,
+    "Qwen/Qwen3-Embedding-0.6B": 1024,
+    "google/embeddinggemma-300m": 768,
+    "unsloth/embeddinggemma-300m": 768,
+    # Hosted OpenAI-compatible remote models (http mode).
+    "mistral-embed": 1024,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "jina-embeddings-v3": 1024,
+}
+
+# Values of HARS_MEMORY_EMBED_PROVIDER that select the in-process
+# sentence-transformers path (the historic default).  Anything non-empty
+# outside {"local"} ∪ {"http"} raises — see _resolve_provider().
+_LOCAL_PROVIDERS = frozenset({"", "local"})
+
+# Transient-failure retry budget for the http embedder: 1 attempt + 2 retries
+# on timeout / transport error / 5xx / 429 (429 additionally honours the
+# server's Retry-After header when present).  Backoff is exponential with
+# base _RETRY_BACKOFF_SECONDS (module-level so tests can zero it).
+_HTTP_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS: float = 0.5
+
+# Substrings (lower-cased) whose presence in a 400 response body marks it as
+# a batch/token-size overflow → the http embedder halves the batch and
+# retries, instead of failing.  Deliberately 400-gated: a size complaint on
+# another status code is not something we guess at.
+_SIZE_LIMIT_400_MARKERS: tuple[str, ...] = (
+    "maximum context length",
+    "maximum length",
+    "max length",
+    "too long",
+    "too large",
+    "too many tokens",
+    "token limit",
+    "exceed",
+    "batch size",
+    "input must have",
+    "inputs must",
+    "array length",
+    "less than or equal",
+    "reduce the",
+    "shorten",
+)
+
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean-ish env var ("1"/"0"/"true"/... ) with a default."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_STRINGS:
+        return True
+    if raw in _FALSE_STRINGS:
+        return False
+    raise RuntimeError(
+        f"{name}={raw!r} is invalid; expected a boolean-ish value "
+        '(e.g. "1"/"0", "true"/"false"). Refusing to guess: this flag changes '
+        "the vector space, so a typo must fail loud, not fall back."
+    )
+
+
+def _resolve_provider() -> str:
+    """Resolve HARS_MEMORY_EMBED_PROVIDER to "local" | "http" (fail loud on typos).
+
+    "" / unset / "local" → the historic in-process sentence-transformers path,
+    byte-identical to pre-http-mode behaviour.  "http" → remote
+    OpenAI-compatible endpoint.  Anything else raises: silently treating
+    "htpp" as local would load a 300–600 MB model AND (worse) let a
+    half-configured http setup pass validation against the wrong backend.
+    """
+    raw = os.environ.get("HARS_MEMORY_EMBED_PROVIDER", "").strip().lower()
+    if raw in _LOCAL_PROVIDERS:
+        return "local"
+    if raw == "http":
+        return "http"
+    raise RuntimeError(
+        f"HARS_MEMORY_EMBED_PROVIDER={raw!r} is invalid; expected 'local' "
+        '(in-process sentence-transformers, the default) or \'http\' '
+        "(OpenAI-compatible remote embedder via HARS_MEMORY_EMBED_BASE_URL)."
+    )
+
+
+def _known_dim(*model_names: str) -> int | None:
+    """First known output dimension among ``model_names``, else None."""
+    for name in model_names:
+        if name and name in _KNOWN_DIMS:
+            return _KNOWN_DIMS[name]
+    return None
+
+
+def _make_async_client(timeout: float) -> object:
+    """Create the httpx.AsyncClient used by the http embedder.
+
+    Module-level indirection so tests can monkeypatch in an
+    httpx.MockTransport-backed client without any real network.
+    """
+    import httpx
+
+    return httpx.AsyncClient(timeout=timeout)
+
+
+class _BatchSizeLimitError(RuntimeError):
+    """Internal: the endpoint returned a 400 whose body looks like a
+    batch/token-size overflow.  The http embedder responds by halving the
+    batch and retrying (max 2 halvings) rather than failing immediately."""
+
+
+def _looks_like_size_limit_400(body: str) -> bool:
+    lowered = body.lower()
+    return any(marker in lowered for marker in _SIZE_LIMIT_400_MARKERS)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) into seconds."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _http_headers(api_key: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _probe_remote_dim(base_url: str, api_key: str, model: str, timeout: float) -> int:
+    """Resolve a remote embedder's dimension with one synchronous probe call.
+
+    Used by embedding_dimension() in http mode ONLY when neither
+    HARS_MEMORY_EMBED_MODEL nor HARS_MEMORY_EMBED_HTTP_MODEL is listed in
+    _KNOWN_DIMS — i.e. an unlisted remote model whose dim we cannot know
+    offline.  The single blocking call happens once at create_lightrag()
+    time, before validate_embedder_against_index() compares it with the dim
+    baked into an existing index.
+    """
+    import httpx
+
+    try:
+        resp = httpx.post(
+            f"{base_url}/embeddings",
+            json={"model": model, "input": ["dimension probe"]},
+            headers=_http_headers(api_key),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        dim = int(len(data[0]["embedding"]))
+        logger.info("Probed remote embedder %s @ %s: dim=%d", model, base_url, dim)
+        return dim
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot resolve the embedding dimension for "
+            f"HARS_MEMORY_EMBED_PROVIDER=http: probe request to "
+            f"{base_url}/embeddings (model={model!r}) failed. Either make the "
+            "endpoint reachable (check HARS_MEMORY_EMBED_BASE_URL / "
+            "HARS_MEMORY_EMBED_API_KEY / HARS_MEMORY_EMBED_HTTP_TIMEOUT), or set "
+            "HARS_MEMORY_EMBED_MODEL to a model whose dimension is listed in "
+            "embedder._KNOWN_DIMS so no probe is needed. Refusing to guess a "
+            "dimension: a wrong guess would silently embed queries into the "
+            f"wrong vector space. Original error: {exc}"
+        ) from exc
+
+
+def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
+    """Build the HARS_MEMORY_EMBED_PROVIDER=http embedding function.
+
+    Async, OpenAI-compatible ``POST {base}/embeddings`` client with:
+    client-side prompt parity for embeddinggemma (see module docstring),
+    batching (HARS_MEMORY_EMBED_BATCH_SIZE capped by
+    HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST), automatic batch halving
+    on size-limit 400s, 429 Retry-After + 5xx/timeout retries, optional
+    pacing (HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS), Bearer auth, dim
+    validation against _KNOWN_DIMS, and per-call/per-run usage logging.
+
+    Returns an async callable ``(texts, context=None) -> ndarray (n, dim)
+    float32``, the exact contract of the in-process embedder.
+    """
+    import asyncio
+    import time
+
+    base_url = os.environ.get("HARS_MEMORY_EMBED_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError(
+            "HARS_MEMORY_EMBED_PROVIDER=http requires HARS_MEMORY_EMBED_BASE_URL "
+            "(e.g. 'http://127.0.0.1:8791/v1' for a shared llama.cpp embed "
+            "server, or 'https://api.openai.com/v1' for a hosted API). "
+            "Without a base URL there is no endpoint to call — failing loud "
+            "instead of silently falling back to the in-process model."
+        )
+    api_key = os.environ.get("HARS_MEMORY_EMBED_API_KEY", "").strip()
+    _explicit_http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip()
+    http_model = _explicit_http_model or model_name
+    timeout = float(os.environ.get("HARS_MEMORY_EMBED_HTTP_TIMEOUT", "60"))
+    batch_size = max(1, int(batch_size))
+    max_inputs_per_request = max(
+        1, int(os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST", "128"))
+    )
+    min_interval_s = max(0.0, float(os.environ.get("HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS", "0"))) / 1000.0
+    apply_prompts = _env_flag("HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS", True)
+    query_prompt_text = os.environ.get("HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT", _EMBEDDING_GEMMA_QUERY_PROMPT)
+    doc_prefix = os.environ.get("HARS_MEMORY_EMBED_DOC_PREFIX", "")
+
+    # A named prompt is a sentence-transformers CLIENT-side lookup into the
+    # model's prompts dict; a remote endpoint has no such concept.  Someone
+    # with HARS_MEMORY_EMBED_PROMPT_NAME set (e.g. embeddinggemma's
+    # "document") flipping provider to http would get silently different
+    # vectors — refuse instead.  (QUERY prompt is fine: it is configured as
+    # raw TEXT via HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT.)
+    _st_prompt_name = os.environ.get("HARS_MEMORY_EMBED_PROMPT_NAME", "").strip()
+    if _st_prompt_name:
+        raise RuntimeError(
+            f"HARS_MEMORY_EMBED_PROMPT_NAME={_st_prompt_name!r} cannot be honoured "
+            "in HARS_MEMORY_EMBED_PROVIDER=http mode: prompt_name is a "
+            "sentence-transformers client-side concept and a remote "
+            "/v1/embeddings endpoint only sees raw strings. Reproduce its effect "
+            "client-side via HARS_MEMORY_EMBED_QUERY_PROMPT_TEXT (query side) "
+            "and HARS_MEMORY_EMBED_DOC_PREFIX (document side), or unset "
+            "HARS_MEMORY_EMBED_PROMPT_NAME. Refusing to continue: silently "
+            "ignoring it would change the vector space with no error."
+        )
+    if not apply_prompts and doc_prefix:
+        logger.warning(
+            "HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS=0 disables ALL client-side "
+            "prefixing, including the configured "
+            "HARS_MEMORY_EMBED_DOC_PREFIX=%r — document texts will be sent raw.",
+            doc_prefix,
+        )
+
+    # Expected dimension from the offline table — the "server side" of the
+    # first-call validation.  When HARS_MEMORY_EMBED_HTTP_MODEL is explicitly
+    # set it names what the SERVER serves (its dim may legitimately differ
+    # from HARS_MEMORY_EMBED_MODEL's — e.g. google/ vs unsloth/ GGUF ids —
+    # so only the server id's entry applies); when unset both names coincide.
+    # None for unlisted models: the first response then DEFINES the run's
+    # dim, and lightrag_init's index check (via the _probe_remote_dim path in
+    # embedding_dimension) still guards the index side.
+    expected_dim = (
+        _known_dim(http_model) if _explicit_http_model else _known_dim(model_name)
+    )
+
+    # Per-run accumulation for the cost-visibility summary.  mutable dict →
+    # closable without nonlocal chains.
+    run = {
+        "dim": expected_dim,
+        "requests": 0,
+        "texts": 0,
+        "tokens": 0,
+        "tokens_known": True,  # False once a response omits usage.prompt_tokens
+        "last_request_at": 0.0,
+    }
+
+    logger.info(
+        "HTTP embedder: model=%r @ %s (batch=%d, max_inputs=%d, timeout=%.0fs, "
+        "apply_prompts=%s, min_interval=%.0fms, query_prompt=%r, doc_prefix=%r)",
+        http_model,
+        base_url,
+        batch_size,
+        max_inputs_per_request,
+        timeout,
+        apply_prompts,
+        min_interval_s * 1000.0,
+        query_prompt_text,
+        doc_prefix,
+    )
+
+    def _prefix_for(context: str | None) -> str:
+        """Client-side prefix reproducing the in-process ST behaviour.
+
+        Local mode prepends HARS_MEMORY_EMBED_DOC_PREFIX to EVERY text, then
+        ST prepends the query prompt ON TOP for context="query" — so query
+        strings are ``query_prompt + doc_prefix + text``.  With the defaults
+        ("" doc prefix) this reduces to the familiar ``query_prompt + text``.
+        HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS=0 sends texts raw (required for
+        non-embeddinggemma hosted models).
+        """
+        if not apply_prompts:
+            return ""
+        if context == "query":
+            return query_prompt_text + doc_prefix
+        return doc_prefix
+
+    async def _pace() -> None:
+        """Optional client-side pacing (HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS)."""
+        if min_interval_s <= 0.0:
+            return
+        now = time.monotonic()
+        wait = run["last_request_at"] + min_interval_s - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        run["last_request_at"] = time.monotonic()
+
+    def _check_dim(dim: int) -> None:
+        """Validate the server-side dim against expectations, naming the side.
+
+        First response: compared with the _KNOWN_DIMS expectation for
+        HARS_MEMORY_EMBED_MODEL / HARS_MEMORY_EMBED_HTTP_MODEL (when listed).
+        Every response: compared with the dim established earlier in this
+        run — catches the server swapping models mid-run.
+        """
+        if run["dim"] is None:
+            run["dim"] = dim
+            logger.info("Remote embedder dim resolved from first response: %d", dim)
+            return
+        if dim != run["dim"]:
+            if expected_dim is not None:
+                expected_origin = (
+                    f"from _KNOWN_DIMS for HARS_MEMORY_EMBED_MODEL={model_name!r} / "
+                    f"HARS_MEMORY_EMBED_HTTP_MODEL={http_model!r} — this also "
+                    "guards the dim baked into the existing index"
+                )
+            else:
+                expected_origin = "from this run's earlier responses"
+            raise RuntimeError(
+                f"Embedding dimension mismatch in HARS_MEMORY_EMBED_PROVIDER=http "
+                f"mode: the endpoint {base_url}/embeddings returned {dim}-dim "
+                f"vectors for model {http_model!r}, but {run['dim']}-dim vectors "
+                f"were expected ({expected_origin}). One side is wrong: either "
+                "the server is serving a different model than configured (fix "
+                "HARS_MEMORY_EMBED_BASE_URL / HARS_MEMORY_EMBED_HTTP_MODEL), or "
+                "the model name / index is inconsistent "
+                "(HARS_MEMORY_EMBED_MODEL). Guessing would silently embed into "
+                "the wrong vector space."
+            )
+
+    def _parse_embeddings(payload: dict, chunk_inputs: list[str]) -> list[list[float]]:
+        data = payload.get("data")
+        if not isinstance(data, list) or len(data) != len(chunk_inputs):
+            raise RuntimeError(
+                f"Malformed response from embedding endpoint {base_url}/embeddings "
+                f"(model={http_model!r}): expected data[{len(chunk_inputs)}], got "
+                f"{type(data).__name__}[{len(data) if isinstance(data, list) else '-'}]. "
+                "Is the endpoint really OpenAI-compatible "
+                "(HARS_MEMORY_EMBED_BASE_URL)?"
+            )
+        # OpenAI spec: entries carry their input position in "index" — order
+        # explicitly instead of trusting server ordering.
+        ordered = sorted(data, key=lambda e: int(e.get("index", 0)))
+        vecs: list[list[float]] = []
+        for entry in ordered:
+            vec = entry.get("embedding")
+            if not isinstance(vec, list) or not vec:
+                raise RuntimeError(
+                    f"Malformed response from embedding endpoint "
+                    f"{base_url}/embeddings: an entry has no usable 'embedding' "
+                    f"field ({type(vec).__name__}). Check "
+                    "HARS_MEMORY_EMBED_BASE_URL points at /v1 of an "
+                    "OpenAI-compatible embeddings server."
+                )
+            vecs.append(vec)
+        _check_dim(len(vecs[0]))
+        usage = payload.get("usage") or {}
+        tokens = usage.get("prompt_tokens")
+        if isinstance(tokens, (int, float)):
+            run["tokens"] += int(tokens)
+        else:
+            run["tokens_known"] = False
+        return vecs
+
+    async def _post_with_retries(client: object, chunk_inputs: list[str]) -> list[list[float]]:
+        """One POST /embeddings with transient-failure retries.
+
+        Retries (max _HTTP_MAX_ATTEMPTS attempts): timeout/transport errors,
+        5xx, and 429 (honouring Retry-After when present, exponential backoff
+        otherwise).  Any other 4xx fails immediately with the response body
+        in the message — retrying a 401/404/422 is pure latency.  A 400 whose
+        body looks like a batch/token-size overflow raises
+        _BatchSizeLimitError so the caller can halve the batch.
+        """
+        import httpx
+
+        url = f"{base_url}/embeddings"
+        payload = {"model": http_model, "input": chunk_inputs}
+        headers = _http_headers(api_key)
+        last_error: Exception | None = None
+
+        for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
+            await _pace()
+            try:
+                resp = await client.post(url, json=payload, headers=headers)  # type: ignore[attr-defined]
+            except httpx.TransportError as exc:  # timeouts included
+                last_error = exc
+                logger.warning(
+                    "Embedding request failed (attempt %d/%d) against %s: %s",
+                    attempt, _HTTP_MAX_ATTEMPTS, url, exc,
+                )
+            else:
+                if resp.status_code < 400:
+                    run["requests"] += 1
+                    return _parse_embeddings(resp.json(), chunk_inputs)
+                body = resp.text[:500]
+                if resp.status_code == 400 and _looks_like_size_limit_400(body):
+                    raise _BatchSizeLimitError(
+                        f"Embedding endpoint rejected a batch of {len(chunk_inputs)} "
+                        f"input(s) with 400 (looks like a size limit): {body}"
+                    )
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last_error = RuntimeError(f"HTTP {resp.status_code}: {body}")
+                    logger.warning(
+                        "Embedding endpoint returned HTTP %d (attempt %d/%d): %s",
+                        resp.status_code, attempt, _HTTP_MAX_ATTEMPTS, body,
+                    )
+                    retry_after = (
+                        _retry_after_seconds(resp.headers.get("retry-after"))
+                        if resp.status_code == 429
+                        else None
+                    )
+                    if attempt < _HTTP_MAX_ATTEMPTS:
+                        delay = (
+                            retry_after
+                            if retry_after is not None
+                            else _RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                        )
+                        if resp.status_code == 429 and retry_after is not None:
+                            logger.info(
+                                "Rate limited (429); honouring Retry-After=%.3fs",
+                                delay,
+                            )
+                        await asyncio.sleep(delay)
+                    continue
+                # Non-transient 4xx (401/403/404/422/...): retrying is pointless.
+                hint = (
+                    " — check HARS_MEMORY_EMBED_API_KEY"
+                    if resp.status_code in (401, 403)
+                    else ""
+                )
+                raise RuntimeError(
+                    f"Embedding endpoint {url} returned HTTP {resp.status_code}"
+                    f"{hint} (model={http_model!r}). Response body: {body}"
+                )
+            if attempt < _HTTP_MAX_ATTEMPTS:
+                delay = _RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning("Retrying embedding request in %.2fs", delay)
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"Embedding endpoint {url} (model={http_model!r}) failed after "
+            f"{_HTTP_MAX_ATTEMPTS} attempts; last error: {last_error}. Check that "
+            "the endpoint is reachable (HARS_MEMORY_EMBED_BASE_URL), authorised "
+            "(HARS_MEMORY_EMBED_API_KEY), serving the configured model "
+            "(HARS_MEMORY_EMBED_HTTP_MODEL), not rate limiting you (raise "
+            "HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS), and that "
+            "HARS_MEMORY_EMBED_HTTP_TIMEOUT is not too small."
+        )
+
+    async def _embed_chunk(client: object, chunk: list[str]) -> list[list[float]]:
+        """Embed one batch, halving it on size-limit 400s (max 2 halvings).
+
+        The halving re-splits into sub-POSTs while preserving order, so a
+        "maximum context length" 400 on a 64-input request degrades to 32+32
+        (then 16+16+16+16...) instead of failing the whole flush.
+        """
+        pending: list[tuple[list[str], int]] = [(chunk, 0)]
+        out: list[list[float]] = []
+        while pending:
+            seg, depth = pending.pop(0)
+            try:
+                out.extend(await _post_with_retries(client, seg))
+                continue
+            except _BatchSizeLimitError as exc:
+                if len(seg) == 1:
+                    raise RuntimeError(
+                        f"The embedding endpoint rejected a SINGLE input as too "
+                        f"large (model={http_model!r} @ {base_url}). The text "
+                        "cannot be split client-side: reduce chunk size "
+                        "(HARS_MEMORY_CHUNK_TOKEN_SIZE / HARS_MEMORY_EMBED_MAX_TOKENS) "
+                        "or raise the server context. Original 400: "
+                        f"{exc}"
+                    ) from exc
+                if depth >= 2:
+                    raise RuntimeError(
+                        f"Embedding endpoint still rejects size-limited batches "
+                        f"after 2 halvings (started at {len(chunk)} inputs, now "
+                        f"{len(seg)}; model={http_model!r} @ {base_url}). Lower "
+                        "HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST (currently "
+                        f"{max_inputs_per_request}) and/or reduce chunk size "
+                        "(HARS_MEMORY_CHUNK_TOKEN_SIZE / "
+                        "HARS_MEMORY_EMBED_MAX_TOKENS). Original 400: "
+                        f"{exc}"
+                    ) from exc
+                mid = len(seg) // 2
+                pending[0:0] = [(seg[:mid], depth + 1), (seg[mid:], depth + 1)]
+                logger.warning(
+                    "Batch of %d rejected as too large; halving into %d+%d and retrying",
+                    len(seg), mid, len(seg) - mid,
+                )
+        return out
+
+    async def embed(texts: list[str], context: str | None = None, **_kwargs: object) -> "np.ndarray":
+        import numpy as np
+
+        if not texts:
+            return np.zeros((0, run["dim"] or 0), dtype=np.float32)
+
+        # LightRAG (>=1.4.16) calls embedding_func(batch, context="document")
+        # at insert time and embedding_func([query], context="query") at query
+        # time; context=None (legacy callers) falls back to document-side
+        # behaviour — identical semantics to the in-process embedder above.
+        prefix = _prefix_for(context)
+        inputs = [prefix + t for t in texts] if prefix else list(texts)
+
+        # Effective per-request size: caller's batch size (HARS_MEMORY_EMBED_
+        # BATCH_SIZE, threaded through make_embedding_func) capped by the
+        # remote-API per-request input limit.
+        step = min(batch_size, max_inputs_per_request)
+
+        async with _make_async_client(timeout) as client:  # type: ignore[attr-defined]
+            vectors: list[list[float]] = []
+            for start in range(0, len(inputs), step):
+                vectors.extend(await _embed_chunk(client, inputs[start : start + step]))
+
+        run["texts"] += len(texts)
+        token_summary = (
+            f"{run['tokens']} prompt_tokens"
+            if run["tokens_known"]
+            else f">={run['tokens']} prompt_tokens (some responses omitted usage)"
+        )
+        logger.info(
+            "HTTP embedder run summary: %d requests, %d texts, %s (model=%r @ %s)",
+            run["requests"], run["texts"], token_summary, http_model, base_url,
+        )
+        return np.asarray(vectors, dtype=np.float32)
+
+    return embed
 
 
 @lru_cache(maxsize=1)
@@ -140,6 +784,14 @@ def make_embedding_func(
     async callable:
         ``async (texts: list[str]) -> numpy.ndarray`` of shape (n_texts, dim), dtype float32.
     """
+    # Provider selection FIRST: http mode must never touch the in-process
+    # model (sharing the embedder over HTTP is the entire point — loading
+    # SentenceTransformer here would negate the ~300–600 MB RAM saving).
+    # Default (no env vars set) falls through to the historic local path,
+    # byte-identical to pre-http-mode behaviour.
+    if _resolve_provider() == "http":
+        return _make_http_embedding_func(model_name=model_name, batch_size=batch_size)
+
     model = _load_model(model_name, hf_cache_dir, batch_size)
 
     _doc_prefix: str = os.environ.get("HARS_MEMORY_EMBED_DOC_PREFIX", "")
@@ -192,24 +844,40 @@ def embedding_dimension(model_name: str = "unsloth/embeddinggemma-300m") -> int:
     """Return the output dimension for a given sentence-transformers model.
 
     Resolution order:
-    1. Try to derive the dimension from the already-loaded (or loadable) model via
+    1. In HARS_MEMORY_EMBED_PROVIDER=http mode, NEVER load the in-process
+       model (that would negate the point of the shared embedder): use the
+       ``_KNOWN_DIMS`` entry for HARS_MEMORY_EMBED_MODEL /
+       HARS_MEMORY_EMBED_HTTP_MODEL, and only if the model is unlisted fall
+       back to ONE synchronous probe call against the endpoint.
+    2. Try to derive the dimension from the already-loaded (or loadable) model via
        ``get_sentence_embedding_dimension()`` — always authoritative.
-    2. Fall back to ``_KNOWN_DIMS`` for offline/cold-start fast-path.
-    3. Raise — a silent wrong-dimension guess is exactly the failure mode this
+    3. Fall back to ``_KNOWN_DIMS`` for offline/cold-start fast-path.
+    4. Raise — a silent wrong-dimension guess is exactly the failure mode this
        module exists to eliminate (see EmbeddingDimensionMismatchError below).
     """
-    # Fast-path offline fallback — covers models that haven't been loaded yet and
-    # models where loading might be undesired (e.g. during config validation).
-    _KNOWN_DIMS: dict[str, int] = {
-        "intfloat/e5-large-v2": 1024,
-        "intfloat/e5-base-v2": 768,
-        "intfloat/e5-small-v2": 384,
-        "BAAI/bge-m3": 1024,
-        "nomic-ai/nomic-embed-text-v1": 768,
-        "Qwen/Qwen3-Embedding-0.6B": 1024,
-        "google/embeddinggemma-300m": 768,
-        "unsloth/embeddinggemma-300m": 768,
-    }
+    if _resolve_provider() == "http":
+        # An explicitly-set HARS_MEMORY_EMBED_HTTP_MODEL names what the
+        # SERVER serves — its dim is the authority (it may legitimately
+        # differ from HARS_MEMORY_EMBED_MODEL's id).  Only fall back to the
+        # EMBED_MODEL name when no explicit server id is configured.
+        explicit_http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip()
+        known = _KNOWN_DIMS.get(explicit_http_model if explicit_http_model else model_name)
+        if known is not None:
+            return known
+        http_model = explicit_http_model or model_name
+        base_url = os.environ.get("HARS_MEMORY_EMBED_BASE_URL", "").strip().rstrip("/")
+        if not base_url:
+            raise RuntimeError(
+                "HARS_MEMORY_EMBED_PROVIDER=http requires HARS_MEMORY_EMBED_BASE_URL "
+                f"(model {model_name!r} / {http_model!r} is not in _KNOWN_DIMS, so the "
+                "dimension must come from the endpoint itself)."
+            )
+        return _probe_remote_dim(
+            base_url,
+            os.environ.get("HARS_MEMORY_EMBED_API_KEY", "").strip(),
+            http_model,
+            float(os.environ.get("HARS_MEMORY_EMBED_HTTP_TIMEOUT", "60")),
+        )
 
     # Prefer the model-derived dimension when the model is already cached in
     # _load_model (lru_cache).  This correctly handles any model not listed above.

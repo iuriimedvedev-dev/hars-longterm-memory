@@ -235,12 +235,79 @@ All model bindings are in `config/.env` (or environment variables). No code chan
 |---|---|---|
 | Extraction LLM | `HARS_MEMORY_EXTRACTOR_BASE_URL` + `HARS_MEMORY_EXTRACTOR_MODEL` | GPU-exclusive; update llama-server launch cmd |
 | Query LLM | `HARS_MEMORY_QUERY_BASE_URL` + `HARS_MEMORY_QUERY_MODEL` | Can be CPU if small |
-| Embedder | `HARS_MEMORY_EMBED_MODEL` | Changing the model changes the vector dimension — rebuild the index with `index.py --full` |
+| Embedder | `HARS_MEMORY_EMBED_MODEL` | Changing the model changes the vector dimension — rebuild the index with `index.py --full`. Or run it remote/shared: `HARS_MEMORY_EMBED_PROVIDER=http` (see next section) |
 | Vector backend | `HARS_MEMORY_VECTOR_STORAGE` | Current default: `QdrantVectorDBStorage` (since 2026-07-30); `NanoVectorDBStorage` for rollback |
 | Qdrant URL | `HARS_MEMORY_QDRANT_URL` | Dedicated `hars-memory-qdrant` compose service is `http://localhost:6335` |
 | Qdrant tenant | `HARS_MEMORY_QDRANT_COLLECTION` | NOT a collection name — the `workspace_id` tenant id in every payload/query filter |
 
 After swapping embedder: run `index.py --full` to rebuild all vectors.
+
+### Shared & hosted remote embedders (`HARS_MEMORY_EMBED_PROVIDER=http`)
+
+By default the embedder loads sentence-transformers in-process (~300–600 MB
+RAM). Setting `HARS_MEMORY_EMBED_PROVIDER=http` instead sends texts to an
+OpenAI-compatible `/v1/embeddings` endpoint — either a shared llama.cpp embed
+server (recommended: one embedder process for several services) or a hosted
+API. Query prompts / doc prefixes are applied CLIENT-SIDE so the vectors match
+the in-process model (full details in `hars_memory/server/embedder.py`'s
+docstring).
+
+**Point memory at the shared llama.cpp embed port (direct, not via the
+proxy — keeps memory availability decoupled from the proxy):**
+
+```bash
+HARS_MEMORY_EMBED_PROVIDER=http
+HARS_MEMORY_EMBED_BASE_URL=http://127.0.0.1:8791/v1
+HARS_MEMORY_EMBED_MODEL=unsloth/embeddinggemma-300m     # index-identity (dim guard)
+HARS_MEMORY_EMBED_HTTP_MODEL=google/embeddinggemma-300m # server-side GGUF id
+# HARS_MEMORY_EMBED_API_KEY=...        # optional Bearer (hosted APIs)
+# HARS_MEMORY_EMBED_HTTP_TIMEOUT=60
+# HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST=128
+# HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS=0
+```
+
+**Hosted remote embedders** (same protocol, "pennies per million tokens"):
+
+```bash
+# OpenAI — text-embedding-3-small (1536-dim, ~$0.02/1M tokens)
+HARS_MEMORY_EMBED_PROVIDER=http
+HARS_MEMORY_EMBED_BASE_URL=https://api.openai.com/v1
+HARS_MEMORY_EMBED_MODEL=text-embedding-3-small
+HARS_MEMORY_EMBED_HTTP_MODEL=text-embedding-3-small
+HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS=0   # REQUIRED: non-embeddinggemma model
+HARS_MEMORY_EMBED_API_KEY=sk-...
+
+# Mistral — mistral-embed (1024-dim, ~$0.1/1M tokens)
+HARS_MEMORY_EMBED_PROVIDER=http
+HARS_MEMORY_EMBED_BASE_URL=https://api.mistral.ai/v1
+HARS_MEMORY_EMBED_MODEL=mistral-embed
+HARS_MEMORY_EMBED_HTTP_MODEL=mistral-embed
+HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS=0   # REQUIRED
+HARS_MEMORY_EMBED_API_KEY=...
+
+# Jina — jina-embeddings-v3 (1024-dim, ~$0.02/1M tokens)
+HARS_MEMORY_EMBED_PROVIDER=http
+HARS_MEMORY_EMBED_BASE_URL=https://api.jina.ai/v1
+HARS_MEMORY_EMBED_MODEL=jina-embeddings-v3
+HARS_MEMORY_EMBED_HTTP_MODEL=jina-embeddings-v3
+HARS_MEMORY_EMBED_HTTP_APPLY_PROMPTS=0   # REQUIRED
+HARS_MEMORY_EMBED_API_KEY=...
+```
+
+> **⚠️ WARNING — vector-space safety.**
+> **Query-side-only** switches (query prompt text, `..._APPLY_PROMPTS`,
+> provider itself) are safe ANY TIME **only because** query vectors are never
+> stored — *provided the model is IDENTICAL to the one the index was built
+> with*. **Any model change on EITHER side (doc-side or query-side) is a
+> different vector space and requires a FULL re-embed** (`index.py --full`).
+> A different model is not a "prompt tweak" — `text-embedding-3-small` and
+> `embeddinggemma` share nothing but the HTTP protocol. The dimension guard
+> (`_KNOWN_DIMS` + index validation) catches mismatches loudly, but dim
+> equality does NOT imply vector-space equality: only re-embed after changing
+> models. Doc-side drift measured between the in-process and llama.cpp
+> backends of the SAME embeddinggemma model: cosine ≈ 0.9994–0.9997
+> (GGUF quantization noise) — sharing the 8791 port for query-side is safe;
+> do a full re-embed if you also move doc-side embedding to it.
 
 ---
 
