@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import networkx as nx
-import pytest
 
 from hars_memory.ingest.audit import audit_index
 
