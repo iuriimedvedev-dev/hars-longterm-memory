@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Remote/shared embedder mode: `HARS_MEMORY_EMBED_PROVIDER=http` sends texts to
+  an OpenAI-compatible `/v1/embeddings` endpoint instead of loading
+  sentence-transformers in-process (~300–600 MB RAM saved by sharing one
+  embedder, e.g. a llama.cpp `--embeddings` server or a hosted API). Query
+  prompts / doc prefixes are applied client-side for vector parity;
+  batching (`HARS_MEMORY_EMBED_BATCH_SIZE`,
+  `HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST` with automatic halving on
+  size-limit 400s), 429 `Retry-After` + 5xx retries, optional pacing
+  (`HARS_MEMORY_EMBED_HTTP_MIN_INTERVAL_MS`), Bearer auth
+  (`HARS_MEMORY_EMBED_API_KEY`), dimension validation against the index, and
+  token-usage cost logging. Default (no env vars) behaviour is unchanged.
+  See README "Shared & hosted remote embedders".
+
 ## [0.5.0] - 2026-10-13
 
 ### Added
