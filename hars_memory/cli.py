@@ -196,6 +196,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_extractor_bench(args: argparse.Namespace) -> int:
+    from hars_memory.eval.extractor_bench import main as extractor_bench_main
+
+    try:
+        extractor_bench_main(args.extractor_bench_argv)
+    except SystemExit as exc:
+        code = exc.code
+        return code if isinstance(code, int) else 1
+    return 0
+
+
 def _cmd_strategy_bench(args: argparse.Namespace) -> int:
     from hars_memory.eval.strategy_bench import StrategyBenchmarkError, run_strategy_matrix
     from hars_memory.strategies import StrategyConfigurationError, load_strategy_matrix
@@ -1147,6 +1158,17 @@ def _build_parser() -> argparse.ArgumentParser:
     strategy_p.add_argument("--config", required=True, type=Path)
     strategy_p.add_argument("--run-id", default=None)
     strategy_p.set_defaults(func=_cmd_strategy_bench)
+
+    extractor_p = sub.add_parser(
+        "extractor-bench",
+        help="Benchmark extractor LLMs (run/score/report over fixed docs).",
+    )
+    extractor_p.add_argument(
+        "extractor_bench_argv",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to memory-extractor-bench (run|score|report ...).",
+    )
+    extractor_p.set_defaults(func=_cmd_extractor_bench)
 
     # -- Servers --
     recall_p = sub.add_parser("recall", help="Query the LightRAG knowledge graph.")
