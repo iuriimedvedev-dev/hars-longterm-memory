@@ -51,7 +51,7 @@ def _compare(name: str, left_label: str, left: set, right_label: str, right: set
 def _rel_ids(edge: frozenset[str]) -> set[str]:
     from lightrag.utils import compute_mdhash_id
 
-    a, b = sorted(edge)
+    a, b = sorted(edge) * (2 if len(edge) == 1 else 1)  # a self-loop collapses to a 1-element set
     return {compute_mdhash_id(a + b, prefix="rel-"), compute_mdhash_id(b + a, prefix="rel-")}
 
 
