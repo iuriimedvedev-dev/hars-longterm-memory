@@ -3495,7 +3495,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             # not something this generic package should hardcode a path for.
             if not dry_run:
                 gpu_guard_script_path = os.environ.get("HARS_MEMORY_GPU_GUARD_SCRIPT_PATH", "").strip()
-                if os.environ.get("HARS_MEMORY_EXTRACTOR_PROVIDER", "local").strip().lower() != "local":
+                if (os.environ.get("HARS_MEMORY_EXTRACTOR_PROVIDER", "").strip().lower() or "local") != "local":
                     # Hosted extractor provider (e.g. openrouter): no local GPU is used.
                     logger.info("extractor provider is not local — GPU guard not applicable, skipping.")
                 elif not gpu_guard_script_path:

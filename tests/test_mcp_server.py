@@ -742,6 +742,22 @@ class TestMemoryConsolidateGpuGuard:
         assert json.loads(result[0].text)["ok"] is True
         assert captured.get("called") is True  # a blocking guard did NOT stop the hosted run
 
+    def test_empty_extractor_provider_still_runs_gpu_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+        import json
+
+        script = self._write_gpu_guard_script(tmp_path, raises=True)
+        mod = _load_mcp_module_with_env({"HARS_MEMORY_INDEX_DIR": str(tmp_path)})
+        monkeypatch.setenv("HARS_MEMORY_GPU_GUARD_SCRIPT_PATH", str(script))
+        monkeypatch.setenv("HARS_MEMORY_EXTRACTOR_PROVIDER", "")  # resolves to "local" in extractor_config
+        captured = self._install_fake_subprocess_run(monkeypatch)
+
+        result = asyncio.run(mod.call_tool("memory_consolidate", {"dry_run": False}))
+        assert "GPU is busy" in json.loads(result[0].text)["error"]
+        assert "called" not in captured
+
     def test_dry_run_never_checks_gpu_guard_even_if_configured_to_block(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
