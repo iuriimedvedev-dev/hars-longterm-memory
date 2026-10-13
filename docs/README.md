@@ -37,6 +37,7 @@ The `memory` command provides a unified interface for all subsystems:
 | `memory import <archive>` | Import index from a tar.gz archive |
 | `memory estimate-cost <paths>` | Estimate indexing cost before running (dry-run, no API calls) |
 | `memory strategy-bench` | Run strategy matrix benchmark |
+| `memory extractor-bench <run\|score\|report>` | Benchmark extractor LLMs on fixed docs |
 
 Examples:
 
@@ -60,6 +61,13 @@ memory import /tmp/hars-index-backup.tar.gz --index-dir /tmp/new-index
 # Estimate cost before indexing
 memory estimate-cost kb/ --model gpt-5.6-luna --chunk-size 2048 --batch-size 256
 memory estimate-cost kb/ --model deepseek-v3.2 --max-gleaning 1
+
+# Extractor LLM benchmark (fixed docs + reference entities in
+# hars_memory/eval/fixtures/extractor_bench_v1/; thinking is forced off via
+# chat_template_kwargs.enable_thinking=false, leaks fail the run)
+memory extractor-bench run --model qwen3.5-9b --out /tmp/bench-runs/qwen3.5-9b
+memory extractor-bench score --run-dir /tmp/bench-runs/qwen3.5-9b
+memory extractor-bench report --runs /tmp/bench-runs/*/ --out /tmp/bench-runs/report.txt
 ```
 
 Legacy entrypoints (`memory-index`, `memory-mcp`, `memory-grpc`, `hars-longterm-memory-server`, etc.) remain available for backward compatibility.

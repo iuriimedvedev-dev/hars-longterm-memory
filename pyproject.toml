@@ -98,6 +98,7 @@ memory-eval-battle = "hars_memory.cli:eval_battle_main"
 memory = "hars_memory.cli:main"
 hars-longterm-memory-server = "hars_memory.service.server:main"
 memory-strategy-bench = "hars_memory.eval.strategy_bench:main"
+memory-extractor-bench = "hars_memory.eval.extractor_bench:main"
 memory-grpc = "hars_memory.cli:grpc_main"
 hars-longterm-memory-grpc = "hars_memory.grpc.server:main"
 
