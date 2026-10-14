@@ -450,7 +450,7 @@ def create_lightrag(
         make_embedding_func,
         validate_embedder_against_index,
     )
-    from hars_memory.server.reranker import make_rerank_func
+    from hars_memory.server.reranker import make_rerank_func_from_env
     from hars_memory.schema.loader import DEFAULT_SCHEMA_PATH, load_schema
 
     # Entity/relation vocabulary + extraction guidance: generic package
@@ -538,26 +538,17 @@ def create_lightrag(
         batch_size=embed_batch_size,
     )
 
-    # Local CPU cross-encoder reranker (tools/memory/server/reranker.py).
-    # Unset HARS_MEMORY_RERANK_MODEL => rerank_model_func stays None and LightRAG's
-    # own enable_rerank=True default is a no-op (it warns and returns the
-    # original chunks) — i.e. today's behaviour is fully preserved.  Building
-    # the rerank_func here does NOT load the model (lazy-loaded on first
-    # actual rerank call) so this costs nothing when unset.
-    _rerank_model = os.environ.get("HARS_MEMORY_RERANK_MODEL", "")
-    rerank_func = None
-    if _rerank_model:
-        rerank_func = make_rerank_func(
-            model_name=_rerank_model,
-            device=os.environ.get("HARS_MEMORY_RERANK_DEVICE", "cpu"),
-            hf_cache_dir=_emb_cache,
-            # Default 1, not a larger batch: measured 2x FASTER on this corpus's
-            # long, length-variable chunks — see reranker.py's module docstring.
-            batch_size=int(os.environ.get("HARS_MEMORY_RERANK_BATCH_SIZE", "1")),
-            local_files_only=os.environ.get("HARS_MEMORY_RERANK_LOCAL_FILES_ONLY", "1").lower()
-            not in {"0", "false", "no"},
-        )
-        logger.info("Reranker configured: %s (lazy-loaded on first use)", _rerank_model)
+    # Reranker (hars_memory/server/reranker.py): provider dispatch lives there.
+    # Default (no BASE_URL / no MODEL) => rerank_model_func stays None and
+    # LightRAG's own enable_rerank=True default is a no-op (it warns and returns
+    # the original chunks) — i.e. the pre-reranker behaviour is fully preserved.
+    # "local" loads a CPU cross-encoder lazily on first use; "http" POSTs to a
+    # Cohere-style /rerank endpoint (e.g. the code-diver llama.cpp reranker on
+    # 127.0.0.1:8792).  Neither construction path loads a model or touches the
+    # network, so this costs nothing until the first actual rerank call.
+    from hars_memory.server.reranker import make_rerank_func_from_env
+
+    rerank_func = make_rerank_func_from_env(hf_cache_dir=_emb_cache)
     # LightRAG's own default (DEFAULT_MIN_RERANK_SCORE in lightrag/constants.py)
     # is already 0.0 in 1.4.16, i.e. no filtering. Resolved explicitly here
     # (HARS_MEMORY_ prefixed, falling back to LightRAG's bare MIN_RERANK_SCORE for
