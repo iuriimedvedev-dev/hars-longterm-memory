@@ -40,6 +40,9 @@ Environment variables (see config/.env.example):
                                             --refresh-changed content
                                             fingerprints (default: alongside
                                             HARS_MEMORY_INDEX_DIR)
+    HARS_MEMORY_CHUNKER_MODE                 - legacy (default) | md_struct;
+                                            see --chunker-mode. Unset keeps
+                                            LightRAG's token splitter.
 """
 
 from __future__ import annotations
@@ -129,6 +132,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Walk + count documents only — no LLM extraction, no DB writes.",
+    )
+    parser.add_argument(
+        "--chunker-mode",
+        choices=("legacy", "md_struct"),
+        default=None,
+        help=(
+            "Chunker switch (overrides HARS_MEMORY_CHUNKER_MODE for this run): "
+            "'legacy' keeps LightRAG's own token splitter (default, existing "
+            "indexes stay consistent); 'md_struct' chunks Markdown on section "
+            "boundaries (ingest/md_structure.py). Structural chunks change "
+            "chunk texts and therefore chunk ids — adopting md_struct needs a "
+            "full re-embed / re-index, not an incremental update."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -371,6 +387,12 @@ async def _insert_all_batches(
 
 
 async def _run_indexing(args: argparse.Namespace) -> None:
+    # --chunker-mode overrides HARS_MEMORY_CHUNKER_MODE for this run only
+    # (see server/lightrag_init.py for the legacy|md_struct resolution).
+    if getattr(args, "chunker_mode", None):
+        os.environ["HARS_MEMORY_CHUNKER_MODE"] = args.chunker_mode
+        logger.info("Chunker mode override from --chunker-mode: %s", args.chunker_mode)
+
     # GPU-guard moved to tools/memory-config/scripts/gpu_guard.py — Cortex's own
     # indexing wrapper (update_kb.sh) must call assert_gpu_free() before invoking
     # this CLI; the package itself no longer knows Cortex's GPU is a shared
