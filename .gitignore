@@ -29,3 +29,7 @@ experiments/**/cache/
 experiments/**/results/
 # session notes are local working notes: never tracked, never shipped
 .session/
+
+# Generated eval datasets (project-specific, not for commit)
+eval_agentic-data/
+eval_agentic/
