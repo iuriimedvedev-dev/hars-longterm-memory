@@ -447,6 +447,78 @@ except ValueError as exc:
 if not math.isfinite(HARS_MEMORY_RERANK_TIMEOUT_S) or HARS_MEMORY_RERANK_TIMEOUT_S <= 0:
     raise ValueError("HARS_MEMORY_RERANK_TIMEOUT_S must be > 0")
 
+# Per-document char cap on the text sent to the HTTP reranker. Huge documents
+# saturate cross-encoder scores (measured 2026-10-14, RCA eval_agentic/rca/RCA.md:
+# top-2 Qwen3-Reranker scores differed by 0.0008 — 0.9996 vs 0.9998 — on full
+# multi-k-char docs, i.e. no discriminative signal), while heads carry the
+# topical signal on this corpus. Applied inside rerank_http (see its
+# doc_char_limit), so the request body itself is bounded.
+try:
+    HARS_MEMORY_RERANK_HTTP_DOC_CHARS = int(
+        os.environ.get("HARS_MEMORY_RERANK_HTTP_DOC_CHARS", "2000")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_RERANK_HTTP_DOC_CHARS must be an integer") from exc
+if HARS_MEMORY_RERANK_HTTP_DOC_CHARS <= 0:
+    raise ValueError("HARS_MEMORY_RERANK_HTTP_DOC_CHARS must be > 0")
+
+# Margin-guarded rerank blending: the reranker's proposed order may only swap a
+# pair of documents whose FUSION scores differ by strictly less than this
+# margin (dense+BM25 fusion is min-max normalized per query, so its top hit is
+# ~1.0 for any query — a 0.15 margin keeps fusion-confident pairs locked while
+# letting the reranker break genuine near-ties). Measured rationale (RCA
+# 2026-10-14): the saturated reranker promoted a worst-in-pool doc (fusion
+# 0.0489) over the fusion-#1 gold doc (fusion 1.000); with the guard that swap
+# is refused. See _margin_guarded_rerank_blend for the exact rule.
+try:
+    HARS_MEMORY_RERANK_FUSION_MARGIN = float(
+        os.environ.get("HARS_MEMORY_RERANK_FUSION_MARGIN", "0.15")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_RERANK_FUSION_MARGIN must be a number") from exc
+if not math.isfinite(HARS_MEMORY_RERANK_FUSION_MARGIN) or HARS_MEMORY_RERANK_FUSION_MARGIN < 0:
+    raise ValueError("HARS_MEMORY_RERANK_FUSION_MARGIN must be a finite number >= 0")
+
+# Skip the HTTP rerank call entirely when fusion is already confident: if the
+# best fused_score in the pool is >= this threshold, dense and BM25 agree and
+# reranking can only add noise/latency (measured: fusion ranked the gold note
+# #1 while the reranker promoted the worst-in-pool doc; Qwen3-Reranker scores
+# saturate at ~0.999 for anything topical on this corpus). 0 disables the skip.
+try:
+    HARS_MEMORY_RERANK_SKIP_FUSION_SCORE = float(
+        os.environ.get("HARS_MEMORY_RERANK_SKIP_FUSION_SCORE", "0.9")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_RERANK_SKIP_FUSION_SCORE must be a number") from exc
+if not math.isfinite(HARS_MEMORY_RERANK_SKIP_FUSION_SCORE) or HARS_MEMORY_RERANK_SKIP_FUSION_SCORE < 0:
+    raise ValueError("HARS_MEMORY_RERANK_SKIP_FUSION_SCORE must be a finite number >= 0")
+
+# --- Context assembly budget (memory_recall, context_only merged path) --------
+# HARS_MEMORY_CONTEXT_MAX_CHARS: total rendered-char budget for the assembled
+# Document Chunks emission (whole-document granularity: once the next
+# document's block would not fit, assembly STOPS — no blind mid-context cut,
+# which is what amputated the gold note in the Q05 RCA failure). 0 (the
+# default) preserves the historical behaviour: no server-side total cap; the
+# only size controls were top_k and LightRAG's own token budgets.
+# HARS_MEMORY_CONTEXT_MAX_DOC_CHARS: per-document cap on the rendered block —
+# one mega-note could previously eat ~70% of the window (measured: a 17.7k-char
+# block in a 25k context, RCA Q05). A document over the cap is truncated at a
+# paragraph/line boundary (never mid-word) with a "…[truncated]" marker.
+try:
+    HARS_MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("HARS_MEMORY_CONTEXT_MAX_CHARS", "0"))
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_CONTEXT_MAX_CHARS must be an integer") from exc
+if HARS_MEMORY_CONTEXT_MAX_CHARS < 0:
+    raise ValueError("HARS_MEMORY_CONTEXT_MAX_CHARS must be >= 0")
+try:
+    HARS_MEMORY_CONTEXT_MAX_DOC_CHARS = int(
+        os.environ.get("HARS_MEMORY_CONTEXT_MAX_DOC_CHARS", "6000")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_CONTEXT_MAX_DOC_CHARS must be an integer") from exc
+if HARS_MEMORY_CONTEXT_MAX_DOC_CHARS < 0:
+    raise ValueError("HARS_MEMORY_CONTEXT_MAX_DOC_CHARS must be >= 0")
+
 ROUTING_MODES = ("off", "lang")
 HARS_MEMORY_ROUTING = os.environ.get("HARS_MEMORY_ROUTING", "off")
 if HARS_MEMORY_ROUTING not in ROUTING_MODES:
@@ -1122,6 +1194,53 @@ def _select_diverse_fused_chunks(
     return selected[:limit]
 
 
+def _margin_guarded_rerank_blend(
+    fusion_order: list[int],
+    rerank_order: list[int],
+    fusion_scores: dict[int, float],
+    margin: float,
+) -> tuple[list[int], int]:
+    """Blend the HTTP reranker's proposed order into the fusion order under a
+    fusion-score margin guard.
+
+    Exact rule (deterministic, testable):
+      1. Start from the FUSION ranking.
+      2. Walk it left-to-right with insertion sort whose comparison key is the
+         reranker's proposed preference (a candidate bubbles UP past its left
+         neighbour while that neighbour sits LATER in the reranker's order).
+      3. Each individual swap is applied ONLY if the two candidates' fusion
+         scores differ by strictly less than `margin` — i.e. the reranker may
+         only reorder pairs fusion was NOT confident about. When the guard
+         refuses a swap, bubbling for that candidate stops at that neighbour.
+      4. Returns (blended order, blocked_inversions): blocked_inversions counts
+         the pairs the guard overruled (reranker wanted the moving candidate
+         ahead, but |scoredifference| >= margin kept the neighbour ahead).
+
+    Tokens are caller-chosen (the http path passes pool POSITIONS, so duplicate
+    chunk_ids cannot collide); every token in fusion_order/rerank_order must
+    have an entry in fusion_scores. Tokens missing from rerank_order (should
+    not happen — the reranker ranks the whole pool or fails) sort last.
+    """
+    if not fusion_order:
+        return [], 0
+    last_rank = len(rerank_order)
+    rerank_rank = {token: rank for rank, token in enumerate(rerank_order)}
+    out = list(fusion_order)
+    blocked = 0
+    for i in range(1, len(out)):
+        current = out[i]
+        j = i - 1
+        while j >= 0 and rerank_rank.get(out[j], last_rank) > rerank_rank.get(current, last_rank):
+            if abs(fusion_scores[out[j]] - fusion_scores[current]) < margin:
+                out[j + 1] = out[j]
+                out[j] = current
+                j -= 1
+            else:
+                blocked += 1
+                break
+    return out, blocked
+
+
 def _ripgrep_term_is_specific(term: str) -> bool:
     """Return whether a ripgrep term matches a high-specificity shape."""
     has_upper = any(char.isupper() for char in term)
@@ -1553,22 +1672,69 @@ async def _compute_hybrid_block(
             if not pool_to_rerank:
                 rerank_status["fallback_reason"] = "empty_pool"
             else:
-                from hars_memory.retrieval.http_rerank import rerank_http
+                # Confident-fusion skip (Fix 3, RCA 2026-10-14): dense+BM25
+                # agreeing at the top of the pool means fusion already ranked
+                # the best candidate #1; the saturated HTTP reranker could only
+                # overturn it (and did — it promoted the worst-in-pool doc).
+                # fusion's min-max normalization pins the top fused_score near
+                # 1.0 whenever both channels retrieve the same chunk, so the
+                # threshold reads as "both channels agree on the winner".
+                max_fusion_score = max(chunk.fused_score for chunk in pool_to_rerank)
+                rerank_status["max_fusion_score"] = round(max_fusion_score, 4)
+                if (
+                    HARS_MEMORY_RERANK_SKIP_FUSION_SCORE > 0
+                    and max_fusion_score >= HARS_MEMORY_RERANK_SKIP_FUSION_SCORE
+                ):
+                    rerank_status["fallback_reason"] = "fusion_confident"
+                    rerank_status["skip_threshold"] = HARS_MEMORY_RERANK_SKIP_FUSION_SCORE
+                    logger.info(
+                        "Skipping HTTP rerank: fusion already confident "
+                        "(max fused_score %.4f >= %.2f)",
+                        max_fusion_score,
+                        HARS_MEMORY_RERANK_SKIP_FUSION_SCORE,
+                    )
+                else:
+                    from hars_memory.retrieval.http_rerank import rerank_http
 
-                rerank_start = time.monotonic()
-                indices, fallback_reason = await rerank_http(
-                    question,
-                    [chunk.content for chunk in pool_to_rerank],
-                    url=HARS_MEMORY_RERANK_HTTP_URL,
-                    model=HARS_MEMORY_RERANK_HTTP_MODEL,
-                    timeout_s=HARS_MEMORY_RERANK_TIMEOUT_S,
-                )
-                rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
-                rerank_status["latency_ms"] = round(rerank_elapsed_ms, 2)
-                rerank_status["fallback_reason"] = fallback_reason
-                if indices is not None:
-                    fused = [pool_to_rerank[index] for index in indices] + fused[len(pool_to_rerank):]
-                    rerank_status["applied"] = True
+                    rerank_start = time.monotonic()
+                    indices, fallback_reason = await rerank_http(
+                        question,
+                        [chunk.content for chunk in pool_to_rerank],
+                        url=HARS_MEMORY_RERANK_HTTP_URL,
+                        model=HARS_MEMORY_RERANK_HTTP_MODEL,
+                        timeout_s=HARS_MEMORY_RERANK_TIMEOUT_S,
+                        doc_char_limit=HARS_MEMORY_RERANK_HTTP_DOC_CHARS,
+                    )
+                    rerank_elapsed_ms = (time.monotonic() - rerank_start) * 1000.0
+                    rerank_status["latency_ms"] = round(rerank_elapsed_ms, 2)
+                    rerank_status["fallback_reason"] = fallback_reason
+                    if indices is not None:
+                        # Margin-guarded blending (Fix 2, RCA 2026-10-14): the
+                        # reranker's saturated ~0.999-vs-0.999 ordering may no
+                        # longer REPLACE fusion wholesale — see
+                        # _margin_guarded_rerank_blend for the exact rule. The
+                        # blend starts from the fusion order, so fusion-confident
+                        # pairs can never be flipped by a sub-margin score gap.
+                        blended_positions, blocked_inversions = _margin_guarded_rerank_blend(
+                            list(range(len(pool_to_rerank))),
+                            list(indices),
+                            {
+                                position: chunk.fused_score
+                                for position, chunk in enumerate(pool_to_rerank)
+                            },
+                            HARS_MEMORY_RERANK_FUSION_MARGIN,
+                        )
+                        fused = [pool_to_rerank[i] for i in blended_positions] + fused[len(pool_to_rerank):]
+                        rerank_status["applied"] = True
+                        rerank_status["fusion_margin"] = HARS_MEMORY_RERANK_FUSION_MARGIN
+                        rerank_status["blocked_inversions"] = blocked_inversions
+                        if blocked_inversions:
+                            logger.info(
+                                "Rerank margin guard overruled the reranker for "
+                                "%d inversion(s) (margin=%.2f)",
+                                blocked_inversions,
+                                HARS_MEMORY_RERANK_FUSION_MARGIN,
+                            )
         elif rerank_backend == "local" and rerank_func:
             pool_to_rerank = fused[:pool_size]
             rerank_status["pool"] = len(pool_to_rerank)
@@ -2039,6 +2205,36 @@ def _truncate_on_word_boundary(text: str, max_chars: int) -> str:
     return cut.rstrip() + "…"
 
 
+# Appended to every budget-truncated context document so a caller can SEE the
+# cut instead of silently losing the tail.
+CONTEXT_TRUNCATION_MARKER = "…[truncated]"
+
+
+def _truncate_on_line_boundary(text: str, max_chars: int) -> str:
+    """Truncate to at most max_chars at a paragraph/line boundary (never
+    mid-word), appending CONTEXT_TRUNCATION_MARKER.
+
+    Prefers the last newline in the kept region; falls back to the last space;
+    only a single unbroken token longer than the whole budget is cut hard (no
+    boundary exists to honour). The marker length is reserved from the budget,
+    so the result never exceeds max_chars.
+    """
+    if len(text) <= max_chars:
+        return text
+    keep = max_chars - len(CONTEXT_TRUNCATION_MARKER)
+    if keep <= 0:
+        return CONTEXT_TRUNCATION_MARKER
+    cut = text[:keep]
+    newline = cut.rfind("\n")
+    if newline > 0:
+        cut = cut[:newline]
+    else:
+        space = cut.rfind(" ")
+        if space > 0:
+            cut = cut[:space]
+    return cut.rstrip() + CONTEXT_TRUNCATION_MARKER
+
+
 def _sanitize_for_json(obj: Any, max_depth: int = 5, _depth: int = 0) -> Any:
     """Recursively sanitize a LightRAG result dict for JSON serialization.
     
@@ -2317,15 +2513,42 @@ def _representative_content(
 
 
 def _merge_context_with_fusion(
-    context: str, fused_chunks: list[dict[str, Any]], limit: int
+    context: str,
+    fused_chunks: list[dict[str, Any]],
+    limit: int,
+    max_doc_chars: int | None = None,
+    max_chars: int | None = None,
 ) -> tuple[str, bool]:
     """Reorder/augment `context`'s Document Chunks + Reference Document List
     sections into round-robin(fusion, lightrag) document order.
+
+    Budget controls (Fix 1, RCA 2026-10-14 — one mega-note could previously
+    emit a ~17.7k-char block and push later documents past any caller's
+    window):
+      * `max_doc_chars` (default HARS_MEMORY_CONTEXT_MAX_DOC_CHARS, 6000):
+        per-document cap on the RENDERED content — a document whose chunks
+        exceed it is truncated at a paragraph/line boundary (never mid-word)
+        with a "…[truncated]" marker, and its remaining chunks are dropped.
+        0 disables the per-document cap.
+      * `max_chars` (default HARS_MEMORY_CONTEXT_MAX_CHARS, 0 = no cap, the
+        historical behaviour): total rendered-char budget for the assembled
+        chunk emission. Assembly stays fused-rank order and stops BEFORE the
+        first document that would not fit — whole-document granularity, never
+        a blind mid-buffer cut. The first document is always emitted (bounded
+        by the per-document cap when enabled), so a budget smaller than one
+        document degrades to that single document rather than to nothing.
+
+    None resolves to the env-derived module default; the MCP `max_chars`
+    argument overrides the total budget per call.
 
     Returns (new_context, applied). applied=False (context returned
     unchanged) if either fenced section is missing or the merge would be a
     no-op — fails closed, matching _postprocess_context's contract.
     """
+    if max_doc_chars is None:
+        max_doc_chars = HARS_MEMORY_CONTEXT_MAX_DOC_CHARS
+    if max_chars is None:
+        max_chars = HARS_MEMORY_CONTEXT_MAX_CHARS
     chunks_block = _extract_fenced_block(context, _CONTEXT_CHUNK_SECTION_HEADER)
     refs_block = _extract_fenced_block(context, _CONTEXT_REFERENCE_SECTION_HEADER)
     if chunks_block is None or refs_block is None:
@@ -2433,11 +2656,30 @@ def _merge_context_with_fusion(
         used_ref_ids.add(ref_id)
         return ref_id
 
-    new_chunk_lines: list[str] = []
-    new_ref_lines: list[str] = []
+    # Emit per-DOCUMENT groups first, then apply the budgets: the per-doc cap
+    # bounds each group's rendered size, the total budget then admits whole
+    # groups in fused-rank order until it is exhausted (no mid-document cut).
+    doc_block_pairs: list[list[tuple[str, str]]] = []
+    doc_block_sizes: list[int] = []
+    docs_truncated = 0
     for path in merged_order:
+        pairs: list[tuple[str, str]] = []
+        used_chars = 0
         emitted_contents: list[str] = []
+        truncated_this_doc = False
+
+        def _fit_to_doc_budget(content: str) -> str:
+            """Shrink `content` to the per-document budget once this document's
+            emitted chunks fill it (never mid-word; marker appended)."""
+            nonlocal truncated_this_doc
+            if not max_doc_chars or used_chars + len(content) <= max_doc_chars:
+                return content
+            truncated_this_doc = True
+            return _truncate_on_line_boundary(content, max(0, max_doc_chars - used_chars))
+
         for chunk in chunks_by_path.get(path, []):
+            if max_doc_chars and used_chars >= max_doc_chars:
+                break
             own_ref_id = str(chunk.get("reference_id", ""))
             if own_ref_id and own_ref_id not in emitted_ref_ids:
                 ref_id = own_ref_id
@@ -2445,31 +2687,34 @@ def _merge_context_with_fusion(
                 ref_id = _allocate_ref_id()
             emitted_ref_ids.add(ref_id)
             emitted = dict(chunk)
+            content = _fit_to_doc_budget(str(emitted.get("content", "")))
+            emitted["content"] = content
             emitted["reference_id"] = ref_id
-            emitted["section"] = _extract_breadcrumb_from_content(
-                str(emitted.get("content", ""))
-            )
-            emitted_contents.append(str(emitted.get("content", "")))
-            new_chunk_lines.append(json.dumps(emitted, ensure_ascii=False))
-            new_ref_lines.append(f"[{ref_id}] {path}")
+            emitted["section"] = _extract_breadcrumb_from_content(content)
+            emitted_contents.append(content)
+            chunk_line = json.dumps(emitted, ensure_ascii=False)
+            ref_line = f"[{ref_id}] {path}"
+            pairs.append((chunk_line, ref_line))
+            used_chars += len(content)
         # Fusion-exclusive document: LightRAG's own context never surfaced it,
         # so every one of its fusion chunks is injected — full chunk content
         # when the hybrid channel provides it, snippet otherwise. Documents
         # LightRAG already emitted keep LightRAG's own (fuller) chunks only,
         # exactly as before, to avoid duplicating the same content twice.
-        if chunks_by_path.get(path):
-            continue
-        for fused_chunk in fusion_by_path.get(path, []):
-            content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
-            if not content.strip():
-                continue
-            if any(_content_covered(content, existing) for existing in emitted_contents):
-                continue
-            ref_id = _allocate_ref_id()
-            emitted_ref_ids.add(ref_id)
-            emitted_contents.append(content)
-            new_chunk_lines.append(
-                json.dumps(
+        if not chunks_by_path.get(path):
+            for fused_chunk in fusion_by_path.get(path, []):
+                if max_doc_chars and used_chars >= max_doc_chars:
+                    break
+                content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
+                if not content.strip():
+                    continue
+                if any(_content_covered(content, existing) for existing in emitted_contents):
+                    continue
+                content = _fit_to_doc_budget(content)
+                ref_id = _allocate_ref_id()
+                emitted_ref_ids.add(ref_id)
+                emitted_contents.append(content)
+                chunk_line = json.dumps(
                     {
                         "reference_id": ref_id,
                         "content": content,
@@ -2477,8 +2722,45 @@ def _merge_context_with_fusion(
                     },
                     ensure_ascii=False,
                 )
+                ref_line = f"[{ref_id}] {path}"
+                pairs.append((chunk_line, ref_line))
+                used_chars += len(content)
+        if truncated_this_doc:
+            docs_truncated += 1
+        if pairs:
+            doc_block_pairs.append(pairs)
+            doc_block_sizes.append(
+                sum(len(chunk_line) + len(ref_line) + 2 for chunk_line, ref_line in pairs)
             )
-            new_ref_lines.append(f"[{ref_id}] {path}")
+
+    # Total budget: whole-document granularity — stop before the first document
+    # that would not fit entirely (the first document is always admitted so a
+    # tiny budget degrades to one bounded document, never to an empty context).
+    kept_pairs: list[list[tuple[str, str]]] = []
+    total_chars = 0
+    docs_dropped = 0
+    for pairs, size in zip(doc_block_pairs, doc_block_sizes):
+        if max_chars and kept_pairs and total_chars + size > max_chars:
+            docs_dropped = len(doc_block_pairs) - len(kept_pairs)
+            break
+        kept_pairs.append(pairs)
+        total_chars += size
+    if docs_dropped:
+        logger.info(
+            "Context budget %d chars reached after %d document(s); dropped %d later document(s)",
+            max_chars,
+            len(kept_pairs),
+            docs_dropped,
+        )
+    if docs_truncated:
+        logger.info(
+            "Per-document cap %d chars truncated %d document(s) in assembled context",
+            max_doc_chars,
+            docs_truncated,
+        )
+
+    new_chunk_lines: list[str] = [line for pairs in kept_pairs for line, _ in pairs]
+    new_ref_lines: list[str] = [line for pairs in kept_pairs for _, line in pairs]
 
     if not new_chunk_lines:
         return context, False
@@ -2618,6 +2900,23 @@ async def list_tools() -> list[Tool]:
                     "description": "Return the retrieved graph context (entities/relations/chunks) "
                                    "WITHOUT running the local answer LLM. Default True: the calling "
                                    "agent synthesises the answer itself, which beats the small local LLM.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Caller-side TOTAL char budget for the assembled `context` text "
+                        "(context_only=true). Applied by the context assembly (context_priority="
+                        f"'{CONTEXT_PRIORITY_MERGED}', the default): documents stay in fused-rank "
+                        "order and assembly stops BEFORE the first whole document that would not "
+                        "fit — no mid-context truncation, so nothing is amputated halfway. Each "
+                        "document's block is additionally capped at "
+                        "HARS_MEMORY_CONTEXT_MAX_DOC_CHARS chars (default 6000, line-boundary "
+                        "truncation with a '…[truncated]' marker) regardless of this argument. "
+                        "Omit or pass 0 for the default: no total cap "
+                        "(HARS_MEMORY_CONTEXT_MAX_CHARS, default 0 = the historical behaviour). "
+                        "Pass e.g. 15000 when your harness window is 15k chars."
+                    ),
                 },
                 "context_priority": {
                     "type": "string",
@@ -3003,6 +3302,16 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "error": f"view must be '{RECALL_VIEW_FULL}' or '{RECALL_VIEW_LEAN}'",
                 })
             context_priority = str(args.get("context_priority", DEFAULT_CONTEXT_PRIORITY))
+            max_chars_arg = args.get("max_chars")
+            if max_chars_arg is not None:
+                if isinstance(max_chars_arg, bool) or not isinstance(max_chars_arg, int):
+                    return json_text({
+                        "ok": False,
+                        "error": "max_chars must be an integer (total rendered-char budget "
+                                 "for the assembled context; 0 = no cap)",
+                    })
+                if max_chars_arg < 0:
+                    return json_text({"ok": False, "error": "max_chars must be >= 0"})
             ll_keywords = [str(k) for k in (args.get("ll_keywords") or [])]
             hl_keywords = [str(k) for k in (args.get("hl_keywords") or [])]
             # Pre-supplied keywords skip LightRAG's keyword-extraction LLM call
@@ -3108,7 +3417,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         context_for_response = _postprocess_context(context)
                         if context_priority == CONTEXT_PRIORITY_MERGED:
                             merged_context, applied = _merge_context_with_fusion(
-                                context_for_response, hybrid_block.get("fused_chunks") or [], top_k
+                                context_for_response,
+                                hybrid_block.get("fused_chunks") or [],
+                                top_k,
+                                max_chars=max_chars_arg,
                             )
                             if applied:
                                 context_for_response = merged_context

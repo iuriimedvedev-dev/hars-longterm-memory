@@ -157,6 +157,9 @@ def _hybrid_module(tmp_path: Any, monkeypatch: Any, env: dict[str, str]) -> Any:
         "HARS_MEMORY_RERANK_HTTP_MODEL",
         "HARS_MEMORY_RERANK_POOL",
         "HARS_MEMORY_RERANK_TIMEOUT_S",
+        "HARS_MEMORY_RERANK_HTTP_DOC_CHARS",
+        "HARS_MEMORY_RERANK_FUSION_MARGIN",
+        "HARS_MEMORY_RERANK_SKIP_FUSION_SCORE",
     ):
         if key not in env:
             monkeypatch.delenv(key, raising=False)
@@ -198,6 +201,11 @@ def _fake_rag() -> Any:
 
 
 def test_compute_hybrid_http_reranks_prefix_and_preserves_tail(tmp_path: Any, monkeypatch: Any) -> None:
+    """The reranker reorders the pool prefix, the tail is preserved — but only
+    WITHIN the fusion-score margin (chunk-0 vs chunk-1 differ by 0.5, far above
+    the default margin, so the proposed swap of the fusion-#1 chunk is refused
+    and only reported as a blocked inversion)."""
+
     def respond(payload: dict[str, Any]) -> tuple[int, bytes, float]:
         assert payload["documents"] == ["document 0", "document 1"]
         return _json_response({"results": [
@@ -210,6 +218,9 @@ def test_compute_hybrid_http_reranks_prefix_and_preserves_tail(tmp_path: Any, mo
             "HARS_MEMORY_RERANK_BACKEND": "http",
             "HARS_MEMORY_RERANK_HTTP_URL": url,
             "HARS_MEMORY_RERANK_POOL": "2",
+            # the fake rag's top fused score is 1.0; disable the confident-fusion
+            # skip so this test keeps exercising the rerank endpoint itself
+            "HARS_MEMORY_RERANK_SKIP_FUSION_SCORE": "0",
         })
         rag = _fake_rag()
         local_calls: list[bool] = []
@@ -221,11 +232,15 @@ def test_compute_hybrid_http_reranks_prefix_and_preserves_tail(tmp_path: Any, mo
         rag.rerank_model_func = local_rerank
         result = asyncio.run(mod._compute_hybrid_block(rag, "question", 3))
 
+    # fusion scores: chunk-0 = 1.0, chunk-1 = 0.5 (min-max over distances
+    # 1.0/0.9/0.8). |1.0 - 0.5| >= margin → the reranker's swap is blocked and
+    # the fusion order survives intact.
     assert [chunk["chunk_id"] for chunk in result["fused_chunks"]] == [
-        "chunk-1", "chunk-0", "chunk-2",
+        "chunk-0", "chunk-1", "chunk-2",
     ]
     assert result["rerank"]["backend"] == "http"
     assert result["rerank"]["applied"] is True
+    assert result["rerank"]["blocked_inversions"] == 1
     assert result["rerank"]["latency_ms"] is not None
     assert result["rerank"]["pool"] == 2
     assert result["latency_ms"]["rerank_channel"] is not None
@@ -336,6 +351,7 @@ def test_http_timeout_status_preserves_original_order(tmp_path: Any, monkeypatch
             "HARS_MEMORY_RERANK_BACKEND": "http",
             "HARS_MEMORY_RERANK_HTTP_URL": url,
             "HARS_MEMORY_RERANK_TIMEOUT_S": "0.03",
+            "HARS_MEMORY_RERANK_SKIP_FUSION_SCORE": "0",
         })
         result = asyncio.run(mod._compute_hybrid_block(_fake_rag(), "question", 3))
 
