@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
 ### Added
 
 - Remote/shared embedder mode: `HARS_MEMORY_EMBED_PROVIDER=http` sends texts to
@@ -20,6 +22,43 @@ All notable changes to this project are documented here. The format follows
   (`HARS_MEMORY_EMBED_API_KEY`), dimension validation against the index, and
   token-usage cost logging. Default (no env vars) behaviour is unchanged.
   See README "Shared & hosted remote embedders".
+- Remote/shared reranker mode: `HARS_MEMORY_RERANK_PROVIDER=http` sends rerank
+  calls to a Cohere-style `POST {BASE_URL}/rerank` endpoint (verified against
+  llama.cpp `/v1/rerank`; same code-diver endpoint the MCP fusion rerank uses)
+  instead of loading a cross-encoder in-process. Chunked requests, client-side
+  `top_n` after merge, 429 `Retry-After` + 5xx retries, optional pacing, Bearer
+  auth, run-summary logs. `auto` (default) selects http when
+  `HARS_MEMORY_RERANK_BASE_URL` is set, local when `HARS_MEMORY_RERANK_MODEL`
+  is set, disabled otherwise. See README "Shared & hosted remote rerankers".
+- Structure-aware Markdown chunking: `HARS_MEMORY_CHUNKER_MODE=md_struct`
+  (or `index --chunker-mode md_struct`, new `ingest/md_structure.py`) chunks
+  notes on section boundaries with breadcrumb prefixes, frontmatter parsing,
+  fence-aware headings, table row-blocks and per-note manifests for future
+  section routing. Default `legacy` is byte-identical to before. Adopting
+  `md_struct` changes chunk texts/ids and needs a full re-embed, not an
+  incremental update.
+- Extractor benchmark tool: `memory extractor-bench run/score/report` over
+  fixed fixtures (`eval/fixtures/extractor_bench_v1/`) with a thinking-leak
+  guard, for comparing extractor LLMs.
+- `memory_recall` accepts an optional `max_chars` argument sizing the returned
+  context; context assembly caps each document block
+  (`HARS_MEMORY_CONTEXT_MAX_DOC_CHARS`, default 6000, truncated at line
+  boundaries) and admits whole documents within the total budget
+  (`HARS_MEMORY_CONTEXT_MAX_CHARS`) — no more mid-buffer amputations.
+- Rerank quality guards in the MCP fusion path: per-request document truncation
+  (`HARS_MEMORY_RERANK_HTTP_DOC_CHARS`, default 2000), margin-guarded blending
+  (`HARS_MEMORY_RERANK_FUSION_MARGIN`, default 0.15 — a saturated reranker can
+  no longer promote a worst-in-pool doc past a confident fusion top-1), and
+  rerank-skip when fusion is already confident
+  (`HARS_MEMORY_RERANK_SKIP_FUSION_SCORE`, default 0.9).
+
+### Fixed
+
+- `memory recall` no longer crashes with `TypeError` when
+  `hybrid.identifier_matches` is `None` (treat `None` as empty).
+- Bridge servability: supergateway now runs `--stateful` (one stdio child per
+  bridge instead of one per request — removes the 13–15 s per-call LightRAG
+  re-init; see `cortex/scripts/hars-longterm-memory-mcp-http.sh`).
 
 ## [0.5.0] - 2026-10-13
 
