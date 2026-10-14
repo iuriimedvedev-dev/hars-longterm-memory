@@ -75,8 +75,14 @@ async def rerank_http(
     url: str = DEFAULT_RERANK_URL,
     model: str = DEFAULT_RERANK_MODEL,
     timeout_s: float = 8.0,
+    doc_char_limit: int = DOCUMENT_CHAR_LIMIT,
 ) -> tuple[list[int] | None, str | None]:
     """Return ranked document indices, or ``(None, reason)`` on any failure.
+
+    Each document is truncated to ``doc_char_limit`` chars in the request body:
+    huge documents saturate cross-encoder scores (they add latency and destroy
+    the score spread without adding signal — see
+    HARS_MEMORY_RERANK_HTTP_DOC_CHARS in mcp_server.py for the measurement).
 
     The HTTP request is made once. The explicit ``wait_for`` complements the
     transport timeout so the caller has a hard upper bound even if a transport
@@ -90,7 +96,7 @@ async def rerank_http(
         payload = {
             "model": model,
             "query": query,
-            "documents": [document[:DOCUMENT_CHAR_LIMIT] for document in documents],
+            "documents": [document[: max(0, doc_char_limit)] for document in documents],
         }
 
         async def post() -> list[int]:
