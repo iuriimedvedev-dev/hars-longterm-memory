@@ -309,6 +309,45 @@ HARS_MEMORY_EMBED_API_KEY=...
 > (GGUF quantization noise) — sharing the 8791 port for query-side is safe;
 > do a full re-embed if you also move doc-side embedding to it.
 
+### Shared & hosted remote rerankers
+
+Two independent rerank layers exist. **Enable ONE of them, not both** (both
+together rerank the same query twice at ~2x latency for no quality gain).
+
+**1. MCP fusion rerank (recommended, pre-existing).** Reranks the fused pool
+(vector + BM25 + channels) after fusion - fail-soft, falls back to unranked
+order with fallback_reason on any error:
+
+```bash
+HARS_MEMORY_RERANK_BACKEND=http
+HARS_MEMORY_RERANK_HTTP_URL=http://127.0.0.1:8792/v1/rerank   # code-diver llama.cpp
+HARS_MEMORY_RERANK_HTTP_MODEL=Qwen3-Reranker-0.6B
+HARS_MEMORY_RERANK_POOL=10        # docs per rerank call (latency scales with pool size)
+HARS_MEMORY_RERANK_TIMEOUT_S=30   # CPU cross-encoder needs headroom: 10 docs ~ 9-17s
+```
+
+Measured on this workstation (Qwen3-Reranker-0.6B, llama.cpp CPU, ~2500-char
+docs): 10 docs ~ 9-17 s, 20 docs ~ 13 s - the old 8 s default always timed out.
+Every recall pays this latency while HARS_MEMORY_RERANK_BACKEND=http is set;
+drop the variable to disable.
+
+**2. LightRAG-level rerank** (HARS_MEMORY_RERANK_PROVIDER, added with the
+embedder http mode): reranks inside LightRAG retrieval, before fusion - useful
+for CLI/graph-only paths. Set HARS_MEMORY_RERANK_BASE_URL (Cohere-style
+POST {BASE_URL}/rerank; the same code-diver endpoint works:
+http://127.0.0.1:8792/v1) and optionally HARS_MEMORY_RERANK_HTTP_MODEL.
+Score scales differ per backend (llama.cpp: sigmoid [0,1]; local ettin
+cross-encoder: raw logits) - HARS_MEMORY_MIN_RERANK_SCORE is not portable
+between them. See hars_memory/server/reranker.py for the full env matrix.
+
+> Note: with layer 2 configured and layer 1 unset, the MCP fusion falls back to
+> backend local semantics and reranks the fused pool with the same function -
+> still a single rerank. Only explicit BACKEND=http + PROVIDER=http together
+> would rerank twice.
+
+---
+
+
 ---
 
 ## MCP tool usage (from an AI session)
