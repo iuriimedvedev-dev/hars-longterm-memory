@@ -16,17 +16,27 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 CHUNKS_FILENAME = "kv_store_text_chunks.json"
-LOCATION_KEYS = ("source_path", "heading_path", "section", "start_line", "end_line")
+LOCATION_KEYS = (
+    "source_path",
+    "heading_path",
+    "section",
+    "start_line",
+    "end_line",
+    "section_depth",
+    "is_code_heavy",
+)
 
 # working-dir -> (mtime, {chunk_id: location dict})
 _cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 
 
 def load_chunk_locations(working_dir: str | Path) -> dict[str, dict[str, Any]]:
-    """Return ``{chunk_id: {source_path, heading_path, section, start_line, end_line}}``.
+    """Return ``{chunk_id: {source_path, heading_path, section, start_line, end_line, ...}}``.
 
     Chunks with no location metadata (not yet migrated) are simply absent.  A
     missing or unreadable store yields ``{}`` — location is additive.
+    ``section_depth`` / ``is_code_heavy`` are served when present (only the
+    ``md_struct`` chunker writes them); older chunks just lack those keys.
     """
     path = Path(working_dir) / CHUNKS_FILENAME
     try:

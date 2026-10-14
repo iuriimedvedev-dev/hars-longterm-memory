@@ -46,7 +46,13 @@ BYTE_FALLBACK_TOKEN_RATIO: Final[int] = 4
 LLM_USAGE: Final[dict[str, int]] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
 #: Valid HARS_MEMORY_CHUNKER values (see create_lightrag).
-CHUNKER_MODES: Final[frozenset[str]] = frozenset({"token", "markdown"})
+CHUNKER_MODES: Final[frozenset[str]] = frozenset({"token", "markdown", "md_struct"})
+
+#: Valid HARS_MEMORY_CHUNKER_MODE values (see index.py --chunker-mode).
+#: ``legacy`` is byte-identical to the default ``token`` path; ``md_struct``
+#: selects the section-boundary chunker (``ingest/md_structure.py``).
+CHUNKER_MODE_ENV: Final[str] = "HARS_MEMORY_CHUNKER_MODE"
+CHUNKER_MODE_VALUES: Final[frozenset[str]] = frozenset({"legacy", "md_struct"})
 
 
 class _TiktokenTokenizer:
@@ -386,6 +392,34 @@ def make_llm_func(
     return llm_func
 
 
+def resolve_chunker() -> str:
+    """Resolve the chunker name from ``HARS_MEMORY_CHUNKER_MODE`` / ``HARS_MEMORY_CHUNKER``.
+
+    ``HARS_MEMORY_CHUNKER_MODE`` (``legacy`` | ``md_struct``, see index.py
+    ``--chunker-mode``) wins when set; otherwise the pre-existing
+    ``HARS_MEMORY_CHUNKER`` (``token`` | ``markdown`` | ``md_struct``)
+    applies.  Unset everything and the result is ``"token"`` — the legacy
+    LightRAG splitter, byte-identical to before this mode existed.
+    """
+    mode = os.environ.get(CHUNKER_MODE_ENV, "").strip().lower()
+    if mode and mode not in CHUNKER_MODE_VALUES:
+        raise ValueError(
+            f"{CHUNKER_MODE_ENV}={mode!r} is invalid; "
+            f"expected one of {sorted(CHUNKER_MODE_VALUES)}"
+        )
+    chunker = os.environ.get("HARS_MEMORY_CHUNKER", "token").strip().lower() or "token"
+    if mode == "legacy":
+        chunker = "token"
+    elif mode == "md_struct":
+        chunker = "md_struct"
+    if chunker not in CHUNKER_MODES:
+        raise ValueError(
+            f"HARS_MEMORY_CHUNKER={chunker!r} is invalid; "
+            f"expected one of {sorted(CHUNKER_MODES)}"
+        )
+    return chunker
+
+
 def create_lightrag(
     *,
     working_dir: str | None = None,
@@ -583,18 +617,21 @@ def create_lightrag(
 
     # HARS_MEMORY_CHUNKER: "token" (default) keeps LightRAG's own token splitter,
     # so existing indexes stay consistent; "markdown" plugs in the structure-aware
-    # splitter.  chunk id = md5(chunk text), so switching on an existing index
+    # splitter; "md_struct" plugs in the section-boundary chunker
+    # (ingest/md_structure.py).  HARS_MEMORY_CHUNKER_MODE=legacy|md_struct
+    # (see index.py --chunker-mode) overrides when set: legacy == token.
+    # chunk id = md5(chunk text), so switching on an existing index
     # changes ids for re-chunked docs and needs re-extraction (see AGENTS.md).
-    _chunker = os.environ.get("HARS_MEMORY_CHUNKER", "token").strip().lower() or "token"
-    if _chunker not in CHUNKER_MODES:
-        raise ValueError(
-            f"HARS_MEMORY_CHUNKER={_chunker!r} is invalid; expected one of {sorted(CHUNKER_MODES)}"
-        )
+    _chunker = resolve_chunker()
     _chunker_kwargs: dict[str, object] = {}
     if _chunker == "markdown":
         from hars_memory.ingest.chunker import lightrag_chunking_func
 
         _chunker_kwargs["chunking_func"] = lightrag_chunking_func
+    elif _chunker == "md_struct":
+        from hars_memory.ingest.md_structure import md_struct_chunking_func
+
+        _chunker_kwargs["chunking_func"] = md_struct_chunking_func
     logger.info("LightRAG chunker: %s", _chunker)
 
     rag = LightRAG(
@@ -671,6 +708,9 @@ def create_query_model_func() -> object:
 __all__ = [
     "BYTE_FALLBACK_TOKEN_RATIO",
     "CHUNKER_MODES",
+    "CHUNKER_MODE_ENV",
+    "CHUNKER_MODE_VALUES",
+    "resolve_chunker",
     "TIKTOKEN_ENCODING",
     "resolve_tokenizer",
     "create_lightrag",
