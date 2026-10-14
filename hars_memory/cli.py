@@ -329,9 +329,10 @@ def _cmd_recall(args: argparse.Namespace) -> int:
             print(f"WARNING: {staleness_warning}")
         hybrid = data["hybrid"]
         if hybrid.get("enabled", True):
-            chunks = hybrid.get("fused_chunks", [])
+            chunks = hybrid.get("fused_chunks") or []
+            identifier_matches = hybrid.get("identifier_matches") or []
             print(
-                f"hybrid: {len(chunks)} fused chunks, {len(hybrid.get('identifier_matches', []))} identifier matches"
+                f"hybrid: {len(chunks)} fused chunks, {len(identifier_matches)} identifier matches"
             )
         raw = data["result"]
         if isinstance(raw, str):
