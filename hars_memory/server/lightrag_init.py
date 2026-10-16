@@ -272,6 +272,22 @@ def make_llm_func(
         os.environ.get("HARS_MEMORY_LLM_RETRY_BACKOFF_MAX_SECONDS", "8.0")
     )
 
+    # Optional server-side stop sequences via HARS_MEMORY_LLM_STOP
+    # (comma-separated, empty/unset = off). When set, the list is sent as the
+    # Chat Completions ``stop`` parameter so the server halts generation at
+    # the marker instead of streaming tokens the pipeline discards anyway —
+    # e.g. post-``<|COMPLETE|>`` loops/garbage measured at ~24% of all
+    # generated tokens in the 2026-10-16 re-index (see
+    # eval_agentic/rca/index_perf_analysis.md §3b). Parsed once here, not per
+    # call. Cache-safe: response-cache keys are prompt-based, so adding
+    # ``stop`` neither reads nor invalidates any existing cache entry.
+    _stop_env = os.environ.get("HARS_MEMORY_LLM_STOP", "")
+    stop_sequences: list[str] | None = None
+    if _stop_env.strip():
+        stop_sequences = [
+            part.strip() for part in _stop_env.split(",") if part.strip()
+        ] or None
+
     # llama-server (llama.cpp) does not check bearer auth at all, but
     # create_openai_async_client falls back to os.environ["OPENAI_API_KEY"]
     # (raising KeyError if unset) whenever api_key is falsy, so this must
@@ -335,10 +351,15 @@ def make_llm_func(
         # model as named parameters (the pre-SDK code had no such named/extra
         # split because it built one flat httpx JSON payload dict instead).
         _JSON_PRIMITIVES = (str, int, float, bool, type(None))
-        _NAMED_PARAMS = {"max_tokens", "temperature", "enable_cot"}
+        # "stop" is here because llm_func sets it itself (stop_sequences /
+        # HARS_MEMORY_LLM_STOP): a forwarded primitive must not also ride in
+        # extra_body and collide with it in the serialized JSON payload.
+        _NAMED_PARAMS = {"max_tokens", "temperature", "enable_cot", "stop"}
         forwarded = {k: v for k, v in kwargs.items() if isinstance(v, _JSON_PRIMITIVES)}
         call_max_tokens = forwarded.get("max_tokens", max_tokens)
         call_temperature = forwarded.get("temperature", temperature)
+        # Env-configured stop sequences apply unless the caller passes its own.
+        call_stop = forwarded.get("stop") or stop_sequences
         # Static backend fields (e.g. reasoning effort) first; per-call primitives override.
         extra_body = {
             **static_extra_body,
@@ -351,6 +372,7 @@ def make_llm_func(
                 messages=messages,
                 max_tokens=call_max_tokens,
                 temperature=call_temperature,
+                stop=call_stop,
                 extra_body=extra_body or None,
             )
             message = response.choices[0].message
