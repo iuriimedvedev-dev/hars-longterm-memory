@@ -19,6 +19,13 @@ before touching anything below.
   `PROVIDER=http` → code-diver `:8791`, rerank `BACKEND=http` → `:8792`
   (`POOL=20`, `TIMEOUT_S=30`), extractor/query → gemma `:8083`, index dir as
   above. Change env → `systemctl --user restart hars-longterm-memory-mcp`.
+- **Live trace SSE (2026-10-17):** the same stdio child also serves a read-only
+  recall-trace endpoint on `10.66.66.99:8098` (same WireGuard-only bind):
+  `GET /trace?question=...&ll_keywords=...&top_k=...` streams one SSE event per
+  pipeline stage (`trace_start`→`bm25_hits`→`vector_hits`→`fusion`→`rerank`→
+  `graph_expand`→`context`→`result`→`done`); `GET /healthz` is the liveness
+  probe. No new deps, no index writes; disable with
+  `HARS_MEMORY_TRACE_HTTP_PORT=0`. Contract: `docs/trace-api.md`.
 - **Shared model daemons** (code-diver repo, canonical units in
   `~/.local/src/code-diver/deploy/systemd-user/`, committed):
   - `:8792` rerank Qwen3-Reranker-0.6B-Q8_0, llama.cpp **Vulkan build**,
