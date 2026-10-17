@@ -16,6 +16,12 @@ Layering (deliberately additive)
   (``target_chars`` / ``min_merge_chars``) with plain-title ``[A > B]``
   breadcrumbs, so every chunk carries a short human-readable breadcrumb that
   survives embedding.
+* Units are explicit: the chunker's budgets are **characters**.  Callers that
+  hold a **token** budget (e.g. LightRAG's ``chunk_token_size``) must convert
+  through :data:`CHARS_PER_TOKEN` (``4``) — see
+  :func:`md_struct_chunking_func`.  Mixing a token-scaled budget with a
+  char-based measure (or vice versa) produces ~4x-wrong chunks.
+
 * Compatibility is at the *record* level, not the code level: chunk dicts
   emitted by :func:`md_struct_chunking_func` carry the same keys LightRAG's
   adapter in ``chunker.py`` emits (``tokens`` / ``content`` /
@@ -26,7 +32,8 @@ Layering (deliberately additive)
   ``md5`` chunk ids — so adopting it needs a full re-embed / re-index
   (see ``server/lightrag_init.py``).
 
-Stdlib only: no tokenizer dependency.  Token estimates are ``chars // 4``.
+Stdlib only: no tokenizer dependency.  Token estimates are
+``chars // CHARS_PER_TOKEN``.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 # ---------------------------------------------------------------------------
 # Line-level patterns
@@ -49,10 +56,22 @@ _HR_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
 _FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]+\s*:")
 _DOC_NAME_RE = re.compile(r"\[Document: ([^\n]*?) \| Section: ")
 
+#: Canonical chars-per-token ratio used to convert a token budget into the
+#: char-based budget this module's chunker speaks, *without* a tokenizer.  It is
+#: the ratio the codebase already uses everywhere a token count is derived from
+#: text: :func:`estimate_tokens` (``chars // 4``) and
+#: ``server/lightrag_init.py::BYTE_FALLBACK_TOKEN_RATIO`` (both ``== 4``).  Do
+#: not invent a different ratio here.
+CHARS_PER_TOKEN: Final[int] = 4
+
 #: Default: one section = one chunk when it fits in this many characters.
 DEFAULT_TARGET_CHARS = 2000
 #: Sections smaller than this merge up into their parent / neighbour.
 DEFAULT_MIN_MERGE_CHARS = 200
+#: Floor applied after converting a token budget to chars, so a very small
+#: caller budget can never make ``target_chars`` degenerate below the size of a
+#: plain section heading.
+MIN_TARGET_CHARS: Final[int] = 512
 
 Measure = Callable[[str], int]
 
@@ -62,8 +81,8 @@ def _looks_like_chars(text: str) -> int:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate without a tokenizer dependency (chars / 4)."""
-    return max(1, len(text) // 4) if text.strip() else 0
+    """Rough token estimate without a tokenizer dependency (``chars // CHARS_PER_TOKEN``)."""
+    return max(1, len(text) // CHARS_PER_TOKEN) if text.strip() else 0
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +472,18 @@ def _split_block_lines(
     raw_lines = block.text.split("\n")
     if block.kind == "table":
         head = raw_lines[:2]
+        head_len = measure("\n".join(head))
+        if head_len + 1 >= budget:
+            # The repeated table header (first two rows) alone does not fit
+            # the budget.  Repeating it while splitting rows would call
+            # ``_hard_split(row, 1)`` and emit one piece per character, each
+            # carrying the whole header — exploding a single table into
+            # thousands of overlapping chunks (observed: 22 003 pieces from a
+            # 26 kB table).  Drop header repetition and hard-split the block.
+            return [
+                (frag, block.start_line, block.end_line)
+                for frag in _hard_split(block.text, budget, measure)
+            ]
         rows = raw_lines[2:] if len(raw_lines) > 2 else raw_lines
         pieces: list[tuple[str, int, int]] = []
         group: list[str] = []
@@ -475,7 +506,8 @@ def _split_block_lines(
                     pieces.append((text, group_start, group_start + len(group) - 1))
                     group_start += len(group)
                     group = []
-                for frag in _hard_split(row, max(1, budget - measure("\n".join(head)) - 1), measure):
+                residual = max(1, budget - head_len - 1)
+                for frag in _hard_split(row, residual, measure):
                     pieces.append(
                         ("\n".join(head + [frag]), group_start, group_start)
                     )
@@ -732,7 +764,7 @@ def md_struct_chunking_func(
     split_by_character: str | None = None,
     split_by_character_only: bool = False,
     chunk_overlap_token_size: int = 100,
-    chunk_token_size: int = 1200,
+    chunk_token_budget: int = 1200,
 ) -> list[dict[str, Any]]:
     """LightRAG ``chunking_func`` adapter around :func:`chunk_note_structured`.
 
@@ -746,13 +778,47 @@ def md_struct_chunking_func(
 
     Non-Markdown content, or an explicit ``split_by_character``, delegates to
     LightRAG's own ``chunking_by_token_size`` unchanged — the legacy path.
+
+    Units
+    -----
+    ``chunk_token_budget`` is a budget in **tokens** (LightRAG passes its
+    ``chunk_token_size`` here as the sixth positional argument; this project
+    defaults it to ``512`` via ``HARS_MEMORY_CHUNK_TOKEN_SIZE``).  This
+    module's chunker is **char-based** (``target_chars`` / ``min_merge_chars``),
+    so the token budget is converted with :data:`CHARS_PER_TOKEN`:
+    ``target_chars = chunk_token_budget * CHARS_PER_TOKEN`` — the same ``4``
+    ratio :func:`estimate_tokens` and
+    ``server/lightrag_init.py::BYTE_FALLBACK_TOKEN_RATIO`` use.  The tokenizer
+    is still used to fill each record's ``tokens`` field (the real model-token
+    count), but it does **not** define the chunk size.
+
+    No overlap
+    ----------
+    ``chunk_overlap_token_size`` is accepted for call-contract compatibility
+    but deliberately unused: section boundaries + the per-chunk ``[A > B]``
+    breadcrumb prefix replace token overlap.  It is only forwarded to the
+    legacy ``chunking_by_token_size`` fallback.
+
+    Migration note
+    --------------
+    Before this parameter was explicit the adapter passed
+    ``target_chars = max(512, chunk_token_size * 4)`` to a **token**-based
+    ``measure``, so a nominal 512-token budget actually produced ~2048-token
+    (~8 KB) section chunks (``eval_agentic/rca`` recommendation #3).  The
+    ``*4`` scaling is only correct once the measurement is in chars, which is
+    what this adapter now does.  Sections that already fit the budget yield
+    byte-identical chunks, so their extraction cache stays valid; only chunks
+    split out of sections **above** the budget change text — and therefore
+    their ``md5`` chunk id and extraction cache key — so re-chunking an
+    existing ``md_struct`` index re-extracts the affected documents (see
+    ``docs/configuration.md``).
     """
     def token_split() -> list[dict[str, Any]]:
         from lightrag.operate import chunking_by_token_size
 
         return chunking_by_token_size(
             tokenizer, content, split_by_character, split_by_character_only,
-            chunk_overlap_token_size, chunk_token_size,
+            chunk_overlap_token_size, chunk_token_budget,
         )
 
     if split_by_character:
@@ -763,13 +829,15 @@ def md_struct_chunking_func(
     if not _is_markdown_document(content):
         return token_split()
 
-    def measure(text: str) -> int:
+    def measure_tokens(text: str) -> int:
         return len(tokenizer.encode(text))
 
-    target_chars = max(512, chunk_token_size * 4)
+    # ``chunk_token_budget`` is TOKENS; ``chunk_note_structured`` measures
+    # CHARS, so convert with the canonical ratio and measure in chars.
+    target_chars = max(MIN_TARGET_CHARS, chunk_token_budget * CHARS_PER_TOKEN)
     chunks = chunk_note_structured(
         content, source_id="", source_path=_doc_name_from_header(content),
-        target_chars=target_chars, measure=measure,
+        target_chars=target_chars, measure=_looks_like_chars,
     )
     if not chunks:
         return token_split()
@@ -780,7 +848,7 @@ def md_struct_chunking_func(
     results: list[dict[str, Any]] = []
     for chunk in chunks:
         record: dict[str, Any] = {
-            "tokens": measure(chunk.text),
+            "tokens": measure_tokens(chunk.text),
             "content": chunk.text,
             "chunk_order_index": len(results),
             "heading_path": list(chunk.heading_path),
@@ -799,8 +867,10 @@ def md_struct_chunking_func(
 
 
 __all__ = [
+    "CHARS_PER_TOKEN",
     "DEFAULT_MIN_MERGE_CHARS",
     "DEFAULT_TARGET_CHARS",
+    "MIN_TARGET_CHARS",
     "NoteStructure",
     "SectionNode",
     "StructChunk",
