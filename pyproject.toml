@@ -102,6 +102,11 @@ server = [
   "psycopg[binary]>=3.2.0",
 ]
 s3 = ["boto3>=1.35.0"]
+# Learned channel-fusion ranker (hars_memory/ranking/*). Training and the
+# LightGBM artifact backend need lightgbm; INFERENCE over the shipped artifact
+# does not (the loader fails soft to the hand-tuned fusion when lightgbm is
+# absent, and the MLP artifact format is pure numpy).
+ltr = ["lightgbm>=4.0"]
 
 [project.scripts]
 memory-index = "hars_memory.cli:index_main"

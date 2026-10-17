@@ -1634,6 +1634,48 @@ def flat_channel_enabled() -> bool:
     return os.environ.get(HARS_MEMORY_FLAT_CHANNEL_ENV, _FLAT_CHANNEL_DEFAULT).strip().lower() in _TRUTHY
 
 
+# ---------------------------------------------------------------------------
+# Learned channel-fusion ranker (LTR) — ADDITIVE integration point
+# (2026-10-17, learned-ranker task; kept in its own section at the end of the
+# file so it cannot collide with the graph-channel work that also touches this
+# module).
+#
+# `apply_ltr_ranker` replaces the hand-tuned `alpha*dense + (1-alpha)*sparse`
+# ordering with a SMALL learned model over per-candidate channel features
+# (hars_memory/ranking/*): LightGBM LambdaRank / tiny MLP, sub-millisecond per
+# candidate on CPU, no GPU/LLM/network. It is deliberately fail-soft: with no
+# artifact (or an artifact whose feature list disagrees with the checkout) it
+# returns `fused[:top_k]` UNCHANGED, so wiring it in cannot break a search.
+#
+# The imports are lazy (inside the delegating functions) on purpose: this
+# module's import graph is unchanged for every existing caller, and the dry
+# path never pays for loading the ranker unless it is actually invoked.
+# Wiring spec (for the mcp_server owner) is in docs/ltr-ranker.md.
+# ---------------------------------------------------------------------------
+
+
+def ltr_ranker_enabled() -> bool:
+    """True when `HARS_MEMORY_LTR_RANKER` points at a loadable artifact (or the
+    shipped default artifact exists and loads). Read fresh on every call."""
+    from hars_memory.ranking.rerank import ltr_ranker_enabled as _impl
+
+    return _impl()
+
+
+def apply_ltr_ranker(fused: list[FusedChunk], query: str, **kwargs: object) -> list[FusedChunk]:
+    """Reorder the FULL pre-truncation fused pool with the learned ranker.
+
+    Delegates to `hars_memory.ranking.rerank.apply_ltr_ranker`. Returns the
+    pool unchanged (truncated to `top_k` when given) whenever no usable ranker
+    artifact is available. Keyword args: `top_k`, `ll_keywords` is NOT used
+    (the ranker reads score features only), `context`, `index_dir`,
+    `model`/`model_path`.
+    """
+    from hars_memory.ranking.rerank import apply_ltr_ranker as _impl
+
+    return _impl(fused, query, **kwargs)  # type: ignore[arg-type]
+
+
 __all__ = [
     "DEFAULT_HYBRID_ALPHA",
     "HARS_MEMORY_FUSION_TIE_EPSILON_ENV",
@@ -1669,4 +1711,7 @@ __all__ = [
     "flat_channel_enabled",
     "FLAT_DENSE_MAX_INJECTED",
     "apply_flat_dense_gate",
+    # Learned channel-fusion ranker (LTR) — additive, see the section above.
+    "ltr_ranker_enabled",
+    "apply_ltr_ranker",
 ]
