@@ -291,17 +291,20 @@ class TestAdapterAndSwitch:
                 return list(text.encode("utf-8"))
 
         calls: list[str] = []
-        stub_operate = types.ModuleType("lightrag.operate")
+        # lightrag >= 1.5 moved chunking_by_token_size out of lightrag.operate
+        # into lightrag.chunker; the adapter imports it from its new home.
+        stub_chunker = types.ModuleType("lightrag.chunker")
 
         def fake_split(tokenizer: object, content: str, *args: object) -> list[dict]:
             calls.append(content)
             return [{"tokens": 1, "content": content, "chunk_order_index": 0}]
 
-        stub_operate.chunking_by_token_size = fake_split  # type: ignore[attr-defined]
+        stub_chunker.chunking_by_token_size = fake_split  # type: ignore[attr-defined]
         stub_lightrag = types.ModuleType("lightrag")
+        stub_lightrag.__path__ = []  # type: ignore[attr-defined]  # package marker
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setitem(sys.modules, "lightrag", stub_lightrag)
-        monkeypatch.setitem(sys.modules, "lightrag.operate", stub_operate)
+        monkeypatch.setitem(sys.modules, "lightrag.chunker", stub_chunker)
         try:
             records = md.md_struct_chunking_func(
                 FakeTok(), "plain prose " * 500, None, False, 100, 1200

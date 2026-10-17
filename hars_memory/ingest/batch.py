@@ -204,20 +204,39 @@ class BatchRequest:
 
 
 def request_key(
-    user_prompt: str, system_prompt: str | None, history: list[dict[str, str]] | None
+    user_prompt: str,
+    system_prompt: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    response_format: Any | None = None,
+    llm_cache_identity: Any | None = None,
 ) -> tuple[str, str, list[dict[str, str]]]:
     """Return (cache_key, joined_prompt, messages) exactly as LightRAG derives them.
 
     Mirrors ``lightrag.utils.use_llm_func_with_cache`` (cache_type ``extract``,
-    mode ``default``); messages mirror ``server/lightrag_init.make_llm_func``.
+    mode ``default``) as of lightrag-hku 1.5.7, where the hashed input also
+    includes the serialized ``response_format`` and per-role
+    ``llm_cache_identity``; messages mirror ``server/lightrag_init.make_llm_func``.
     """
-    from lightrag.utils import compute_args_hash, generate_cache_key
+    from lightrag.utils import (
+        _serialize_cache_variant,
+        compute_args_hash,
+        generate_cache_key,
+        serialize_llm_cache_identity,
+    )
 
     parts = [p for p in (user_prompt, system_prompt) if p]
     if history:
         parts.append(json.dumps(history, ensure_ascii=False))
     joined = "\n".join(parts)
-    key = generate_cache_key("default", "extract", compute_args_hash(joined))
+    arg_hash = compute_args_hash(
+        joined,
+        "\n<response_format>\n",
+        _serialize_cache_variant(response_format),
+        "\n<llm_identity>\n",
+        serialize_llm_cache_identity(llm_cache_identity),
+    )
+    key = generate_cache_key("default", "extract", arg_hash)
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -280,13 +299,29 @@ async def _collect_async(
     rag = create_lightrag(working_dir=str(scratch))
     cache = _RecordingCache(answers)
 
+    # lightrag >= 1.5 routes every LLM call through per-role wrappers
+    # (``role_llm_funcs["extract"]``), and the extraction cache key now folds in
+    # the per-role ``llm_cache_identity``. Build the same global_config LightRAG
+    # would, then swap the extract role's callable for our recorder.
+    from lightrag.utils import get_llm_cache_identity
+
+    global_config = rag._build_global_config()  # type: ignore[attr-defined]
+    llm_cache_identity = get_llm_cache_identity(global_config, "extract")
+
     async def recorder(
         prompt: str,
         system_prompt: str | None = None,
         history_messages: list[dict[str, str]] | None = None,
+        response_format: Any | None = None,
         **_: object,
     ) -> str:
-        key, joined, messages = request_key(prompt, system_prompt, history_messages)
+        key, joined, messages = request_key(
+            prompt,
+            system_prompt,
+            history_messages,
+            response_format=response_format,
+            llm_cache_identity=llm_cache_identity,
+        )
         derived = any(m.get("content") == _STUB for m in (history_messages or []))
         cache.record_call(key, joined, messages, derived)
         return _STUB
@@ -310,8 +345,7 @@ async def _collect_async(
                 "full_doc_id": doc.doc_id,
                 "file_path": _unique_file_key(doc),
             }
-    global_config = asdict(rag)  # type: ignore[call-overload]
-    global_config["llm_model_func"] = recorder
+    global_config["role_llm_funcs"]["extract"] = recorder
     await extract_entities(chunks, global_config=global_config, llm_response_cache=cache)
 
     tokenizer = rag.tokenizer  # type: ignore[attr-defined]

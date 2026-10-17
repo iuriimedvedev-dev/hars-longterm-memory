@@ -5,7 +5,8 @@ from metrics import load_results
 keys = ["file_hit@1", "fact@3", "fact@5", "fact_rr", "chars@5"]
 base = load_results(sys.argv[1])
 def col(rows, k): return [r[k] for r in rows]
-print("| name | " + " | ".join(keys) + " |"); print("|---|" + "---|" * len(keys))
+print("| name | " + " | ".join(keys) + " |")
+print("|---|" + "---|" * len(keys))
 for n in sys.argv[1:]:
     rows = load_results(n)
     cells = []

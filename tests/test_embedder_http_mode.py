@@ -317,7 +317,7 @@ class TestRequestShape:
             assert result[i] == pytest.approx(server.embed(text))
 
     async def test_empty_input_returns_empty_array(self, http_env, install_fake_server) -> None:
-        server = install_fake_server(FakeEmbedServer())
+        install_fake_server(FakeEmbedServer())
         func = embedder.make_embedding_func(batch_size=8)
         result = await func([], context="document")
         assert result.shape[0] == 0
@@ -527,7 +527,7 @@ class TestCostVisibility:
     async def test_usage_logged_debug_and_run_summary_info(
         self, http_env, install_fake_server, caplog
     ) -> None:
-        server = install_fake_server(FakeEmbedServer())  # usage = 10 * len(text)
+        install_fake_server(FakeEmbedServer())  # usage = 10 * len(text)
         func = embedder.make_embedding_func(batch_size=8)
         with caplog.at_level(logging.DEBUG, logger="hars_memory.server.embedder"):
             await func(["abcd"], context="document")  # 40 tokens

@@ -161,13 +161,34 @@ def _run_all(index_dir: Path, docs: list[Document], backend: FakeBackend, **kw: 
 
 
 def test_request_key_matches_lightrag_cache_key() -> None:
-    from lightrag.utils import compute_args_hash, generate_cache_key
+    from lightrag.utils import (
+        _serialize_cache_variant,
+        compute_args_hash,
+        generate_cache_key,
+        serialize_llm_cache_identity,
+    )
 
     history = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}]
-    key, joined, messages = batch.request_key("user text", "system text", history)
+    # lightrag >= 1.5 folds response_format + per-role llm_cache_identity into
+    # the hashed input, so the mirror must take them too.
+    response_format = {"type": "json_object"}
+    identity = {"role": "extract", "binding": None, "model": "m", "host": None}
+    key, joined, messages = batch.request_key(
+        "user text",
+        "system text",
+        history,
+        response_format=response_format,
+        llm_cache_identity=identity,
+    )
     expected = generate_cache_key(
         "default", "extract",
-        compute_args_hash("user text\nsystem text\n" + json.dumps(history, ensure_ascii=False)),
+        compute_args_hash(
+            "user text\nsystem text\n" + json.dumps(history, ensure_ascii=False),
+            "\n<response_format>\n",
+            _serialize_cache_variant(response_format),
+            "\n<llm_identity>\n",
+            serialize_llm_cache_identity(identity),
+        ),
     )
     assert key == expected
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]

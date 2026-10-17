@@ -205,7 +205,7 @@ class TestLightragAdapter:
         assert (beta["start_line"], beta["end_line"]) == (7, 9)
 
     def test_non_markdown_delegates_to_token_splitter(self, tok) -> None:
-        from lightrag.operate import chunking_by_token_size
+        from lightrag.chunker import chunking_by_token_size
 
         code = "# comment\n" + "\n".join(f"x{i} = {i}" for i in range(400))
         content = f"[Document: tool.py | Section: all | Date: 2026-01-01]\n\n{code}\n"
@@ -215,7 +215,7 @@ class TestLightragAdapter:
             )
 
     def test_split_by_character_delegates(self, tok) -> None:
-        from lightrag.operate import chunking_by_token_size
+        from lightrag.chunker import chunking_by_token_size
 
         text = "# T\n\nalpha\n\n## S\n\nbeta\n"
         assert lightrag_chunking_func(tok, text, "\n\n", True, 0, 128) == chunking_by_token_size(
