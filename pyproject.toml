@@ -10,8 +10,24 @@ requires-python = ">=3.13"
 readme = "README.md"
 
 dependencies = [
-  # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall
-  "lightrag-hku>=1.4.16",
+  # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall.
+  # PINNED to the 1.4.x line (audit 2026-10-17). The serving venv must read the
+  # store it serves, and the store format is version-sensitive:
+  #   * kv_store_doc_status.json rows written by LightRAG >= 1.5 carry
+  #     `content_hash` (1.4.16's DocProcessingStatus rejects it -> TypeError)
+  #     and statuses `parsing`/`analyzing` (1.4.16's get_status_counts()
+  #     raises KeyError on them). Measured on the 1.5.7 Colab snapshot:
+  #     1050/1340 rows un-constructible, get_status_counts() -> KeyError.
+  #   * BUT the repo cannot yet IMPORT under 1.5.7: hars_memory/ingest/chunker.py
+  #     and ingest/md_structure.py import `chunking_by_token_size` from
+  #     `lightrag.operate` (moved to `lightrag.chunker.token_size` in 1.5), and
+  #     eval/extractor_bench.py imports `DEFAULT_ENTITY_TYPES` from
+  #     `lightrag.constants` (removed in 1.5). Pinning ==1.5.7 unpatched broke
+  #     37 tests (32 + 4 import errors) on 2026-10-17.
+  # So the upper bound stays <1.5 until those imports migrate; then move to
+  # ==1.5.7 (the builder's version). See docs/VERSION_PIN.md for the evidence,
+  # the exact migration, and the upgrade/rollback procedure.
+  "lightrag-hku>=1.4.16,<1.5",
   # CPU-only sentence embeddings (e5-large-v2, bge-m3, nomic-embed-text)
   "sentence-transformers>=5.0.0",
   # torch CPU wheel — resolved via the pytorch-cpu named index below

@@ -530,7 +530,7 @@ class TestRipgrepFusion:
         )
 
         monkeypatch.delenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, raising=False)
-        assert ripgrep_channel_enabled() is True  # measured default -- see fusion.py's comment
+        assert ripgrep_channel_enabled() is False  # audit 2026-10-17: default OFF, matches live env
 
         monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "0")
         assert ripgrep_channel_enabled() is False
