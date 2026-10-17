@@ -546,6 +546,12 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return {}
     graph_doc_ok = sum(1 for r in rows if r["graph"]["doc_recall"] >= 1.0)
     fusion_doc_ok = sum(1 for r in rows if r["fusion_only"]["doc_recall"] >= 1.0)
+    # The assembled context is already a ~top-10 budget (per-doc cap + caps), while
+    # `fused_chunks` is the WIDE candidate pool (candidate_pool_size = 3*top_k, up to
+    # 53 docs here). The fair "would the fusion-only branch also solve it" comparison
+    # is therefore at a matched @10 budget, not over the full fusion pool.
+    graph_doc_ok_10 = sum(1 for r in rows if r["graph"]["doc_recall@10"] >= 1.0)
+    fusion_doc_ok_10 = sum(1 for r in rows if r["fusion_only"]["doc_recall@10"] >= 1.0)
     graph_adds = sum(1 for r in rows if r["graph_delta"]["doc_recall"] > 0.0)
     return {
         "n_questions": n,
@@ -562,6 +568,8 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "graph_delta_doc_recall": _mean([r["graph_delta"]["doc_recall"] for r in rows]),
         "graph_doc_solved": graph_doc_ok,
         "fusion_doc_solved": fusion_doc_ok,
+        "graph_doc_solved@10": graph_doc_ok_10,
+        "fusion_doc_solved@10": fusion_doc_ok_10,
         "graph_adds_docs": graph_adds,
         "latency_ms_mean": _mean([r["latency_ms"]["total"] for r in rows]),
         "latency_ms_median": round(
@@ -645,7 +653,7 @@ def validate_gold(
 
 
 def mine_chains(
-    graph: GraphIndex, max_degree: int = 400, prefer_clean: bool = True, limit: int = 200
+    graph: GraphIndex, max_degree: int = 400, limit: int = 200
 ) -> list[dict[str, Any]]:
     """Mine typed 2-hop chains A -rel1-> B -rel2-> C where A and C have clean
     single-document provenance and B is any typed entity (usually a
@@ -683,9 +691,11 @@ def mine_chains(
     for B, nbrs in adj.items():
         if types.get(B) not in interesting or len(desc.get(B, "")) < 30:
             continue
+        # A and C must be document-local (clean) so each chain's gold documents
+        # are unambiguous; B is deliberately allowed to be a cross-document hub
+        # (a metric/model/config that appears in many docs) — that hub IS the
+        # bridge a multi-hop query has to traverse.
         cand = [(n, ks) for n, ks in nbrs if types.get(n) in interesting and clean(n)]
-        if prefer_clean and not clean(B):
-            continue
         for i in range(len(cand)):
             for j in range(i + 1, len(cand)):
                 A, k1 = cand[i]
