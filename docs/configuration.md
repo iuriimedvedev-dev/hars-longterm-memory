@@ -24,6 +24,10 @@ inline rationale).
 | `HARS_MEMORY_QUERY_TIMEOUT_SECONDS` | `60` | Timeout for LightRAG `aquery` call |
 | `HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER` | `1.0` | Multiplier for `fetch_top_k` when not explicitly passed. Measured optimum 1.0 at `top_k=20` |
 | `HARS_MEMORY_CONTEXT_PRIORITY_DEFAULT` | `merged` | Server-wide default for `context_priority` parameter |
+| `HARS_MEMORY_GRAPH_BRANCH` | `auto` | Whether the LightRAG graph pass runs on the `context_only` path. `auto` = only when the resolved mode is a real graph mode (`mix`/`local`/`global`, i.e. keywords supplied); with no keywords it would degrade to `naive` — a second dense search over the same chunk store the fusion channel already queried (measured +7.6 s/query) — so it is skipped and reported as `lightrag_mode: "skipped"`. `on` = historical always-call, `off` = never call |
+| `HARS_MEMORY_CONTEXT_MAX_CHARS` | `15000` | Hard global budget (emitted chunk content chars) for the assembled `context`; `0` disables. Best-ranked chunks win the space |
+| `HARS_MEMORY_CONTEXT_MAX_DOC_CHARS` | `6000` | Per-document cap on emitted content (line-boundary truncation with a `…[truncated]` marker); stops one mega-note from starving the budget. `0` disables |
+| `HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY` | `0.05` | Soft source-diversity tiebreaker: score penalty per already-selected chunk of the same document during assembly |
 | `HARS_MEMORY_SUPERSESSION_SCORING` | `1` | Enable supersession-aware rescoring (`0` to disable) |
 | `HARS_MEMORY_HYBRID_ALPHA` | `0.5` | Alpha weight for dense+sparse fusion. Measured optimum 0.5 |
 | `HARS_MEMORY_EXTRACTOR_EXTRA_HEADERS` | — | JSON object of extra HTTP headers for the extractor endpoint |

@@ -299,22 +299,30 @@ def apply_supersession_scoring(
 # WHY this exists as a SEPARATE function from `apply_supersession_scoring`
 # above, rather than reusing it: `apply_supersession_scoring` is defined on
 # `fusion.FusedChunk`, which always carries a `fused_score` to multiplicatively
-# attenuate. The caller this function was extracted for
-# (`hars_longterm_memory_mcp.py`'s `_merge_context_with_fusion`, item:
-# supersession-aware scoring on the FINAL MERGED context) has no such score:
-# LightRAG's own mode-based context assembly (naive/local/global/hybrid) never
-# exposes a per-chunk score in its rendered `only_need_context=True` output —
-# only rank order (see `tools/memory/eval/channels.py`'s `lightrag_mode`,
-# which documents and relies on the identical constraint: `score=None` is
-# correct there, not a missing value). The merged list interleaves that
-# scoreless LightRAG order with the fusion channel's scored order via a plain
-# round-robin (`_round_robin_merge`), which itself only ever reasons about
-# POSITION, never magnitude — so by the time a candidate reaches this
-# function, there is no single numeric score left to multiply that would mean
-# the same thing for every candidate regardless of which channel it came
-# from. A rank-only setting has exactly one meaningful notion of "attenuate a
-# flagged candidate": rank it below every candidate that was NOT flagged.
-# That is a stable partition, not a multiplicative rescale.
+# attenuate. The caller this function was extracted for (`mcp_server.py`'s
+# `_merge_context_with_fusion`) originally had no such score: LightRAG's own
+# mode-based context assembly (naive/local/global/hybrid) never exposes a
+# per-chunk score in its rendered `only_need_context=True` output — only rank
+# order (see `tools/memory/eval/channels.py`'s `lightrag_mode`, which documents
+# and relies on the identical constraint: `score=None` is correct there, not a
+# missing value). That caller used to interleave the scoreless LightRAG order
+# with the fusion channel's scored order via a plain positional round-robin
+# (the since-removed `_round_robin_merge`), which only ever reasoned about
+# POSITION, never magnitude — so there was no single numeric score to multiply
+# that would mean the same thing for every candidate regardless of channel. A
+# rank-only setting has exactly one meaningful notion of "attenuate a flagged
+# candidate": rank it below every candidate that was NOT flagged. That is a
+# stable partition, not a multiplicative rescale.
+#
+# 2026-10-17: the assembly now SCORES both branches (LightRAG context rank is
+# mapped onto a lower band — see `mcp_server.py::_lightrag_rank_score`) and
+# selects chunks best-first, so `_merge_context_with_fusion` applies the same
+# partition inline via `is_self_declared_deprecated` (below) instead of calling
+# this function: it needs the flagged group pushed below every unflagged
+# candidate *inside a score-based greedy selection*, which a pure output
+# reorder cannot express. This function remains the public rank-only partition
+# for callers that hold no numeric score at all, and is kept tested
+# (`tests/test_supersession_scoring.py`).
 #
 # WHY a stable partition also SOLVES double-penalization for free (see the
 # task's explicit "beware double-penalisation" callout): the fusion channel,
@@ -350,7 +358,7 @@ def apply_marker_penalty_to_ranked_list(ranked: list[tuple[str, str]]) -> list[s
     """Stably partition a RANK-ORDERED `(candidate_key, content)` list so
     every self-declared-deprecated candidate sorts after every candidate that
     is not, preserving each group's relative order otherwise. Returns just
-    the reordered `candidate_key`s (the merged list's file paths).
+    the reordered `candidate_key`s (e.g. a merged list's file paths).
 
     Recency-discount has NO analogue here (deliberately): it is a continuous
     magnitude ("older but still valid" is only ever a MINOR tiebreaker — see

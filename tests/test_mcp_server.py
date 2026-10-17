@@ -2391,32 +2391,50 @@ def _sample_merge_context() -> str:
     )
 
 
-class TestRoundRobinMerge:
-    def test_interleaves_primary_first(self) -> None:
-        mod = _load_mcp_module_with_env({})
-        merged = mod._round_robin_merge(["a", "b", "c"], ["x", "y", "z"], 6)  # type: ignore[attr-defined]
-        assert merged == ["a", "x", "b", "y", "c", "z"]
+class TestAssemblyCandidateOrdering:
+    """Score-ordered chunk selection — the replacement for the document-level
+    positional round-robin (2026-10-17 retrieval review, recommendation #4)."""
 
-    def test_dedupes_across_lists(self) -> None:
+    def test_orders_by_score_across_both_branches(self) -> None:
         mod = _load_mcp_module_with_env({})
-        merged = mod._round_robin_merge(["a", "b"], ["b", "c"], 10)  # type: ignore[attr-defined]
-        assert merged == ["a", "b", "c"]
+        candidates = [
+            {"file_path": "a.md", "content": "a", "score": 0.1},
+            {"file_path": "b.md", "content": "b", "score": 0.9},
+            {"file_path": "c.md", "content": "c", "score": 0.5},
+        ]
+        ordered = mod._order_assembly_candidates(candidates, 10)  # type: ignore[attr-defined]
+        assert [c["file_path"] for c in ordered] == ["b.md", "c.md", "a.md"]
 
-    def test_respects_limit(self) -> None:
+    def test_diversity_is_a_soft_tiebreaker_not_a_hard_round_robin(self) -> None:
+        """A clearly better chunk always precedes a worse one even when both
+        come from the same document — the soft penalty may only break ties."""
         mod = _load_mcp_module_with_env({})
-        merged = mod._round_robin_merge(["a", "b", "c"], ["x", "y", "z"], 2)  # type: ignore[attr-defined]
-        assert merged == ["a", "x"]
+        candidates = [
+            {"file_path": "a.md", "content": "a1", "score": 0.9},
+            {"file_path": "a.md", "content": "a2", "score": 0.88},
+            {"file_path": "b.md", "content": "b1", "score": 0.2},
+        ]
+        ordered = mod._order_assembly_candidates(candidates, 10)  # type: ignore[attr-defined]
+        assert [c["file_path"] for c in ordered] == ["a.md", "a.md", "b.md"]
 
-    def test_empty_secondary(self) -> None:
+    def test_limit_is_a_soft_document_preference(self) -> None:
+        """`top_k` orders which documents come first; it does NOT hard-cut the
+        context (the char budgets do) — a lower-ranked document's chunk is still
+        emitted while budget remains."""
         mod = _load_mcp_module_with_env({})
-        merged = mod._round_robin_merge(["a", "b"], [], 10)  # type: ignore[attr-defined]
-        assert merged == ["a", "b"]
+        candidates = [
+            {"file_path": "a.md", "content": "a1", "score": 0.9},
+            {"file_path": "a.md", "content": "a2", "score": 0.8},
+            {"file_path": "b.md", "content": "b1", "score": 0.7},
+        ]
+        ordered = mod._order_assembly_candidates(candidates, 1)  # type: ignore[attr-defined]
+        assert [c["file_path"] for c in ordered] == ["a.md", "a.md", "b.md"]
 
 
 class TestMergeContextWithFusion:
     def test_injects_fusion_only_document_first(self) -> None:
-        """Fusion-exclusive doc must appear (round-robin, fusion first) and get
-        a new reference_id continuing from the max existing one."""
+        """Fusion-exclusive doc must appear (score-ordered) and get a new
+        reference_id continuing from the max existing one."""
         import json
 
         mod = _load_mcp_module_with_env({})
@@ -2431,8 +2449,8 @@ class TestMergeContextWithFusion:
 
         chunks_block = mod._extract_fenced_block(new_context, mod._CONTEXT_CHUNK_SECTION_HEADER)  # type: ignore[attr-defined]
         chunk_lines = [json.loads(line) for line in chunks_block[2].splitlines() if line.strip()]
-        # round-robin(fusion=[docC, docA], lightrag=[docA, docB]) dedup ->
-        # [docC, docA, docB] -> docC first, new ref_id 3 (max existing was 2).
+        # score order: docC (fusion 0.9, exclusive -> new ref_id 3, max existing
+        # was 2), then LightRAG's own docA (rank 1) and docB (rank 2).
         assert chunk_lines[0]["reference_id"] == "3"
         assert chunk_lines[0]["content"] == "Fusion-only snippet."
 
@@ -2479,15 +2497,14 @@ class TestMergeContextWithFusion:
 
 
 # ---------------------------------------------------------------------------
-# Supersession-aware scoring applied to the FINAL MERGED context (not just
+# Supersession-aware scoring applied to the ASSEMBLED context (not just
 # fuse()'s own fusion-channel input) — see retrieval/supersession.py's
-# `apply_marker_penalty_to_ranked_list`. Root-cause scenario this reproduces:
-# a self-declared-deprecated document reachable ONLY via LightRAG's own
-# graph/vector chunk order (never scored, never touched by fuse()) still
-# outranks the correct document in the ROUND-ROBIN-interleaved output, even
-# though the fusion channel alone (and HARS_MEMORY_SUPERSESSION_SCORING) would
-# get this right on its own — because fuse()'s marker penalty only ever
-# reorders the fusion channel's own candidates before the merge ever runs.
+# `is_self_declared_deprecated`. Root-cause scenario this reproduces: a
+# self-declared-deprecated document reachable ONLY via LightRAG's own
+# graph/vector chunk order (never scored, never touched by fuse()) must still
+# be demoted below genuine chunks — fuse()'s marker penalty only ever reorders
+# the fusion channel's own candidates. The assembly applies the same stable
+# partition across BOTH branches' candidates before score-ordered selection.
 # ---------------------------------------------------------------------------
 
 
@@ -2520,12 +2537,13 @@ def _sample_merge_context_with_lightrag_side_deprecated_doc() -> str:
 
 
 def _fusion_chunks_with_correct_doc_ranked_second() -> list[dict]:
-    """Fusion channel: an irrelevant filler doc ranks ABOVE the correct doc —
-    with round-robin(fusion-first, lightrag), this places the correct doc at
-    merged position 3 (fusion[0]=docX, lightrag[0]=docDep, fusion[1]=docCur),
-    i.e. BEHIND the lightrag-side deprecated doc at position 2, reproducing
-    the exact bug (a superseded doc outranking its replacement) even though
-    neither channel's OWN ranking is individually wrong."""
+    """Fusion channel: an irrelevant filler doc ranks ABOVE the correct doc.
+    docCur is fusion-exclusive (score 0.7); the LightRAG-side deprecated doc
+    (docDep, rank 1 -> synthetic band score 0.5) is kept as LightRAG's own
+    chunk and carries no fusion score. A score-ordered assembly therefore
+    places docCur ahead of docDep on the fusion channel's own judgement; the
+    marker partition (see the class below) is the second, independent reason
+    docDep can never lead."""
     return [
         {"chunk_id": "cX", "file_path": "docX.md", "snippet": "Irrelevant filler.", "fused_score": 0.9},
         {"chunk_id": "cCur", "file_path": "docCur.md", "snippet": "Current, correct finding.", "fused_score": 0.7},
@@ -2550,37 +2568,39 @@ class TestMergeContextWithFusionSupersessionScoring:
     ) -> None:
         """Default flipped 2026-07-30: with no env var set, supersession
         scoring is ON and the lightrag-side deprecated doc must already be
-        demoted below the correct one, with no explicit opt-in required."""
+        demoted below the other (genuine) document, with no explicit opt-in
+        required. The deprecated chunk is LightRAG's rank-1, i.e. it would lead
+        on score alone — only the marker partition demotes it."""
         monkeypatch.delenv("HARS_MEMORY_SUPERSESSION_SCORING", raising=False)
         mod = _load_mcp_module_with_env({})
         new_context, applied = mod._merge_context_with_fusion(  # type: ignore[attr-defined]
             _sample_merge_context_with_lightrag_side_deprecated_doc(),
-            _fusion_chunks_with_correct_doc_ranked_second(),
+            [],
             limit=10,
         )
         assert applied is True
         order = _final_document_order(mod, new_context)
-        assert order.index("docCur.md") < order.index("docDep.md"), (
-            "default (no env var set): correct doc must outrank the superseded doc"
+        assert order.index("docY.md") < order.index("docDep.md"), (
+            "default (no env var set): a self-declared-stale doc must not lead"
         )
 
     def test_explicit_disable_leaves_lightrag_side_deprecated_doc_outranking_correct(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Escape hatch: HARS_MEMORY_SUPERSESSION_SCORING=0 must restore the
-        pre-flip behaviour — a superseded doc reachable only via LightRAG's
-        own order can still outrank the correct doc."""
+        unpartitioned score order — the deprecated doc keeps its rank-1
+        position instead of being pushed below every genuine chunk."""
         mod = _load_mcp_module_with_env({})
         monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "0")
         new_context, applied = mod._merge_context_with_fusion(  # type: ignore[attr-defined]
             _sample_merge_context_with_lightrag_side_deprecated_doc(),
-            _fusion_chunks_with_correct_doc_ranked_second(),
+            [],
             limit=10,
         )
         assert applied is True
         order = _final_document_order(mod, new_context)
-        assert order.index("docDep.md") < order.index("docCur.md"), (
-            "flag explicitly off: superseded doc still outranks the correct doc (pre-flip baseline)"
+        assert order.index("docDep.md") < order.index("docY.md"), (
+            "flag explicitly off: no marker partition, score order only"
         )
 
     def test_enabled_demotes_lightrag_side_deprecated_doc_below_correct(
@@ -2614,20 +2634,20 @@ class TestMergeContextWithFusionSupersessionScoring:
     def test_sub_flag_off_disables_merge_stage_demotion_even_with_master_flag_on(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """HARS_MEMORY_SUPERSESSION_MARKER_PENALTY=0 must disable the merge
+        """HARS_MEMORY_SUPERSESSION_MARKER_PENALTY=0 must disable the assembly
         stage too — same two-flag composition `fuse()` itself honours."""
         mod = _load_mcp_module_with_env({})
         monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_SCORING", "1")
         monkeypatch.setenv("HARS_MEMORY_SUPERSESSION_MARKER_PENALTY", "0")
         new_context, applied = mod._merge_context_with_fusion(  # type: ignore[attr-defined]
             _sample_merge_context_with_lightrag_side_deprecated_doc(),
-            _fusion_chunks_with_correct_doc_ranked_second(),
+            [],
             limit=10,
         )
         assert applied is True
         order = _final_document_order(mod, new_context)
-        assert order.index("docDep.md") < order.index("docCur.md"), (
-            "sub-flag off: merge-stage demotion must not fire even though the master flag is on"
+        assert order.index("docDep.md") < order.index("docY.md"), (
+            "sub-flag off: assembly-stage demotion must not fire even though the master flag is on"
         )
 
     def test_composes_without_double_penalizing_a_fusion_side_already_scored_doc(
@@ -2667,12 +2687,16 @@ class TestMergeContextWithFusionSupersessionScoring:
         )
         # docDep is ALSO the fusion channel's own top (and only) candidate —
         # standing in for "fuse() already demoted everything else, this is
-        # what survived at the top of its own already-penalized ranking".
-        fused_chunks = [{"chunk_id": "cDep", "file_path": "docDep.md", "snippet": "irrelevant", "fused_score": 0.9}]
+        # what survived at the top of its own already-penalized ranking". Its
+        # snippet IS the deprecated chunk's content, so the coverage match
+        # adopts the fusion score for that same chunk.
+        fused_chunks = [
+            {"chunk_id": "cDep", "file_path": "docDep.md", "content": deprecated_content, "fused_score": 0.9}
+        ]
         new_context, applied = mod._merge_context_with_fusion(context, fused_chunks, limit=10)  # type: ignore[attr-defined]
         assert applied is True
         order = _final_document_order(mod, new_context)
-        assert order == ["docCur.md", "docDep.md"], (
+        assert order[0] == "docCur.md" and order[-1] == "docDep.md", (
             "deprecated doc must land last exactly once — no further collapse from appearing "
             "as the fusion channel's own top candidate too"
         )

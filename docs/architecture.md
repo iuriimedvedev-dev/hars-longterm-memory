@@ -68,17 +68,16 @@ flowchart TD
     K --> L[Fingerprint sidecar]
 
     M[User question] --> N[memory_recall]
-    N --> O{Keywords provided?}
-    O -->|Yes| P[Graph mode]
-    O -->|No| Q[Naive mode]
-    P --> R[LightRAG aquery]
-    P --> S[BM25 fusion]
-    P --> T[Ripgrep channel]
-    R --> U[Hybrid block]
+    N --> S[BM25 + dense fusion]
+    S --> T[Ripgrep channel]
+    N --> O{Graph signal? keywords / mode}
+    O -->|Yes| R[LightRAG aquery graph pass]
+    O -->|No| Z[Graph branch skipped]
+    R --> U[Score-ordered chunk assembly]
     S --> U
     T --> U
-    U --> V[Merge context]
-    V --> W[Supersession rescore]
+    Z --> U
+    U --> W[Supersession partition + budgets]
     W --> X[Response]
 ```
 
@@ -86,18 +85,29 @@ flowchart TD
 
 The `memory_recall` tool orchestrates up to 4 retrieval channels:
 
-### 1. LightRAG graph channel (always on)
-- Entity/relation graph traversal
-- Modes: `local` (entity neighbourhood), `global` (community themes), `hybrid` (both)
-- Uses `ll_keywords`/`hl_keywords` when provided — skips the keyword-extraction LLM call
-- Falls back to `naive` (pure vector similarity) when no keywords are supplied
-
-### 2. BM25 sparse fusion channel (always on)
-- Sparse keyword retrieval over the indexed chunk store
-- Exact identifier matching (e.g. `A2S32`, `hyp:7f62cfb4`) — dense embeddings miss these
+### 1. Dense+BM25 fusion channel (always on — the default path)
+- Dense vector search over the indexed chunk store (`chunks_vdb`) fused with BM25 sparse retrieval
+- Sparse keyword retrieval over the indexed chunk store, exact identifier matching (e.g. `A2S32`, `hyp:7f62cfb4`) — dense embeddings miss these
 - Alpha-weighted fusion with dense results (`HARS_MEMORY_HYBRID_ALPHA`, default 0.5)
 - Atomic index save via temp dir + `os.replace` (no half-written index reads)
 - BM25 query runs in `asyncio.to_thread` — does not block the event loop
+
+### 2. LightRAG graph channel (routed — `HARS_MEMORY_GRAPH_BRANCH`, default `auto`)
+- Entity/relation graph traversal. Modes: `local` (entity neighbourhood), `global` (community themes), `hybrid`→`mix` (both)
+- Uses `ll_keywords`/`hl_keywords` when provided — skips the keyword-extraction LLM call
+- **`auto` (default): runs only when the RESOLVED mode is a real graph mode**
+  (`mix`/`local`/`global`), i.e. when keywords were supplied. With no keywords
+  LightRAG can only run `naive` — a second dense vector search over the *same*
+  chunk store the fusion channel just queried (measured +7.6 s/query, recall@10
+  0.688 vs 0.979 for fusion) — so the graph branch is **skipped** and the context
+  is assembled from the fusion channel alone. `mode=naive` (explicit or
+  fallback) is likewise skipped. An explicit `context_priority=lightrag` request
+  keeps the graph branch on, and the answer path (`context_only=false`) always
+  runs it.
+- `on` restores the historical always-call behaviour; `off` never calls it.
+- When skipped, the response reports `lightrag_mode: "skipped"` (never a fake
+  `naive`) plus `graph_branch: {enabled, setting, reason}`, and the trace emits
+  `graph_expand` with `skipped: true` + the reason instead of zeroed counters.
 
 ### 3. Ripgrep live-worktree channel (default on)
 - Searches the LIVE filesystem (not the index) for exact identifiers
@@ -111,15 +121,31 @@ The `memory_recall` tool orchestrates up to 4 retrieval channels:
 - Pays CPU embed cost per query
 - Enable via `HARS_MEMORY_FLAT_CHANNEL=1` when index/vector-store drift is suspected
 
-### Context merging
+### Context assembly
 
-When `context_only=true` (default) and `context_priority=merged` (default):
+When `context_only=true` (default):
+It is a **score-ordered chunk assembly** (2026-10-17 retrieval review,
+recommendation #4 — the previous document-level round-robin + whole-document
+emission is what amputated the gold note in the Q05 RCA failure):
 
-1. LightRAG's own `context` string is parsed into individual document chunks
-2. BM25 fusion results are interleaved with LightRAG chunks in round-robin order
-3. Supersession-aware rescoring re-ranks the merged list (superseded/outdated docs rank lower)
-4. Fusion-only documents are injected using their `snippet` (truncated content)
-5. Each chunk includes a `section` field with the breadcrumb heading chain for section-level citation accuracy
+1. Every candidate chunk from both branches gets one comparable score — the
+   fusion score, or a rank-derived score on a lower band for LightRAG chunks
+   (its rendered context carries order but no numbers)
+2. Candidates are selected best-first at **chunk** granularity; source
+   diversity is a **soft tiebreaker** (a small per-document penalty), never a
+   hard positional round-robin
+3. The self-declared-superseded marker partition is applied across both
+   branches' candidates (supersession-aware; `HARS_MEMORY_SUPERSESSION_SCORING`)
+4. Budgets: `HARS_MEMORY_CONTEXT_MAX_CHARS` (global, default 15000) and
+   `HARS_MEMORY_CONTEXT_MAX_DOC_CHARS` (per document, default 6000) — the
+   best-ranked chunks always win the space, and no single document can starve
+   the budget
+5. When the graph branch was skipped the context is rendered from branch 1
+   alone as a LightRAG-shaped Document Chunks / Reference Document List block
+   (`context_priority_applied: "fusion_only"`) — with no fake empty
+   Knowledge-Graph sections
+6. Each chunk includes a `section` field with the breadcrumb heading chain for
+   section-level citation accuracy
 
 ## Index pipeline
 
