@@ -6,6 +6,59 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-17
+
+### Added
+
+- Live recall telemetry over SSE (`memory_trace`): a read-only streaming
+  endpoint that emits one event per `memory_recall` pipeline stage as it runs
+  (`hars_memory/trace.py`, `ContextVar` emitter, dependency-free HTTP/1.1 SSE
+  listener started by `memory mcp` on a sibling port —
+  `HARS_MEMORY_TRACE_HTTP_PORT`, default 8098, `0` disables). The default
+  MCP/CLI path emits nothing and is behaviourally unchanged; `/mcp` is
+  untouched. Notably enables live animation in `memory-travel`. See
+  [docs/trace-api.md](docs/trace-api.md).
+- Relational multi-hop evaluation harness for the graph branch
+  (`hars_memory/eval/relational_eval.py`): read-only `validate` / `run` /
+  `mine` subcommands that score the graph branch (graph_expand entities +
+  relations + assembled context docs) and the fusion-only branch side by side,
+  reusing `hars_memory.eval.metrics` conventions.
+- Optional server-side stop sequences via `HARS_MEMORY_LLM_STOP`
+  (comma-split, default off): `make_llm_func` now sends a Chat Completions
+  `stop` list that stops generation at the `<|COMPLETE|>` delimiter instead of
+  discarding ~24% of generated tokens afterwards (RCA
+  `eval_agentic/rca/index_perf_analysis.md` §3b). Routed through the existing
+  named-param override semantics, not `extra_body`. Cache-safe (prompt-keyed).
+
+### Changed
+
+- Documented the true two-branch recall DAG: fusion/rerank (`_compute_hybrid_block`,
+  dense `chunks_vdb.query` + BM25 → fuse → rerank) completes BEFORE the LightRAG
+  entity/relation pass (`graph_expand`); fusion has no graph channel. A dependency
+  guard pins the recorded call order, a graph-free fusion payload and
+  `graph_expand.derived_from == context_string` so the ordering cannot regress to
+  match a UI label. See [docs/trace-api.md](docs/trace-api.md).
+- Operations handoff for memory indexing setup, and a note on the live trace SSE
+  endpoint (`:8098`).
+
+### Fixed
+
+- `md_struct` chunking used the wrong units: `md_struct_chunking_func` passed the
+  token budget (`chunk_token_size`, default 512) as a *character* target to a
+  tokenizer-based measure, producing ~4× oversized (~2048-token / ~8 KB) section
+  chunks. The parameter is renamed to `chunk_token_budget` (tokens), documented,
+  and converted to the chunker's char budget via the canonical `CHARS_PER_TOKEN=4`
+  ratio while measuring in chars; the tokenizer still records the real token
+  count. Also hardened `_split_block_lines`: a table whose repeated header rows
+  alone exceed the budget no longer explodes into one chunk per character
+  (a 26 kB table had produced 22,003 overlapping chunks) — it falls back to a
+  plain hard split.
+- `relational_eval` mining and aggregation: `mine` now requires A/C chains to be
+  document-local with B as the cross-document hub (the bridge), and aggregate
+  scores add graph/fusion `doc_solved@10` at a matched top-10 budget (the served
+  context is ~top-10 while `fused_chunks` is a wide candidate pool), so the
+  "would fusion alone solve it" comparison is fair.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
