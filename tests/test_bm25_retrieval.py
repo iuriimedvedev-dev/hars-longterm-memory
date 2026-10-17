@@ -439,7 +439,7 @@ class TestRipgrepFusion:
         ripgrep_hits = {
             "off_index.md": ChannelHit(score=4.0, content="found only by rg", file_path="off_index.md"),
         }
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_boost=False)
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_boost=False, mode="injection")
         # The real top-2 candidates are unchanged, in the same order/score.
         assert [c.chunk_id for c in gated[:2]] == [c.chunk_id for c in fused[:2]]
         assert gated[:2] == fused[:2]
@@ -465,7 +465,7 @@ class TestRipgrepFusion:
         ripgrep_hits = {
             "b.md": ChannelHit(score=6.0, content="rg found b.md too", file_path="/abs/path/to/b.md"),
         }
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True)
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True, mode="injection")
         matched = next(c for c in gated if c.chunk_id == "chunk-b")
         assert matched.ripgrep_score == 6.0
         # No new "ripgrep:b.md" entry was injected -- it was recognized as
@@ -479,7 +479,7 @@ class TestRipgrepFusion:
         fused = self._sample_fused()
         by_id = {c.chunk_id: c for c in fused}
         ripgrep_hits = {"b.md": ChannelHit(score=6.0, content="x", file_path="b.md")}
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3)  # enable_boost defaults False
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, mode="injection")  # enable_boost defaults False
         matched = next(c for c in gated if c.chunk_id == "chunk-b")
         assert matched.fused_score == pytest.approx(by_id["chunk-b"].fused_score)
         assert matched.ripgrep_score == 6.0  # still recorded, even though score is untouched
@@ -496,7 +496,7 @@ class TestRipgrepFusion:
         # A huge raw ripgrep score must still saturate at RIPGREP_BOOST_CAP,
         # never overwhelm a real dense/sparse-earned fused_score.
         ripgrep_hits = {"b.md": ChannelHit(score=1_000_000.0, content="x", file_path="b.md")}
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True)
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=3, enable_boost=True, mode="injection")
         matched = next(c for c in gated if c.chunk_id == "chunk-b")
         assert matched.fused_score == pytest.approx(by_id["chunk-b"].fused_score + RIPGREP_BOOST_CAP)
 
@@ -508,7 +508,7 @@ class TestRipgrepFusion:
             f"off_{i}.md": ChannelHit(score=float(10 - i), content="x", file_path=f"off_{i}.md")
             for i in range(5)
         }
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, max_injected=2)
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, max_injected=2, mode="injection")
         injected = [c for c in gated if c.chunk_id.startswith("ripgrep:")]
         assert len(injected) == 2
         # Highest-scoring off-index hits win the limited slots.
@@ -519,7 +519,7 @@ class TestRipgrepFusion:
 
         fused = self._sample_fused()
         ripgrep_hits = {"off_index.md": ChannelHit(score=9.0, content="x", file_path="off_index.md")}
-        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_injection=False)
+        gated = apply_ripgrep_gate(fused, ripgrep_hits, top_k=2, enable_injection=False, mode="injection")
         assert len(gated) == 2
         assert not any(c.chunk_id.startswith("ripgrep:") for c in gated)
 

@@ -164,6 +164,22 @@ class TestRankedReranking:
             (c.chunk_id, c.fused_score) for c in direct
         ]
 
+    def test_gate_default_mode_follows_the_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`mode=None` (the live call site) resolves to the env mode, which
+        defaults to `ranked` — so the channel re-ranks with no call-site
+        change; `=injection` restores the legacy append-only behaviour."""
+        hits = _two_hit_scores()
+        monkeypatch.delenv(HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV, raising=False)
+        via_gate = apply_ripgrep_gate(_pool(), hits, top_k=3, weight=1.0)
+        direct = apply_ripgrep_ranked(_pool(), hits, top_k=3, weight=1.0)
+        assert [(c.chunk_id, c.fused_score) for c in via_gate] == [
+            (c.chunk_id, c.fused_score) for c in direct
+        ]
+
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV, "injection")
+        legacy = apply_ripgrep_gate(_pool(), hits, top_k=3)
+        assert [c.chunk_id for c in legacy[:3]] == [c.chunk_id for c in _pool()][:3]
+
     def test_empty_hits_is_a_pure_passthrough(self) -> None:
         pool = _pool()
         assert apply_ripgrep_ranked(pool, {}, top_k=2) == pool[:2]
