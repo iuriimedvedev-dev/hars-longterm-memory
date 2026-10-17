@@ -24,8 +24,9 @@ required after indexing.
 ## memory_recall
 
 Primary retrieval tool. Returns relevant context from the knowledge graph for a
-natural language question. Supports four retrieval modes with an additive
-dense+BM25 sparse fusion channel layered on top.
+natural language question. Retrieval runs as **parallel channels: vector + BM25
++ ripgrep + graph** — four retrieval modes over a fused dense+BM25+ripgrep
+candidate ranking, with the LightRAG graph pass as an independent second branch.
 
 ### Parameters
 
@@ -105,11 +106,17 @@ dense+BM25 sparse fusion channel layered on top.
   `graph_branch.reason` explains why (`context_priority=lightrag` and the answer
   path keep it on). `mode_fallback` is only set when the fallback actually ran
 - **Hybrid field**: the `hybrid` field is always present, even without
-  `debug=true`. It contains fused dense+BM25 results, identifier matches from
-  the BM25 channel, and the ripgrep live-worktree channel status
-- **Ripgrep channel** (default on): searches the LIVE worktree for exact
-  identifiers from the question and `ll_keywords`. Catches files added/edited
-  since the last consolidation that the index has never seen
+  `debug=true`. It contains the fused vector+BM25+ripgrep results, identifier
+  matches from the BM25 channel, and per-channel status blocks
+- **Ripgrep channel** (default on, `ranked` mode): searches the LIVE worktree
+  for exact identifiers from the question and `ll_keywords`. Its literal-match
+  score re-ranks chunks **within** `top_k`; off-index files it finds are still
+  appended after `top_k` as `ripgrep:<basename>` entries. Catches files
+  added/edited since the last consolidation that the index has never seen
+- **Cross-encoder reranker** (default **off**): the HTTP Qwen3-Reranker cost
+  7.4–14 s/query for +6.3 pts recall@1 on saturated scores and is off the
+  default path; `HARS_MEMORY_RERANK_BACKEND=http|local` re-enables it as an
+  opt-in (see the env reference)
 - **Flat-dense channel** (default off): additive channel covering chunks in the
   index's raw chunk store but missing/stale in the primary vector store
 - **Supersession rescoring** (default on): demotes superseded/outdated chunks in
