@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Learned channel-fusion ranker (learning-to-rank) for the recall path,
+  replacing the hand-tuned additive blend with a LightGBM LambdaRank model over
+  20 deterministic rank-time features (dense/BM25/ripgrep scores + norms, fused
+  score/gap/rank, channel count, identifier/term overlap, chunk/doc length,
+  doc recency, section depth, code-heaviness, supersession flag, graph
+  entity fan-in/match). New package `hars_memory/ranking/` (features, artifact
+  loader with a feature-manifest guard, fail-soft `apply_ltr_ranker`, training
+  lib) plus `hars_memory/eval/ltr_{dataset,train,eval}.py` and a scaled
+  synthetic-query generator. Inference ≈0.20 ms/candidate on CPU, no GPU/LLM.
+  Offline gate on the held-out 48-query GC-fixed and 28-query relational sets:
+  recall@1 0.7083→0.7708 / 0.2857→0.3214, NDCG@10 0.8563→0.8848 / 0.6144→0.6288,
+  MRR 0.8149→0.8479 / 0.6845→0.7055 (all ≥ baseline). Artifact
+  `hars_memory/ranking/artifacts/ranker.json` (+ manifest, committed). New
+  optional extra `ltr` (`uv sync --extra ltr`) provides LightGBM for
+  training and the LightGBM artifact backend; without it the loader fails soft
+  to the hand-tuned fusion. Additive integration point in
+  `retrieval/fusion.py` (`apply_ltr_ranker`, `ltr_ranker_enabled`) — no
+  call-site change is made in `mcp_server.py`; see `docs/ltr-ranker.md` for the
+  exact wiring spec.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
