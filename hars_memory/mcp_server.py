@@ -257,9 +257,9 @@ DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "6")
 # forced to the same number. That starves _compute_hybrid_block's fusion
 # pool (`HYBRID_CANDIDATE_POOL_MULTIPLIER`), the supersession rescoring, and
 # the z-score tie-break of any candidate the initial top_k-wide cosine cut
-# had already dropped, since _merge_context_with_fusion's round-robin merge
-# can only choose among what LightRAG's own chunk_top_k-bounded `context`
-# block already contains.
+# had already dropped, since _merge_context_with_fusion can only choose among
+# what LightRAG's own chunk_top_k-bounded `context` block already contains
+# (plus the fusion branch's own candidates).
 #
 # `fetch_top_k` (memory_recall arg) / HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER
 # (env) decouple this: QueryParam.chunk_top_k and _compute_hybrid_block's
@@ -323,6 +323,11 @@ HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER = float(
 )
 
 NAIVE_FALLBACK_MODE = "naive"
+# Value `memory_recall`'s `lightrag_mode` field carries when the graph branch
+# was NOT run at all (see HARS_MEMORY_GRAPH_BRANCH / _resolve_graph_branch).
+# Deliberately distinct from `naive`: reporting a mode LightRAG never ran would
+# be dishonest telemetry.
+GRAPH_BRANCH_SKIPPED = "skipped"
 # max_tokens used to be interpolated into this prose but never enforced (100 and 4096
 # produced byte-identical output — see item 9 audit); removed from the schema, this
 # fixed instruction is kept since it does shape LLM answer-mode output.
@@ -388,9 +393,10 @@ RIPGREP_STOPWORDS = frozenset({
 
 # memory_recall `context_priority` values — see _merge_context_with_fusion.
 #
-# Default flipped to CONTEXT_PRIORITY_MERGED on 2026-07-30. Measured on the
-# 46-query tools/memory/eval/retrieval_queries.yaml labeled set, current
-# index, top_k=10:
+# Default flipped to CONTEXT_PRIORITY_MERGED on 2026-07-30. The 2026-07-30
+# numbers below were measured with the ORIGINAL document-level round-robin
+# merge (46-query tools/memory/eval/retrieval_queries.yaml labeled set, current
+# index, top_k=10):
 #
 #   variant                                              recall@1  recall@10  ndcg@10  mrr    supersession_err
 #   pre-flip shipped default (lightrag, supersession off)  0.477     0.727      0.637   0.634   0.333
@@ -402,13 +408,24 @@ RIPGREP_STOPWORDS = frozenset({
 # default on every metric and every query type, no regressions. Added
 # latency ~0.04ms.
 #
+# 2026-10-17: the merge itself was replaced by score-ordered CHUNK assembly
+# (see the assembly section above `_merge_context_with_fusion`); the reasoning
+# (two complementary channels) is unchanged, the naive positional interleave of
+# whole documents is gone.
+#
 # Escape hatch: set HARS_MEMORY_CONTEXT_PRIORITY_DEFAULT=lightrag to revert
 # every caller that omits `context_priority` back to the pre-flip behaviour
 # without patching call sites — see DEFAULT_CONTEXT_PRIORITY below. A caller
 # can also always override per-call by passing context_priority= explicitly,
 # regardless of this default (unaffected by the env var either way).
 CONTEXT_PRIORITY_LIGHTRAG = "lightrag"  # today's unmodified context field
-CONTEXT_PRIORITY_MERGED = "merged"  # round-robin(fusion, lightrag) reorder+inject
+CONTEXT_PRIORITY_MERGED = "merged"  # score-ordered chunk assembly (fusion + lightrag)
+CONTEXT_PRIORITY_FUSION_ONLY = "fusion_only"  # graph branch skipped -> branch 1 alone
+CONTEXT_PRIORITY_VALUES = (
+    CONTEXT_PRIORITY_LIGHTRAG,
+    CONTEXT_PRIORITY_MERGED,
+    CONTEXT_PRIORITY_FUSION_ONLY,
+)
 
 _context_priority_default_raw = os.environ.get(
     "HARS_MEMORY_CONTEXT_PRIORITY_DEFAULT", CONTEXT_PRIORITY_MERGED
@@ -505,19 +522,86 @@ except ValueError as exc:
 if not math.isfinite(HARS_MEMORY_RERANK_SKIP_FUSION_SCORE) or HARS_MEMORY_RERANK_SKIP_FUSION_SCORE < 0:
     raise ValueError("HARS_MEMORY_RERANK_SKIP_FUSION_SCORE must be a finite number >= 0")
 
-# --- Context assembly budget (memory_recall, context_only merged path) --------
-# HARS_MEMORY_CONTEXT_MAX_CHARS: total rendered-char budget for the assembled
-# Document Chunks emission (whole-document granularity: once the next
-# document's block would not fit, assembly STOPS — no blind mid-context cut,
-# which is what amputated the gold note in the Q05 RCA failure). 0 (the
-# default) preserves the historical behaviour: no server-side total cap; the
-# only size controls were top_k and LightRAG's own token budgets.
-# HARS_MEMORY_CONTEXT_MAX_DOC_CHARS: per-document cap on the rendered block —
-# one mega-note could previously eat ~70% of the window (measured: a 17.7k-char
-# block in a 25k context, RCA Q05). A document over the cap is truncated at a
-# paragraph/line boundary (never mid-word) with a "…[truncated]" marker.
+# --- Query routing: does the graph branch run at all? -------------------------
+# 2026-10-17 retrieval review (eval_agentic/rca/antigravity_retrieval_review.md,
+# recommendations #1/#4). Measured facts this knob exists for:
+#
+#   * With NO caller-supplied keywords `_resolve_query_mode` degrades the
+#     requested mode to LightRAG `naive`, and the old code still called
+#     `rag.aquery(...)` on the context_only path — a SECOND dense pass over the
+#     SAME `chunks_vdb` branch 1 had just queried (measured: +7.6 s/query in
+#     `eval_agentic-data/ab_report_current.json`, recall@10 0.688 at 7 643 ms
+#     vs 0.979 at 12.7 ms for the fusion branch). "Fusing a retriever with a
+#     degraded copy of half of itself."
+#   * LightRAG `mix` (the `mode=hybrid` mapping) measured 0.792 recall@10 at
+#     79 026 ms on the same 48-query set — no recall@1 gain over fusion.
+#
+# HARS_MEMORY_GRAPH_BRANCH (auto|on|off, default `auto`):
+#
+#   off  — never call `rag.aquery` on the `context_only` path; assemble the
+#          context from branch 1 (dense+sparse -> fusion -> rerank) alone.
+#   on   — historical behaviour, unchanged: always call `rag.aquery`, even
+#          when the resolved mode can only be LightRAG `naive`.
+#   auto — call `rag.aquery` ONLY when the graph branch is genuinely wanted,
+#          i.e. the RESOLVED LightRAG mode is a real graph mode
+#          (`mix`/`local`/`global`). Those modes require caller-supplied
+#          `ll_keywords`/`hl_keywords`, so in practice:
+#            * keywords supplied (mode hybrid/local/global)  -> graph runs;
+#            * no keywords (resolved `naive` fallback)       -> SKIPPED;
+#            * explicit `mode=naive` (LightRAG's own vector pass over the very
+#              same chunk store branch 1 already queried)   -> SKIPPED.
+#          An explicit `context_priority=lightrag` request also keeps the graph
+#          branch (that value means "return LightRAG's own context").
+#
+# The RESPONSE stays schema-stable (`context` is always present) and the
+# telemetry stays honest: when skipped, `lightrag_mode` reports `"skipped"`
+# (never a fake `naive`) plus a `graph_branch` {enabled, reason} block, and the
+# `graph_expand` trace frame is emitted with `skipped: true` + the reason rather
+# than zeroed counters pretending a pass ran.
+#
+# NOTE: the answer path (`context_only=false`) is deliberately NOT routed by
+# this knob — it needs retrieved context to synthesise an answer from, and
+# `aquery_llm` is the only thing that produces it today.
+GRAPH_BRANCH_MODES = ("auto", "on", "off")
+HARS_MEMORY_GRAPH_BRANCH = os.environ.get("HARS_MEMORY_GRAPH_BRANCH", "auto").strip().lower()
+if HARS_MEMORY_GRAPH_BRANCH not in GRAPH_BRANCH_MODES:
+    raise ValueError(
+        f"HARS_MEMORY_GRAPH_BRANCH={HARS_MEMORY_GRAPH_BRANCH!r} must be one of "
+        f"{', '.join(repr(mode) for mode in GRAPH_BRANCH_MODES)}"
+    )
+
+# --- Context assembly: chunk-score-ordered, hard global budget ----------------
+# 2026-10-17 review recommendation #4: the round-robin(document) merge that
+# interleaved a 0.979-recall@10 retriever with a 0.792 one, then emitted WHOLE
+# documents, is what amputated the gold note in the Q05 RCA failure (a 17.7k
+# mega-note block pushed the gold note past the harness's 15k cut even though
+# retrieval had it at rank #1-2). Assembly now:
+#
+#   1. orders individual CHUNKS by their fused/rerank score across BOTH
+#      branches (LightRAG chunks carry no numeric score, so their rank is
+#      mapped onto a deliberately lower band — see LIGHTRAG_RANK_SCORE_SCALE —
+#      so the graph branch fills the tail instead of displacing the strong
+#      branch's best chunks);
+#   2. keeps source diversity as a SOFT tiebreaker (a small score penalty per
+#      already-selected chunk of the same document), never a hard
+#      positional round-robin;
+#   3. emits CHUNK-level blocks (never whole documents);
+#   4. enforces HARS_MEMORY_CONTEXT_MAX_DOC_CHARS per document so no single
+#      mega-note can starve the budget, and HARS_MEMORY_CONTEXT_MAX_CHARS
+#      globally.
+#
+# HARS_MEMORY_CONTEXT_MAX_CHARS: hard global budget on emitted chunk content.
+# Assembly walks the score-ordered candidate list and emits every chunk that
+# still fits, skipping (not truncating) later ones once the budget is gone —
+# the best-ranked chunks always win the space. Default 15000 (the harness'
+# documented consumer window; = 0 disables the cap). Previously 0 = unlimited,
+# which is what let assembly exceed any caller's window.
+# HARS_MEMORY_CONTEXT_MAX_DOC_CHARS: per-document cap on emitted content — a
+# document over the cap is truncated at a paragraph/line boundary (never
+# mid-word) with a "…[truncated]" marker; its remaining chunks are dropped.
+# Default 6000. 0 disables the per-document cap.
 try:
-    HARS_MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("HARS_MEMORY_CONTEXT_MAX_CHARS", "0"))
+    HARS_MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("HARS_MEMORY_CONTEXT_MAX_CHARS", "15000"))
 except ValueError as exc:
     raise ValueError("HARS_MEMORY_CONTEXT_MAX_CHARS must be an integer") from exc
 if HARS_MEMORY_CONTEXT_MAX_CHARS < 0:
@@ -530,6 +614,29 @@ except ValueError as exc:
     raise ValueError("HARS_MEMORY_CONTEXT_MAX_DOC_CHARS must be an integer") from exc
 if HARS_MEMORY_CONTEXT_MAX_DOC_CHARS < 0:
     raise ValueError("HARS_MEMORY_CONTEXT_MAX_DOC_CHARS must be >= 0")
+# Soft source-diversity tiebreaker: subtracted from a candidate's score for
+# every chunk of the SAME document already selected. Small on purpose — it
+# breaks near-ties in favour of source diversity without ever letting a
+# lower-scored document overtake a clearly better chunk (the hard round-robin
+# this replaces did exactly that).
+try:
+    HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY = float(
+        os.environ.get("HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY", "0.05")
+    )
+except ValueError as exc:
+    raise ValueError("HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY must be a number") from exc
+if not math.isfinite(HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY) or HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY < 0:
+    raise ValueError("HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY must be a finite number >= 0")
+
+# LightRAG's rendered context carries ORDER but no per-chunk score (see
+# tools/memory/eval/channels.py::lightrag_mode, where score=None is correct, not
+# missing). To fuse the two branches into ONE score-ordered list those chunks
+# need a comparable number: rank 1 of the graph branch maps to
+# LIGHTRAG_RANK_SCORE_SCALE, decaying reciprocally. The scale is < the fusion
+# branch's min-max range so a graph chunk never displaces a fusion chunk of
+# comparable rank — the graph branch fills the TAIL (its documented job: it
+# recovers multi-hop documents fusion misses) instead of diluting the head.
+LIGHTRAG_RANK_SCORE_SCALE = 0.5
 
 ROUTING_MODES = ("off", "lang")
 HARS_MEMORY_ROUTING = os.environ.get("HARS_MEMORY_ROUTING", "off")
@@ -879,6 +986,10 @@ def _resolve_query_mode(rag_mode: str, ll_keywords: list[str], hl_keywords: list
     local/hybrid/global modes hard-fail with no keywords at all. naive mode
     needs none and empirically has the best signal-to-noise in that situation,
     so fall back to it instead of returning a hard failure.
+
+    NOTE: this only says which mode LightRAG WOULD run. Whether the graph
+    branch is worth calling at all is a separate decision — see
+    `_resolve_graph_branch` and HARS_MEMORY_GRAPH_BRANCH.
     """
     if ll_keywords or hl_keywords:
         return rag_mode, None
@@ -886,6 +997,49 @@ def _resolve_query_mode(rag_mode: str, ll_keywords: list[str], hl_keywords: list
         NAIVE_FALLBACK_MODE,
         "no keywords supplied — used naive mode; supply ll_keywords for graph-aware retrieval",
     )
+
+
+def _resolve_graph_branch(
+    rag_mode: str,
+    *,
+    context_priority: str,
+) -> tuple[bool, str, str | None]:
+    """Decide whether the LightRAG graph branch runs for this recall.
+
+    Returns ``(enabled, reason, reported_mode)``:
+
+    * ``enabled`` — whether ``rag.aquery`` may be called at all;
+    * ``reason`` — a human-readable, always-honest explanation recorded in the
+      response's ``graph_branch`` block and in the ``graph_expand`` trace frame;
+    * ``reported_mode`` — the value the RESPONSE's ``lightrag_mode`` field must
+      carry: the resolved mode when the branch ran, ``"skipped"`` when it did
+      not (never a fake ``naive``).
+
+    The rule is documented on HARS_MEMORY_GRAPH_BRANCH above. `auto` skips the
+    branch exactly when the resolved mode is LightRAG's `naive`, i.e. when
+    ``rag.aquery`` would re-run a dense vector search over the same
+    ``chunks_vdb`` branch 1 just queried instead of doing graph retrieval.
+    """
+    setting = HARS_MEMORY_GRAPH_BRANCH
+    if setting == "off":
+        return False, "graph branch disabled (HARS_MEMORY_GRAPH_BRANCH=off)", GRAPH_BRANCH_SKIPPED
+    if setting == "on":
+        return True, "graph branch forced (HARS_MEMORY_GRAPH_BRANCH=on)", rag_mode
+    # auto
+    if context_priority == CONTEXT_PRIORITY_LIGHTRAG:
+        # An explicit "return LightRAG's own context" request is itself a
+        # graph signal — honour it rather than silently returning fusion-only.
+        return True, "context_priority=lightrag requested LightRAG's own context", rag_mode
+    if rag_mode == NAIVE_FALLBACK_MODE:
+        return (
+            False,
+            "no graph signal: the resolved LightRAG mode is 'naive' (no "
+            "ll_keywords/hl_keywords, or mode=naive), which would be a second "
+            "dense pass over the same chunk store branch 1 already queried — "
+            "the context is assembled from the dense+sparse fusion branch alone",
+            GRAPH_BRANCH_SKIPPED,
+        )
+    return True, f"graph mode '{rag_mode}' requested with keywords", rag_mode
 
 
 def _resolve_fetch_top_k(top_k: int, fetch_top_k_arg: Any) -> tuple[int | None, str]:
@@ -2060,7 +2214,7 @@ def _lean_recall_response(
 ) -> dict[str, Any]:
     """Return the small, metadata-preserving `memory_recall` response view."""
     kept_fields = {
-        "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "top_k",
+        "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "graph_branch", "top_k",
         "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
         "staleness_warning",
     }
@@ -2466,65 +2620,215 @@ def _has_graph_entity_context(context: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Opt-in primary-context merge (item 3, memory_recall `context_priority`).
+# Context assembly (memory_recall `context_priority`).
 #
-# Measured via a scratch script built ONLY on tools/memory/eval/ab_bench.py's
-# own scoring primitives (run_config/score_query/aggregate_scores — the
-# harness itself has no "merged channel" config, per task constraints not
-# editing eval/*), on the 46-query retrieval_queries.yaml set, top_k=10:
+# History: this used to be an opt-in document-level round-robin merge measured
+# on the (now stale) 46-query set:
 #
 #   channel                                   recall@1  recall@10  ndcg@10  mrr
 #   hybrid_bm25 (fusion) alone                  0.574     0.810     0.722   0.720
 #   hybrid (lightrag mix, tuned budget) alone    0.491     0.769     0.662   0.659
 #   round-robin(fusion first, lightrag) MERGE    0.574     0.880     0.750   0.732
 #
-# Merge beats BOTH pure channels on every aggregate metric, including
-# multihop specifically (ndcg@10 0.759 fusion-alone / 0.802 lightrag-alone /
-# 0.830 merged) — the two channels are measurably complementary, not
-# redundant: fusion wins identifier/conceptual/latency, lightrag's own
-# entity/relation graph traversal recovers multihop docs fusion misses, and
-# the union recovers gains from both. round-robin with FUSION first was
-# measured to matter (recall@1 0.574 fusion-first vs 0.491 lightrag-first
-# on the identical merge) since fusion's BM25 channel wins exact-identifier
-# rank-1 placement.
+# The 2026-10-17 independent retrieval review (eval_agentic/rca/
+# antigravity_retrieval_review.md, recommendations #1/#4) established why that
+# design is unsound as the DEFAULT path: the merge interleaved a 0.979-recall@10
+# retriever with a 0.688–0.792 one BY POSITION, and emitting whole documents let
+# a single 17.7k-char mega-note push the gold note out of the caller's window
+# (RCA Q05) even though retrieval had ranked the gold chunk #1–2.
 #
-# This is opt-in (CONTEXT_PRIORITY_MERGED, default CONTEXT_PRIORITY_LIGHTRAG
-# = today's unmodified `context` field) and only touches the Document
-# Chunks / Reference Document List sections — entity/relation graph sections
-# are left as LightRAG produced them, preserving the structure a pure-fusion
-# swap would have discarded. Fusion-only documents (not already present in
-# LightRAG's own chunk block) are injected using their hybrid-channel
-# snippet (HYBRID_SNIPPET_MAX_CHARS), not full chunk content — a deliberate
-# simplicity tradeoff so this reuses the already-computed, already-tested
-# `hybrid.fused_chunks` data with zero extra embedding/BM25 calls.
+# Assembly is now score-ordered at CHUNK granularity with a hard global budget;
+# see `_order_assembly_candidates` / `_render_assembly_chunks`. It still only
+# touches the Document Chunks / Reference Document List sections — entity and
+# relation graph sections are left exactly as LightRAG produced them — and
+# Fusion-only chunks are injected from the already-computed `hybrid.fused_chunks`
+# data with zero extra embedding/BM25 calls.
 # ---------------------------------------------------------------------------
 _CONTEXT_REFERENCE_LINE_WITH_PATH_RE = re.compile(r"^\[(?P<ref_id>[^\]]+)\]\s*(?P<path>.+)$")
 
 
-def _round_robin_merge(primary: list[str], secondary: list[str], limit: int) -> list[str]:
-    """Interleave two ranked lists (primary[0], secondary[0], primary[1], ...),
-    deduping and stopping at `limit`. `primary` is emitted first each round —
-    see the module comment above for why that ordering was measured to matter.
+def _lightrag_rank_score(rank: int) -> float:
+    """Map a 1-indexed LightRAG context rank onto the fusion score scale.
+
+    LightRAG's rendered context encodes ORDER only, never a per-chunk score
+    (see tools/memory/eval/channels.py::lightrag_mode — `score=None` there is
+    correct, not missing). To place both branches in ONE score-ordered list the
+    graph branch's ranks are mapped reciprocally onto a deliberately lower
+    scale (LIGHTRAG_RANK_SCORE_SCALE) so a graph chunk can never displace a
+    fusion chunk of comparable rank: the graph branch fills the tail.
     """
-    out: list[str] = []
-    seen: set[str] = set()
-    i = j = 0
-    while (i < len(primary) or j < len(secondary)) and len(out) < limit:
-        if i < len(primary):
-            item = primary[i]
-            i += 1
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
-        if len(out) >= limit:
+    return LIGHTRAG_RANK_SCORE_SCALE / max(1, rank)
+
+
+def _collect_assembly_candidates(
+    lightrag_chunks: list[dict[str, Any]],
+    ref_id_to_path: dict[str, str],
+    fused_chunks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build ONE candidate list of chunks from BOTH branches, each carrying a
+    comparable score (the unit of ranking is the CHUNK, not the document).
+
+    * LightRAG chunks score by rank (`_lightrag_rank_score`).
+    * Fusion chunks score by `fused_score` (the fusion/rerank judgement).
+    * The same underlying chunk arriving from both branches is kept ONCE:
+      LightRAG's fuller content + stable reference_id, but the fusion
+      channel's score (the better-ranked channel's verdict on that chunk).
+      Recognition is either-direction text containment (truncation).
+    * Chunks only the fusion branch surfaced are injected as their own
+      candidate, deduped by (file_path, chunk_id).
+    """
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for rank, chunk in enumerate(lightrag_chunks, start=1):
+        ref_id = str(chunk.get("reference_id", ""))
+        path = ref_id_to_path.get(ref_id, "")
+        content = str(chunk.get("content", ""))
+        if not path or not content.strip():
+            continue
+        key = (path, _chunk_dedup_key(chunk))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "file_path": path,
+            "content": content,
+            "score": _lightrag_rank_score(rank),
+            "reference_id": ref_id or None,
+            "source": "lightrag",
+        })
+    for fused_chunk in fused_chunks:
+        path = str(fused_chunk.get("file_path") or fused_chunk.get("source_path") or "")
+        if not path:
+            continue
+        content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
+        if not content.strip():
+            continue
+        try:
+            score = float(fused_chunk.get("fused_score") or fused_chunk.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        # Same underlying chunk already present from LightRAG (either text is a
+        # truncation of the other)? Keep LightRAG's fuller content + its stable
+        # reference_id, but adopt the fusion channel's score — the better-ranked
+        # channel's verdict on that chunk.
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate["file_path"] == path
+                and _texts_overlap(content, str(candidate["content"]))
+            ),
+            None,
+        )
+        if match is not None:
+            match["score"] = score
+            continue
+        key = (path, _chunk_dedup_key(fused_chunk))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "file_path": path,
+            "content": content,
+            "score": score,
+            "reference_id": None,
+            "source": "fusion",
+        })
+    return candidates
+
+
+def _order_assembly_candidates(
+    candidates: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Score-order the assembled candidates, keeping source diversity as a SOFT
+    tiebreaker only.
+
+    This replaces the document-level positional round-robin
+    (`_round_robin_merge`), which unconditionally interleaved a weak branch
+    into a strong one (slots 2, 4, 6… went to the 0.69–0.79 recall@10 source
+    and pushed the 0.98 source's items down). Here:
+
+    1. the self-declared-superseded stable partition runs first (same
+       HARS_MEMORY_SUPERSESSION_* policy `fuse()` uses — see
+       retrieval/supersession.py), so a stale chunk ranks below every genuine
+       one regardless of which branch surfaced it;
+    2. the list is walked best-first, where a candidate's effective score is
+       its own score MINUS a small penalty per chunk already selected from the
+       SAME document. Diversity therefore only ever breaks near-ties — it can
+       never promote a lower-scored document over a clearly better chunk.
+
+    `limit` is the caller's `top_k` result-count knob, honoured as a SOFT
+    preference: chunks of the first `limit` documents are selected first, and
+    only once none of those remains does selection continue (still in score
+    order) with further documents — the CHAR budgets, not a document count, are
+    the structural bound. That is deliberate (2026-10-17 review recommendation
+    #4: "fill greedily by fused rank until a mandatory global budget is
+    reached"): a hard `top_k`-document cut is what left a gold note retrieved at
+    rank 7+ out of the context even though plenty of budget was left.
+
+    There is also deliberately NO hard per-document chunk cap: a document that
+    legitimately contributed several ranked chunks keeps them all, and the
+    per-document CHAR cap (`HARS_MEMORY_CONTEXT_MAX_DOC_CHARS`) is what stops
+    any single document from starving the budget.
+    """
+    if not candidates:
+        return []
+    ordered = sorted(candidates, key=lambda c: -float(c.get("score") or 0.0))
+    top_score = float(ordered[0].get("score") or 0.0)
+
+    from hars_memory.retrieval.fusion import marker_penalty_enabled
+
+    if marker_penalty_enabled():
+        from hars_memory.retrieval.supersession import is_self_declared_deprecated
+
+        def _flagged(candidate: dict[str, Any]) -> bool:
+            return is_self_declared_deprecated(str(candidate.get("content", "")))
+
+        unflagged = [c for c in ordered if not _flagged(c)]
+        flagged = [c for c in ordered if _flagged(c)]
+        # Stable partition: a self-declared-stale candidate must rank below
+        # EVERY genuine one (supersession.py's rank-only policy — stronger than
+        # fuse()'s 0.3x attenuation, and idempotent). A constant offset larger
+        # than the top score makes that hold inside the greedy selection below
+        # while preserving the relative order WITHIN each group.
+        offset = float(ordered[0].get("score") or 0.0) + 1.0
+        flagged = [
+            {**candidate, "score": float(candidate.get("score") or 0.0) - offset}
+            for candidate in flagged
+        ]
+        ordered = unflagged + flagged
+
+    pool = list(ordered)
+    selected: list[dict[str, Any]] = []
+    per_doc: dict[str, int] = {}
+    doc_count = 0
+    beyond_limit_offset = top_score + 1.0
+    while pool:
+        best_index = -1
+        best_effective: float | None = None
+        for index, candidate in enumerate(pool):
+            path = str(candidate["file_path"])
+            already = per_doc.get(path, 0)
+            penalty = HARS_MEMORY_CONTEXT_DIVERSITY_PENALTY * already
+            if already == 0 and limit > 0 and doc_count >= limit:
+                # Soft top_k preference: a NEW document beyond the caller's
+                # result count is still a candidate — the global char budget
+                # decides whether it is emitted — but it is only reached once
+                # every chunk of the first `limit` documents has been selected.
+                penalty += beyond_limit_offset
+            effective = float(candidate.get("score") or 0.0) - penalty
+            if best_effective is None or effective > best_effective:
+                best_effective = effective
+                best_index = index
+        if best_index < 0:
             break
-        if j < len(secondary):
-            item = secondary[j]
-            j += 1
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
-    return out
+        chosen = pool.pop(best_index)
+        path = str(chosen["file_path"])
+        if per_doc.get(path, 0) == 0:
+            doc_count += 1
+        per_doc[path] = per_doc.get(path, 0) + 1
+        selected.append(chosen)
+    return selected
 
 
 def _parse_chunk_block(raw: str) -> list[dict[str, Any]]:
@@ -2576,23 +2880,200 @@ def _content_covered(candidate: str, existing: str) -> bool:
     return candidate_norm in existing_norm
 
 
-def _representative_content(
-    path: str,
-    chunks_by_path: dict[str, list[dict[str, Any]]],
-    fusion_by_path: dict[str, list[dict[str, Any]]],
+def _texts_overlap(one: str, other: str) -> bool:
+    """True when either text contains the other (whitespace-normalized).
+
+    Used by the assembly stage to recognise "this is the same chunk, rendered
+    at a different length" in EITHER direction: the fusion channel carries the
+    stored chunk text while LightRAG's rendered context may have truncated it
+    (or vice versa after header folding), so a one-directional prefix check
+    would emit the same section twice.
+    """
+    return _content_covered(one, other) or _content_covered(other, one)
+
+
+def _render_assembly_chunks(
+    selected: list[dict[str, Any]],
+    ref_id_to_path: dict[str, str],
+    max_doc_chars: int,
+    max_chars: int,
+) -> list[tuple[str, str]]:
+    """Render selected chunks as LightRAG-format (chunk_line, ref_line) pairs,
+    applying the per-document cap and the hard global budget.
+
+    Budgets count EMITTED CONTENT characters (the JSON envelope and reference
+    lines add ~2% on top and are not counted). A chunk that would exceed the
+    global budget is SKIPPED, not truncated — assembly keeps walking the
+    score-ordered list so the remaining space goes to the next-best chunk that
+    fits, never to a mid-word cut. Two deliberate exceptions keep the contract
+    "never return an empty context because the budget was tiny":
+      * the FIRST emitted chunk is truncated to the leftover budget;
+      * the per-document cap always truncates at a line boundary (the marker
+        makes the loss visible) and drops that document's later chunks.
+    """
+    existing_ids = {int(rid) for rid in ref_id_to_path if rid.isdigit()}
+    next_ref_id = (max(existing_ids) + 1) if existing_ids else 1
+    used_ref_ids: set[str] = set(ref_id_to_path)
+    emitted_ref_ids: set[str] = set()
+    rendered: list[tuple[str, str]] = []
+    used_chars = 0
+    per_doc_chars: dict[str, int] = {}
+    docs_truncated = 0
+
+    def _allocate_ref_id() -> str:
+        nonlocal next_ref_id
+        while str(next_ref_id) in used_ref_ids:
+            next_ref_id += 1
+        ref_id = str(next_ref_id)
+        next_ref_id += 1
+        used_ref_ids.add(ref_id)
+        return ref_id
+
+    for candidate in selected:
+        content = str(candidate.get("content", ""))
+        path = str(candidate["file_path"])
+        if not content.strip():
+            continue
+        if max_doc_chars:
+            doc_remaining = max_doc_chars - per_doc_chars.get(path, 0)
+            if doc_remaining <= 0:
+                continue
+            if len(content) > doc_remaining:
+                trimmed = _truncate_on_line_boundary(content, doc_remaining)
+                # A truncated chunk that keeps almost nothing (say, only the
+                # "…[truncated]" marker) is junk in a prompt — drop it instead
+                # of emitting a 12-char noise block. Same 200-char floor
+                # `_clean_chunks_block` already applies to orphan fragments.
+                if len(trimmed) - len(CONTEXT_TRUNCATION_MARKER) < CONTEXT_MIN_CHUNK_CHARS:
+                    continue
+                content = trimmed
+                docs_truncated += 1
+        if max_chars:
+            room = max_chars - used_chars
+            if room <= 0:
+                break
+            if len(content) > room:
+                if rendered:
+                    continue
+                content = _truncate_on_line_boundary(content, room)
+        if not content.strip():
+            continue
+        if content.endswith(CONTEXT_TRUNCATION_MARKER) and (
+            len(content) - len(CONTEXT_TRUNCATION_MARKER) < CONTEXT_MIN_CHUNK_CHARS
+        ):
+            continue
+        own_ref_id = str(candidate.get("reference_id") or "")
+        if own_ref_id and own_ref_id not in emitted_ref_ids:
+            ref_id = own_ref_id
+        else:
+            ref_id = _allocate_ref_id()
+        emitted_ref_ids.add(ref_id)
+        chunk_line = json.dumps(
+            {
+                "reference_id": ref_id,
+                "content": content,
+                "section": _extract_breadcrumb_from_content(content),
+            },
+            ensure_ascii=False,
+        )
+        ref_line = f"[{ref_id}] {path}"
+        rendered.append((chunk_line, ref_line))
+        used_chars += len(content)
+        per_doc_chars[path] = per_doc_chars.get(path, 0) + len(content)
+
+    if docs_truncated:
+        logger.info(
+            "Per-document cap %d chars truncated %d chunk(s) in assembled context",
+            max_doc_chars,
+            docs_truncated,
+        )
+    if max_chars and used_chars >= max_chars:
+        logger.info(
+            "Context budget %d chars reached; later chunks dropped (%d chunk(s) emitted)",
+            max_chars,
+            len(rendered),
+        )
+    return rendered
+
+
+def _splice_context_sections(
+    context: str, new_chunk_lines: list[str], new_ref_lines: list[str]
 ) -> str:
-    """Content used to score a DOCUMENT (supersession rescoring operates on
-    documents, not chunks). Prefers LightRAG's own (fuller) chunks, joining
-    all of them so a marker in any chunk of the document is seen; falls back
-    to the fusion channel's content/snippet for fusion-exclusive documents."""
-    lightrag = chunks_by_path.get(path) or []
-    if lightrag:
-        return "\n".join(str(chunk.get("content", "")) for chunk in lightrag)
-    for fused_chunk in fusion_by_path.get(path) or []:
-        content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
-        if content:
-            return content
-    return ""
+    """Replace the Document Chunks + Reference Document List fenced blocks of an
+    existing LightRAG context, in place, with the assembled lines.
+
+    Sequential splice: the chunk block is replaced first, then the reference
+    block is RE-LOCATED on the mutated string, because replacing the first
+    block shifts every downstream offset (same pattern as
+    `_postprocess_context`).
+    """
+    result = context
+    chunks_block_now = _extract_fenced_block(result, _CONTEXT_CHUNK_SECTION_HEADER)
+    assert chunks_block_now is not None  # caller matched it; header text is unchanged
+    start, end, _ = chunks_block_now
+    result = result[:start] + "\n".join(new_chunk_lines) + result[end:]
+
+    refs_block_now = _extract_fenced_block(result, _CONTEXT_REFERENCE_SECTION_HEADER)
+    assert refs_block_now is not None
+    start, end, _ = refs_block_now
+    result = result[:start] + "\n".join(new_ref_lines) + result[end:]
+    return result
+
+
+# Full section headers as LightRAG itself renders them (the module's
+# `_CONTEXT_*_SECTION_HEADER` constants are PREFIXES used for locating the
+# block; a fusion-only context has to write the whole header itself).
+_CONTEXT_CHUNK_SECTION_HEADER_FULL = (
+    "Document Chunks (Each entry has a reference_id refer to the `Reference Document List`):"
+)
+_CONTEXT_REFERENCE_SECTION_HEADER_FULL = (
+    "Reference Document List (Each entry starts with a [reference_id] "
+    "that corresponds to entries in the Document Chunks):"
+)
+
+
+def _build_context_string(new_chunk_lines: list[str], new_ref_lines: list[str]) -> str:
+    """Render a LightRAG-shaped context string from assembled chunk lines.
+
+    Used when the graph branch did NOT run (HARS_MEMORY_GRAPH_BRANCH routing),
+    so there is no LightRAG context string to splice into. Only the two
+    sections that actually exist are emitted — no empty Knowledge-Graph
+    entity/relation blocks pretending a graph pass ran.
+    """
+    return (
+        "\n" + _CONTEXT_CHUNK_SECTION_HEADER_FULL + "\n\n```json\n"
+        + "\n".join(new_chunk_lines)
+        + "\n```\n\n"
+        + _CONTEXT_REFERENCE_SECTION_HEADER_FULL + "\n\n```\n"
+        + "\n".join(new_ref_lines)
+        + "\n```\n\n"
+    )
+
+
+def _render_fusion_only_context(
+    fused_chunks: list[dict[str, Any]],
+    limit: int,
+    max_doc_chars: int | None = None,
+    max_chars: int | None = None,
+) -> str | None:
+    """Assemble the `context` field from BRANCH 1 ALONE (dense+sparse fusion).
+
+    Returns the rendered context, or None when branch 1 produced no usable
+    chunk (the caller then reports `has_context=False` honestly instead of a
+    fake empty context).
+    """
+    if max_doc_chars is None:
+        max_doc_chars = HARS_MEMORY_CONTEXT_MAX_DOC_CHARS
+    if max_chars is None:
+        max_chars = HARS_MEMORY_CONTEXT_MAX_CHARS
+    candidates = _collect_assembly_candidates([], {}, fused_chunks)
+    selected = _order_assembly_candidates(candidates, limit)
+    rendered = _render_assembly_chunks(selected, {}, max_doc_chars, max_chars)
+    if not rendered:
+        return None
+    return _build_context_string(
+        [line for line, _ in rendered], [line for _, line in rendered]
+    )
 
 
 def _merge_context_with_fusion(
@@ -2602,31 +3083,39 @@ def _merge_context_with_fusion(
     max_doc_chars: int | None = None,
     max_chars: int | None = None,
 ) -> tuple[str, bool]:
-    """Reorder/augment `context`'s Document Chunks + Reference Document List
-    sections into round-robin(fusion, lightrag) document order.
+    """Assemble `context`'s Document Chunks + Reference Document List sections
+    by SCORE-ORDERED CHUNK selection across both branches.
 
-    Budget controls (Fix 1, RCA 2026-10-14 — one mega-note could previously
-    emit a ~17.7k-char block and push later documents past any caller's
-    window):
+    Replaces the document-level round-robin(fusion, lightrag) merge (2026-10-17
+    retrieval review, recommendation #4): interleaving two incomparably-ranked
+    retrievers by POSITION pushed the better branch's chunks down, and emitting
+    WHOLE documents let one 17.7k-char mega-note push the gold note past a
+    caller's window (RCA Q05) even though retrieval had ranked it #1–2.
+
+    Now every candidate chunk from both branches carries one comparable score
+    (fusion score; LightRAG context rank mapped onto the lower
+    LIGHTRAG_RANK_SCORE_SCALE band), the best ones are selected first with
+    source diversity as a soft tiebreaker only, and the emitted blocks are
+    chunk-level.
+
+    Budget controls:
       * `max_doc_chars` (default HARS_MEMORY_CONTEXT_MAX_DOC_CHARS, 6000):
-        per-document cap on the RENDERED content — a document whose chunks
-        exceed it is truncated at a paragraph/line boundary (never mid-word)
-        with a "…[truncated]" marker, and its remaining chunks are dropped.
-        0 disables the per-document cap.
-      * `max_chars` (default HARS_MEMORY_CONTEXT_MAX_CHARS, 0 = no cap, the
-        historical behaviour): total rendered-char budget for the assembled
-        chunk emission. Assembly stays fused-rank order and stops BEFORE the
-        first document that would not fit — whole-document granularity, never
-        a blind mid-buffer cut. The first document is always emitted (bounded
-        by the per-document cap when enabled), so a budget smaller than one
-        document degrades to that single document rather than to nothing.
+        per-document cap on emitted content — a chunk that would exceed it is
+        truncated at a paragraph/line boundary (never mid-word) with a
+        "…[truncated]" marker and the document's later chunks are dropped. 0
+        disables the per-document cap.
+      * `max_chars` (default HARS_MEMORY_CONTEXT_MAX_CHARS, 15000 = the
+        harness' documented consumer window): hard global budget on emitted
+        content; a chunk that does not fit is skipped so the space goes to the
+        next-best chunk that does. 0 disables the cap.
 
     None resolves to the env-derived module default; the MCP `max_chars`
     argument overrides the total budget per call.
 
     Returns (new_context, applied). applied=False (context returned
-    unchanged) if either fenced section is missing or the merge would be a
-    no-op — fails closed, matching _postprocess_context's contract.
+    unchanged) if either fenced section is missing, no candidate survives the
+    budgets, or the merge would be a no-op — fails closed, matching
+    `_postprocess_context`'s contract.
     """
     if max_doc_chars is None:
         max_doc_chars = HARS_MEMORY_CONTEXT_MAX_DOC_CHARS
@@ -2644,226 +3133,16 @@ def _merge_context_with_fusion(
     if not lightrag_chunks or not ref_id_to_path:
         return context, False
 
-    # Multi-chunk per document: a single file legitimately contributes SEVERAL
-    # ranked chunks (different sections of the same markdown document). Keying
-    # by path alone dropped every chunk after the first, silently losing
-    # relevant content. Chunks are deduped by (file_path, chunk_id) instead,
-    # while DOCUMENT order (and therefore `limit`, which counts documents)
-    # stays exactly as the round-robin merge produced it.
-    lightrag_order: list[str] = []
-    chunks_by_path: dict[str, list[dict[str, Any]]] = {}
-    seen_lightrag_keys: set[tuple[str, str]] = set()
-    for chunk in lightrag_chunks:
-        ref_id = str(chunk.get("reference_id", ""))
-        path = ref_id_to_path.get(ref_id, "")
-        if not path:
-            continue
-        key = (path, _chunk_dedup_key(chunk))
-        if key in seen_lightrag_keys:
-            continue
-        seen_lightrag_keys.add(key)
-        if path not in chunks_by_path:
-            lightrag_order.append(path)
-            chunks_by_path[path] = []
-        chunks_by_path[path].append(chunk)
-
-    fusion_order: list[str] = []
-    fusion_by_path: dict[str, list[dict[str, Any]]] = {}
-    seen_fusion_keys: set[tuple[str, str]] = set()
-    for fused_chunk in fused_chunks:
-        path = str(fused_chunk.get("file_path", ""))
-        if not path:
-            continue
-        key = (path, _chunk_dedup_key(fused_chunk))
-        if key in seen_fusion_keys:
-            continue
-        seen_fusion_keys.add(key)
-        if path not in fusion_by_path:
-            fusion_order.append(path)
-            fusion_by_path[path] = []
-        fusion_by_path[path].append(fused_chunk)
-
-    merged_order = _round_robin_merge(fusion_order, lightrag_order, limit)
-    if not merged_order:
+    candidates = _collect_assembly_candidates(lightrag_chunks, ref_id_to_path, fused_chunks)
+    selected = _order_assembly_candidates(candidates, limit)
+    if not selected:
         return context, False
-
-    # Supersession-aware rescoring of the FINAL MERGED list — companion to
-    # HARS_MEMORY_SUPERSESSION_SCORING, gated by the SAME flag `fuse()` uses
-    # (see retrieval/fusion.py's `marker_penalty_enabled`). Without this,
-    # HARS_MEMORY_SUPERSESSION_SCORING is a no-op on context_priority=merged:
-    # fuse() only ever reorders the FUSION channel's OWN candidates, so a
-    # superseded doc reachable only via LightRAG's own graph/vector ranking
-    # (never scored, never touched by fuse()) can still outrank the correct
-    # doc in the interleaved output even when the fusion channel alone would
-    # get the ordering right. Measured on the 46-query retrieval_queries.yaml
-    # set (tools/memory/eval): merged+supersession was 0.333 supersession_
-    # error_rate (identical to supersession OFF) before this rescoring pass;
-    # 0.167 after — matching the fusion-channel-alone number, i.e. the gain
-    # is no longer washed out by the merge. See
-    # retrieval/supersession.py's `apply_marker_penalty_to_ranked_list`
-    # docstring for why this is a stable partition (not the multiplicative
-    # attenuation `fuse()` itself uses) and why that composes safely with
-    # fuse()'s own already-applied penalty on the fusion-side share of this
-    # same list without double-penalizing it (idempotent by construction).
-    # Content lookup prefers LightRAG's own (fuller) chunk content when a
-    # path is in both channels; falls back to the fusion channel's truncated
-    # snippet (HYBRID_SNIPPET_MAX_CHARS) for fusion-exclusive documents —
-    # same preference order the chunk-emission loop below already uses.
-    from hars_memory.retrieval.fusion import marker_penalty_enabled
-
-    if marker_penalty_enabled():
-        from hars_memory.retrieval.supersession import apply_marker_penalty_to_ranked_list
-
-        ranked_with_content = [
-            (path, _representative_content(path, chunks_by_path, fusion_by_path))
-            for path in merged_order
-        ]
-        merged_order = apply_marker_penalty_to_ranked_list(ranked_with_content)
-
-    existing_ref_ids = {int(rid) for rid in ref_id_to_path if rid.isdigit()}
-    next_ref_id = (max(existing_ref_ids) + 1) if existing_ref_ids else 1
-
-    used_ref_ids: set[str] = set(ref_id_to_path)
-    # Every EMITTED chunk gets its own reference_id: LightRAG's original id is
-    # kept for the first chunk of a document (stable citations), any further
-    # chunk of the same document (and every fusion-exclusive injection) gets a
-    # freshly allocated one, so no two emitted chunks ever share an id.
-    emitted_ref_ids: set[str] = set()
-
-    def _allocate_ref_id() -> str:
-        nonlocal next_ref_id
-        while str(next_ref_id) in used_ref_ids:
-            next_ref_id += 1
-        ref_id = str(next_ref_id)
-        next_ref_id += 1
-        used_ref_ids.add(ref_id)
-        return ref_id
-
-    # Emit per-DOCUMENT groups first, then apply the budgets: the per-doc cap
-    # bounds each group's rendered size, the total budget then admits whole
-    # groups in fused-rank order until it is exhausted (no mid-document cut).
-    doc_block_pairs: list[list[tuple[str, str]]] = []
-    doc_block_sizes: list[int] = []
-    docs_truncated = 0
-    for path in merged_order:
-        pairs: list[tuple[str, str]] = []
-        used_chars = 0
-        emitted_contents: list[str] = []
-        truncated_this_doc = False
-
-        def _fit_to_doc_budget(content: str) -> str:
-            """Shrink `content` to the per-document budget once this document's
-            emitted chunks fill it (never mid-word; marker appended)."""
-            nonlocal truncated_this_doc
-            if not max_doc_chars or used_chars + len(content) <= max_doc_chars:
-                return content
-            truncated_this_doc = True
-            return _truncate_on_line_boundary(content, max(0, max_doc_chars - used_chars))
-
-        for chunk in chunks_by_path.get(path, []):
-            if max_doc_chars and used_chars >= max_doc_chars:
-                break
-            own_ref_id = str(chunk.get("reference_id", ""))
-            if own_ref_id and own_ref_id not in emitted_ref_ids:
-                ref_id = own_ref_id
-            else:
-                ref_id = _allocate_ref_id()
-            emitted_ref_ids.add(ref_id)
-            emitted = dict(chunk)
-            content = _fit_to_doc_budget(str(emitted.get("content", "")))
-            emitted["content"] = content
-            emitted["reference_id"] = ref_id
-            emitted["section"] = _extract_breadcrumb_from_content(content)
-            emitted_contents.append(content)
-            chunk_line = json.dumps(emitted, ensure_ascii=False)
-            ref_line = f"[{ref_id}] {path}"
-            pairs.append((chunk_line, ref_line))
-            used_chars += len(content)
-        # Fusion-exclusive document: LightRAG's own context never surfaced it,
-        # so every one of its fusion chunks is injected — full chunk content
-        # when the hybrid channel provides it, snippet otherwise. Documents
-        # LightRAG already emitted keep LightRAG's own (fuller) chunks only,
-        # exactly as before, to avoid duplicating the same content twice.
-        if not chunks_by_path.get(path):
-            for fused_chunk in fusion_by_path.get(path, []):
-                if max_doc_chars and used_chars >= max_doc_chars:
-                    break
-                content = str(fused_chunk.get("content") or fused_chunk.get("snippet", ""))
-                if not content.strip():
-                    continue
-                if any(_content_covered(content, existing) for existing in emitted_contents):
-                    continue
-                content = _fit_to_doc_budget(content)
-                ref_id = _allocate_ref_id()
-                emitted_ref_ids.add(ref_id)
-                emitted_contents.append(content)
-                chunk_line = json.dumps(
-                    {
-                        "reference_id": ref_id,
-                        "content": content,
-                        "section": _extract_breadcrumb_from_content(content),
-                    },
-                    ensure_ascii=False,
-                )
-                ref_line = f"[{ref_id}] {path}"
-                pairs.append((chunk_line, ref_line))
-                used_chars += len(content)
-        if truncated_this_doc:
-            docs_truncated += 1
-        if pairs:
-            doc_block_pairs.append(pairs)
-            doc_block_sizes.append(
-                sum(len(chunk_line) + len(ref_line) + 2 for chunk_line, ref_line in pairs)
-            )
-
-    # Total budget: whole-document granularity — stop before the first document
-    # that would not fit entirely (the first document is always admitted so a
-    # tiny budget degrades to one bounded document, never to an empty context).
-    kept_pairs: list[list[tuple[str, str]]] = []
-    total_chars = 0
-    docs_dropped = 0
-    for pairs, size in zip(doc_block_pairs, doc_block_sizes):
-        if max_chars and kept_pairs and total_chars + size > max_chars:
-            docs_dropped = len(doc_block_pairs) - len(kept_pairs)
-            break
-        kept_pairs.append(pairs)
-        total_chars += size
-    if docs_dropped:
-        logger.info(
-            "Context budget %d chars reached after %d document(s); dropped %d later document(s)",
-            max_chars,
-            len(kept_pairs),
-            docs_dropped,
-        )
-    if docs_truncated:
-        logger.info(
-            "Per-document cap %d chars truncated %d document(s) in assembled context",
-            max_doc_chars,
-            docs_truncated,
-        )
-
-    new_chunk_lines: list[str] = [line for pairs in kept_pairs for line, _ in pairs]
-    new_ref_lines: list[str] = [line for pairs in kept_pairs for _, line in pairs]
-
-    if not new_chunk_lines:
+    rendered = _render_assembly_chunks(selected, ref_id_to_path, max_doc_chars, max_chars)
+    if not rendered:
         return context, False
-
-    result = context
-    # Splice the chunks block, then re-locate the reference block on the
-    # now-mutated `result` before splicing it — same sequential-splice
-    # pattern as _postprocess_context, required because splicing the first
-    # block shifts every downstream string offset.
-    chunks_block_now = _extract_fenced_block(result, _CONTEXT_CHUNK_SECTION_HEADER)
-    assert chunks_block_now is not None  # just matched above; header text is unchanged
-    start, end, _ = chunks_block_now
-    result = result[:start] + "\n".join(new_chunk_lines) + result[end:]
-
-    refs_block_now = _extract_fenced_block(result, _CONTEXT_REFERENCE_SECTION_HEADER)
-    assert refs_block_now is not None
-    start, end, _ = refs_block_now
-    result = result[:start] + "\n".join(new_ref_lines) + result[end:]
-
-    return result, True
+    new_chunk_lines = [line for line, _ in rendered]
+    new_ref_lines = [line for _, line in rendered]
+    return _splice_context_sections(context, new_chunk_lines, new_ref_lines), True
 
 
 # ---------------------------------------------------------------------------
@@ -2888,9 +3167,13 @@ async def list_tools() -> list[Tool]:
                 "question). Russian corpus: use RUSSIAN (a Russian question over Russian docs was never worse than "
                 "English). Mixed corpus: add keywords in both languages or repeat the query in the second language. "
                 "Always keep identifiers, field names and error codes verbatim. "
-                "If BOTH ll_keywords and hl_keywords are omitted, the query silently runs in naive mode "
-                "instead of the requested mode (naive needs no keywords and empirically has the best "
-                "signal-to-noise without them) — the response's mode_fallback field explains when this fired. "
+                "If BOTH ll_keywords and hl_keywords are omitted, the graph branch is SKIPPED by default "
+                "(HARS_MEMORY_GRAPH_BRANCH=auto): with no keywords LightRAG can only run `naive`, a second "
+                "dense vector search over the SAME chunk store the dense+BM25 fusion branch already "
+                "queried, so the response is assembled from fusion alone (measured: +7.6 s/query for no "
+                "quality gain). The response's `lightrag_mode` then reads \"skipped\" and `graph_branch` "
+                "gives the exact reason; supply keywords (or set HARS_MEMORY_GRAPH_BRANCH=on) to run the "
+                "graph pass. "
                 "Default context_only=true returns raw graph context for you to synthesise. "
                 "mode: local (entity-neighborhood) | global (community themes) | "
                 "hybrid (default, both) | naive (pure vector, also the automatic no-keyword fallback). "
@@ -2929,8 +3212,13 @@ async def list_tools() -> list[Tool]:
                     "type": "string",
                     "enum": ["local", "global", "hybrid", "naive"],
                     "default": "hybrid",
-                    "description": "Retrieval mode. Overridden to 'naive' automatically when both "
-                                   "ll_keywords and hl_keywords are empty (see mode_fallback in the response).",
+                    "description": "Retrieval mode. The LightRAG graph pass runs only when there is a real "
+                                   "graph signal — ll_keywords/hl_keywords supplied (modes local/global/"
+                                   "hybrid then run as requested) — because with no keywords it would "
+                                   "degrade to `naive`, a duplicate dense search over the same chunk store "
+                                   "the fusion branch already queried. When skipped, `lightrag_mode` reads "
+                                   "'skipped' and `graph_branch.reason` explains why; see "
+                                   "HARS_MEMORY_GRAPH_BRANCH.",
                 },
                 "top_k": {
                     "type": "integer", "default": DEFAULT_QUERY_TOP_K, "minimum": 1, "maximum": 50,
@@ -2988,17 +3276,16 @@ async def list_tools() -> list[Tool]:
                     "type": "integer",
                     "minimum": 0,
                     "description": (
-                        "Caller-side TOTAL char budget for the assembled `context` text "
-                        "(context_only=true). Applied by the context assembly (context_priority="
-                        f"'{CONTEXT_PRIORITY_MERGED}', the default): documents stay in fused-rank "
-                        "order and assembly stops BEFORE the first whole document that would not "
-                        "fit — no mid-context truncation, so nothing is amputated halfway. Each "
-                        "document's block is additionally capped at "
+                        "Caller-side TOTAL char budget for the assembled `context` content "
+                        "(context_only=true). Applied by the chunk-score-ordered assembly "
+                        f"(context_priority='{CONTEXT_PRIORITY_MERGED}', the default): the best-scored "
+                        "chunks from both branches are emitted first and a chunk that no longer fits is "
+                        "SKIPPED — never a blind mid-context cut, so the highest-ranked evidence always "
+                        "survives. Each document's emitted content is additionally capped at "
                         "HARS_MEMORY_CONTEXT_MAX_DOC_CHARS chars (default 6000, line-boundary "
-                        "truncation with a '…[truncated]' marker) regardless of this argument. "
-                        "Omit or pass 0 for the default: no total cap "
-                        "(HARS_MEMORY_CONTEXT_MAX_CHARS, default 0 = the historical behaviour). "
-                        "Pass e.g. 15000 when your harness window is 15k chars."
+                        "truncation with a '…[truncated]' marker). "
+                        "Omit to use the server default (HARS_MEMORY_CONTEXT_MAX_CHARS, default 15000 — "
+                        "the documented consumer window); pass 0 to disable the total cap."
                     ),
                 },
                 "context_priority": {
@@ -3010,17 +3297,18 @@ async def list_tools() -> list[Tool]:
                         "DEFAULT_CONTEXT_PRIORITY / HARS_MEMORY_CONTEXT_PRIORITY_DEFAULT to change the "
                         f"server-wide default; pass '{CONTEXT_PRIORITY_LIGHTRAG}' explicitly for the "
                         "pre-2026-07-30 behaviour (today's unmodified `context` field) on any single call. "
-                        f"'{CONTEXT_PRIORITY_MERGED}' reorders/augments the context_only `context` "
-                        "field's Document Chunks section into round-robin(fusion, lightrag) document "
-                        "order, with supersession-aware rescoring of the merged list when "
-                        "HARS_MEMORY_SUPERSESSION_SCORING is on (default on). Measured on this corpus "
-                        "(46-query retrieval_queries.yaml, top_k=10) vs the pre-flip lightrag-only "
-                        "default: recall@1 0.477->0.5324, recall@10 0.727->0.8241, ndcg@10 0.637->0.7151, "
-                        "mrr 0.634->0.7030, supersession_error 0.333->0.1667 — the two channels are "
-                        "complementary, not redundant, and supersession scoring further fixes stale-doc "
-                        "outranking with no measured regression on any metric or query type. Fusion-only "
-                        "documents are injected using their `hybrid.fused_chunks[].snippet` (truncated), "
-                        "not full chunk content. Only affects context_only=True; ignored (no-op, see "
+                        f"'{CONTEXT_PRIORITY_MERGED}' assembles the context_only `context` field's "
+                        "Document Chunks section by SCORE-ORDERED CHUNK selection across both branches "
+                        "(fusion score; LightRAG context rank mapped onto a lower band), emitting "
+                        "chunk-level blocks under the per-document + global char budgets, with source "
+                        "diversity as a soft tiebreaker only. Supersession-aware rescoring of the "
+                        "assembled list applies when HARS_MEMORY_SUPERSESSION_SCORING is on (default on). "
+                        "This replaced the document-level round-robin merge that let a weak branch (and "
+                        "one 17.7k-char mega-note) displace the gold note — see "
+                        "eval_agentic/rca/antigravity_retrieval_review.md, recommendation #4. When the "
+                        "graph branch is skipped (HARS_MEMORY_GRAPH_BRANCH=auto with no keywords) the "
+                        f"assembly is reported as '{CONTEXT_PRIORITY_FUSION_ONLY}' and draws on branch 1 "
+                        "alone. Only affects context_only=True; ignored (no-op, see "
                         "`context_priority_applied` in the response) for the answer-generation path."
                     ),
                 },
@@ -3402,6 +3690,32 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             kw_args = {"ll_keywords": ll_keywords, "hl_keywords": hl_keywords} if (ll_keywords or hl_keywords) else {}
             rag_mode, mode_fallback = _resolve_query_mode(rag_mode, ll_keywords, hl_keywords)
 
+            # Does the graph branch run at all? (2026-10-17 review rec. #1):
+            # with no keywords `_resolve_query_mode` degrades to LightRAG
+            # `naive`, which is a SECOND dense pass over the same chunks_vdb
+            # branch 1 already queried — under the default
+            # HARS_MEMORY_GRAPH_BRANCH=auto that degenerate pass is skipped and
+            # the requested mode is reported as "skipped" (never a fake naive).
+            # Only the context_only path is routed here; the answer path needs
+            # retrieved context to synthesise from.
+            graph_branch_enabled, graph_branch_reason, graph_reported_mode = _resolve_graph_branch(
+                rag_mode, context_priority=context_priority
+            )
+            if not context_only:
+                graph_branch_enabled, graph_branch_reason, graph_reported_mode = (
+                    True,
+                    "answer path (context_only=false) always runs the graph pass",
+                    rag_mode,
+                )
+            if not graph_branch_enabled:
+                rag_mode = graph_reported_mode  # "skipped"
+                mode_fallback = None
+            graph_branch_fields: dict[str, Any] = {
+                "enabled": graph_branch_enabled,
+                "setting": HARS_MEMORY_GRAPH_BRANCH,
+                "reason": graph_branch_reason,
+            }
+
             last_ingest, stale_days = _staleness_info(_graph_file_path(project_meta))
             staleness_fields: dict[str, Any] = {"last_ingest": last_ingest, "stale_days": stale_days}
             if stale_days is not None and stale_days > STALE_INDEX_WARNING_DAYS:
@@ -3423,7 +3737,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 "trace_start",
                 question=question,
                 mode=mode,
-                lightrag_mode=rag_mode,
+                lightrag_mode=graph_reported_mode,
                 mode_fallback=mode_fallback,
                 top_k=top_k,
                 fetch_top_k=fetch_top_k,
@@ -3437,6 +3751,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 context_priority=context_priority,
                 ll_keywords=ll_keywords,
                 hl_keywords=hl_keywords,
+                graph_branch=graph_branch_fields,
             )
 
             rag = await _get_rag(project_id)
@@ -3502,31 +3817,53 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 if HARS_MEMORY_RERANK_BACKEND in {"off", "http"}:
                     query_param_options["enable_rerank"] = False
                 if context_only:
-                    # No local answer LLM: return the retrieved graph context and let
-                    # the calling agent synthesise the answer itself.
-                    graph_start = time.monotonic()
-                    context = await asyncio.wait_for(
-                        rag.aquery(  # type: ignore[attr-defined]
-                            question,
-                            param=QueryParam(
-                                mode=rag_mode,
-                                top_k=top_k,
-                                chunk_top_k=fetch_top_k,
-                                only_need_context=True,
-                                max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
-                                max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
-                                **query_param_options,
+                    # No local answer LLM: return the retrieved context and let
+                    # the calling agent synthesise the answer itself. WHICH
+                    # branch produces it is decided by HARS_MEMORY_GRAPH_BRANCH
+                    # (see _resolve_graph_branch): with no keywords LightRAG can
+                    # only run `naive` — a second dense search over the very
+                    # same chunk store branch 1 already queried — so the graph
+                    # pass is skipped by default and the context is assembled
+                    # from the dense+sparse fusion branch alone.
+                    context: Any = None
+                    graph_channel_ms: float | None = None
+                    if graph_branch_enabled:
+                        graph_start = time.monotonic()
+                        context = await asyncio.wait_for(
+                            rag.aquery(  # type: ignore[attr-defined]
+                                question,
+                                param=QueryParam(
+                                    mode=rag_mode,
+                                    top_k=top_k,
+                                    chunk_top_k=fetch_top_k,
+                                    only_need_context=True,
+                                    max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                                    max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                                    **query_param_options,
+                                ),
                             ),
-                        ),
-                        timeout=query_timeout,
+                            timeout=query_timeout,
+                        )
+                        graph_channel_ms = (time.monotonic() - graph_start) * 1000
+                    else:
+                        logger.info(
+                            "memory_recall graph branch skipped (HARS_MEMORY_GRAPH_BRANCH=%s): %s",
+                            HARS_MEMORY_GRAPH_BRANCH,
+                            graph_branch_reason,
+                        )
+
+                    has_lightrag_context = (
+                        graph_branch_enabled
+                        and bool(context)
+                        and str(context).strip() not in ("", "[no-context]")
                     )
-                    graph_channel_ms = (time.monotonic() - graph_start) * 1000
-                    has_context = bool(context) and str(context).strip() not in ("", "[no-context]")
-                    if _has_graph_entity_context(context):
-                        hybrid_block["confidence"]["low_confidence"] = False
-                    context_priority_applied = CONTEXT_PRIORITY_LIGHTRAG
-                    if has_context and isinstance(context, str):
+                    context_priority_applied: str | None = None
+                    context_for_response: str | None = None
+                    if has_lightrag_context and isinstance(context, str):
                         context_for_response = _postprocess_context(context)
+                        context_priority_applied = CONTEXT_PRIORITY_LIGHTRAG
+                        if _has_graph_entity_context(context):
+                            hybrid_block["confidence"]["low_confidence"] = False
                         if context_priority == CONTEXT_PRIORITY_MERGED:
                             merged_context, applied = _merge_context_with_fusion(
                                 context_for_response,
@@ -3537,7 +3874,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                             if applied:
                                 context_for_response = merged_context
                                 context_priority_applied = CONTEXT_PRIORITY_MERGED
-                    elif has_context:
+                    elif has_lightrag_context:
                         # Defensive: a future LightRAG version could return a structured
                         # object instead of a str. Post-processing only knows how to
                         # parse the confirmed str format, so it is skipped here rather
@@ -3551,30 +3888,73 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                             type(context).__name__,
                         )
                     else:
-                        context_for_response = None
+                        # Graph branch skipped (or it returned nothing): assemble
+                        # the context from branch 1 alone — score-ordered chunks,
+                        # chunk-level blocks, per-doc + global budgets.
+                        context_for_response = _render_fusion_only_context(
+                            hybrid_block.get("fused_chunks") or [],
+                            top_k,
+                            max_chars=max_chars_arg,
+                        )
+                        if context_for_response is not None:
+                            context_priority_applied = CONTEXT_PRIORITY_FUSION_ONLY
+                    has_context = bool(
+                        context_for_response and str(context_for_response).strip()
+                    )
+                    if has_context:
+                        recall_error: str | None = None
+                    elif not graph_branch_enabled:
+                        # Actionable, honest failure: the graph branch was
+                        # deliberately skipped and branch 1 had nothing to
+                        # assemble — say both, instead of a bare "no context".
+                        recall_error = (
+                            "no context retrieved: the graph branch was skipped "
+                            f"(HARS_MEMORY_GRAPH_BRANCH={HARS_MEMORY_GRAPH_BRANCH}: {graph_branch_reason}) "
+                            "and the dense+sparse fusion channel returned no usable chunks. Supply "
+                            "ll_keywords/hl_keywords, check HARS_MEMORY_HYBRID_ENABLED, or set "
+                            "HARS_MEMORY_GRAPH_BRANCH=on to force the LightRAG pass."
+                        )
+                        logger.warning("memory_recall: %s", recall_error)
+                    else:
+                        recall_error = "no context retrieved for this question"
                     # Live trace (SSE): graph pass + assembled context. The
                     # entity/relation/source rows are *derived* by parsing the
-                    # rendered LightRAG context (the only place they exist on
-                    # this path); latency, char count, caps and the priority
-                    # actually applied are measured.
-                    ctx_blocks = _trace_parse_context_blocks(context if isinstance(context, str) else "")
-                    await trace_emit(
-                        "graph_expand",
-                        mode=rag_mode,
-                        latency_ms=round(graph_channel_ms, 2),
-                        entity_count=len(ctx_blocks["entities"]),
-                        relation_count=len(ctx_blocks["relations"]),
-                        traversed_edge_count=len(ctx_blocks["relations"]),
-                        entities=[
-                            {"name": item.get("entity"), "type": item.get("type")}
-                            for item in ctx_blocks["entities"][:HARS_MEMORY_TRACE_HITS_CAP]
-                        ],
-                        relations=[
-                            {"entity1": item.get("entity1"), "entity2": item.get("entity2")}
-                            for item in ctx_blocks["relations"][:HARS_MEMORY_TRACE_HITS_CAP]
-                        ],
-                        derived_from="context_string",
+                    # rendered context (the only place they exist on this path);
+                    # latency, char count, caps and the priority actually applied
+                    # are measured.
+                    ctx_blocks = _trace_parse_context_blocks(
+                        context_for_response if isinstance(context_for_response, str) else ""
                     )
+                    if graph_branch_enabled:
+                        await trace_emit(
+                            "graph_expand",
+                            skipped=False,
+                            mode=rag_mode,
+                            latency_ms=round(graph_channel_ms, 2) if graph_channel_ms is not None else None,
+                            entity_count=len(ctx_blocks["entities"]),
+                            relation_count=len(ctx_blocks["relations"]),
+                            traversed_edge_count=len(ctx_blocks["relations"]),
+                            entities=[
+                                {"name": item.get("entity"), "type": item.get("type")}
+                                for item in ctx_blocks["entities"][:HARS_MEMORY_TRACE_HITS_CAP]
+                            ],
+                            relations=[
+                                {"entity1": item.get("entity1"), "entity2": item.get("entity2")}
+                                for item in ctx_blocks["relations"][:HARS_MEMORY_TRACE_HITS_CAP]
+                            ],
+                            derived_from="context_string",
+                        )
+                    else:
+                        # Honest skip frame: no entity/relation counters at all
+                        # (zeros would pretend the pass ran and found nothing).
+                        await trace_emit(
+                            "graph_expand",
+                            skipped=True,
+                            reason=graph_branch_reason,
+                            mode=graph_reported_mode,
+                            setting=HARS_MEMORY_GRAPH_BRANCH,
+                            derived_from=None,
+                        )
                     await trace_emit(
                         "context",
                         has_context=has_context,
@@ -3614,11 +3994,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     response = {
                         "ok": has_context,
                         "context": context_for_response,
-                        "error": None if has_context else "no context retrieved for this question",
+                        "error": recall_error,
                         "answer": None,
                         "mode": mode,
-                        "lightrag_mode": rag_mode,
+                        "lightrag_mode": graph_reported_mode,
                         "mode_fallback": mode_fallback,
+                        "graph_branch": graph_branch_fields,
                         "top_k": top_k,
                         "fetch_top_k": fetch_top_k,
                         "fetch_top_k_source": fetch_top_k_source,
@@ -3718,6 +4099,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "mode": mode,
                     "lightrag_mode": rag_mode,
                     "mode_fallback": mode_fallback,
+                    "graph_branch": graph_branch_fields,
                     "top_k": top_k,
                     "fetch_top_k": fetch_top_k,
                     "fetch_top_k_source": fetch_top_k_source,

@@ -338,7 +338,12 @@ def test_off_and_http_disable_lightrag_native_reranking(
             return "[no-context]"
 
     mod._rag_instance = FakeRag()
-    asyncio.run(mod.call_tool("memory_recall", {"question": "q", "context_only": True}))
+    # ll_keywords keep the graph branch on (HARS_MEMORY_GRAPH_BRANCH=auto
+    # skips it without a graph signal); this test measures the QueryParam the
+    # graph pass is given.
+    asyncio.run(mod.call_tool(
+        "memory_recall", {"question": "q", "ll_keywords": ["x"], "context_only": True}
+    ))
 
     assert captured["enable_rerank"] is False
 

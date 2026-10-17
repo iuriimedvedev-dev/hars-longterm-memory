@@ -269,7 +269,9 @@ class TestMaxCharsMcpArgument:
 
         mod._rag_instance = _FakeRagForQuery()  # type: ignore[attr-defined]
         result = asyncio.run(mod.call_tool("memory_recall", {
-            "question": "q", "context_only": True, **extra,
+            # keywords keep the graph branch on (HARS_MEMORY_GRAPH_BRANCH=auto):
+            # this test measures the MERGED assembly, which needs both branches.
+            "question": "q", "ll_keywords": ["x"], "context_only": True, **extra,
         }))
         data = json.loads(result[0].text)
         # chunk contents are JSON-escaped inside the context: expose them parsed

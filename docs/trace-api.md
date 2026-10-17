@@ -61,7 +61,7 @@ UI at `:5174` can `EventSource` the endpoint); anything else → 404; a missing
 | 2 | `vector_hits` | dense channel done | `{trace_id, seq, t_ms, latency_ms, embedder, pool_size, hits:[{chunk_id, dense_score, doc, section}]}` |
 | 3 | `fusion` | RRF/alpha blend + diversity done | `{trace_id, seq, t_ms, alpha, candidate_pool_size, pool_size, order:[chunk_id…], scores:{chunk_id: fused}}` |
 | 4 | `rerank` | cross-encoder done / skipped | `{trace_id, seq, t_ms, applied, backend, latency_ms, pool, fallback_reason, max_fusion_score, skip_threshold, blocked_inversions, fusion_margin, before:[ids], after:[ids]}` |
-| 5 | `graph_expand` | LightRAG entity/relation pass done | `{trace_id, seq, t_ms, mode, latency_ms, entity_count, relation_count, traversed_edge_count, entities:[{name, type}], relations:[{entity1, entity2}], derived_from}` |
+| 5 | `graph_expand` | LightRAG entity/relation pass done — or skipped | `{trace_id, seq, t_ms, skipped, mode, latency_ms, entity_count, relation_count, traversed_edge_count, entities:[{name, type}], relations:[{entity1, entity2}], derived_from}`; when `skipped: true`: `{…, skipped: true, reason, mode: "skipped", setting, derived_from: null}` and **no** entity/relation counters at all |
 | 6 | `context` | prompt context assembled | `{trace_id, seq, t_ms, has_context, chars, context_priority_applied, source_count, entity_count, relation_count, sources:[{reference_id, doc, section}], caps:{max_chars, max_entity_tokens, max_relation_tokens}}` |
 | 7 | `result` | final | **today's full `memory_recall` JSON, unchanged** (no trace fields added) |
 | 8 | `done` | terminal (success) | `{trace_id, ok, total_ms, has_context}` |
@@ -87,8 +87,9 @@ Notes:
   `memory_recall` body, then `rag.aquery`), and `graph_expand` is emitted
   afterwards by **parsing the rendered context string** (`derived_from:
   "context_string"`). The two branches are independent and converge only in
-  `context` (`context_priority=merged` round-robins fusion chunks with
-  LightRAG's own graph-retrieved chunks). A consumer must therefore not draw a
+  `context`: the assembly orders both branches' CHUNK candidates by score
+  (diversity is a soft tiebreaker) under the global/per-document char budgets.
+  A consumer must therefore not draw a
   `graph_expand → fusion` edge; see
   `tests/test_trace_endpoint.py::TestRealPipelineTrace::
   test_fusion_is_independent_of_the_later_graph_pass`.
@@ -98,6 +99,20 @@ Notes:
   traversed_edge_count` all `0` (parsed from a context string that contains no
   entity/relation JSON lines). The frame is **not** skipped; a zeroed frame is
   the honest signal that the branch ran and yielded nothing.
+- **Graph-branch routing (2026-10-17 review rec. #1).** `trace_start` reports the
+  RESOLVED mode (`lightrag_mode`) plus a `graph_branch` `{enabled, setting,
+  reason}` block. Under the default `HARS_MEMORY_GRAPH_BRANCH=auto` the graph pass
+  is skipped when the resolved mode is LightRAG `naive` (no keywords supplied, or
+  an explicit `mode=naive`): with no keywords LightRAG could only re-run a dense
+  vector search over the same `chunks_vdb` branch 1 already queried (measured
+  +7.6 s/query for no quality gain), so the context is assembled from the fusion
+  branch alone. `trace_start.lightrag_mode` then reads `"skipped"` — never a fake
+  `naive` — and `graph_expand` is emitted with `skipped: true` + `reason` and NO
+  entity/relation counters (zeros would pretend the pass ran and found nothing).
+  `HARS_MEMORY_GRAPH_BRANCH=on` restores the always-call behaviour, `=off` never
+  calls it, and an explicit `context_priority=lightrag` or the answer path keep
+  it on. When it runs, the frame carries `skipped: false` and the measured counts
+  as before.
 - `order`/`scores`/`before`/`after` are the **true pre-rerank order**, measured
 
   where `_compute_diverse` runs, not reconstructed from dense scores — this

@@ -32,13 +32,14 @@ dense+BM25 sparse fusion channel layered on top.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `question` | `string` | **required** | Natural language question |
-| `mode` | `enum` | `hybrid` | Retrieval mode: `local` (entity-neighbourhood), `global` (community themes), `hybrid` (both), `naive` (pure vector, automatic fallback when no keywords) |
+| `mode` | `enum` | `hybrid` | Retrieval mode: `local` (entity-neighbourhood), `global` (community themes), `hybrid` (both), `naive` (pure vector). The LightRAG graph pass runs only when the resolved mode is a real graph mode (`mix`/`local`/`global`, i.e. keywords supplied) — see `HARS_MEMORY_GRAPH_BRANCH`. When skipped, `lightrag_mode` reads `"skipped"` and `graph_branch.reason` explains why |
 | `top_k` | `integer` | `20` | Result count: entities/relations/chunks returned. Range 1–50 |
 | `fetch_top_k` | `integer` | — | Fetch width before truncation. Must be >= top_k. Defaults to `top_k * HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER` (env-configurable, default 1.0) |
-| `ll_keywords` | `string[]` | `[]` | Low-level keywords: specific entities, codes, names. When supplied, skips LightRAG's keyword-extraction LLM call entirely |
+| `ll_keywords` | `string[]` | `[]` | Low-level keywords: specific entities, codes, names. When supplied, skips LightRAG's keyword-extraction LLM call entirely AND enables the graph branch |
 | `hl_keywords` | `string[]` | `[]` | High-level keywords: themes/concepts. Same as ll_keywords — both must be empty for keyword extraction to run |
 | `context_only` | `boolean` | `true` | Return raw graph context without running the local answer LLM. Default `true` — the calling agent synthesises the answer |
-| `context_priority` | `enum` | `merged` | Context ordering: `merged` (round-robin fusion+LightRAG with supersession rescoring), `lightrag` (original LightRAG order). Only affects `context_only=true` |
+| `context_priority` | `enum` | `merged` | Context assembly: `merged` (score-ordered chunk assembly across both branches with supersession rescoring; `fusion_only` is reported when the graph branch was skipped), `lightrag` (original LightRAG order — also forces the graph branch on). Only affects `context_only=true` |
+| `max_chars` | `integer` | `15000` | Per-call total char budget for the assembled `context`; `0` = no cap. Default from `HARS_MEMORY_CONTEXT_MAX_CHARS` |
 | `debug` | `boolean` | `false` | Include debug data: `fused_chunks`, `latency_breakdown`, `llm_usage`, `raw_result` |
 
 ### Response shape
@@ -85,6 +86,8 @@ dense+BM25 sparse fusion channel layered on top.
   "entities_used": ["GKE Ingress", "Kubernetes Networking"],
   "mode_fallback": null,
   "mode": "hybrid",
+  "lightrag_mode": "mix",
+  "graph_branch": {"enabled": true, "setting": "auto", "reason": "graph mode 'mix' requested with keywords"},
   "context_priority_applied": "merged",
   "last_ingest": "2026-08-25",
   "stale_days": 7
@@ -93,9 +96,14 @@ dense+BM25 sparse fusion channel layered on top.
 
 ### Key behaviours
 
-- **Keyword fallback**: when both `ll_keywords` and `hl_keywords` are omitted,
-  the query silently runs in `naive` mode — the `mode_fallback` field explains
-  when this fired
+- **Graph-branch routing** (`HARS_MEMORY_GRAPH_BRANCH`, default `auto`): the
+  LightRAG graph pass runs only when the resolved mode is a real graph mode —
+  `mix`/`local`/`global`, i.e. when `ll_keywords`/`hl_keywords` were supplied.
+  With no keywords it would degrade to `naive`, a second dense search over the
+  same chunk store the fusion channel just queried (measured +7.6 s/query for no
+  quality gain), so it is skipped: `lightrag_mode` reads `"skipped"` and
+  `graph_branch.reason` explains why (`context_priority=lightrag` and the answer
+  path keep it on). `mode_fallback` is only set when the fallback actually ran
 - **Hybrid field**: the `hybrid` field is always present, even without
   `debug=true`. It contains fused dense+BM25 results, identifier matches from
   the BM25 channel, and the ripgrep live-worktree channel status
@@ -104,8 +112,11 @@ dense+BM25 sparse fusion channel layered on top.
   since the last consolidation that the index has never seen
 - **Flat-dense channel** (default off): additive channel covering chunks in the
   index's raw chunk store but missing/stale in the primary vector store
-- **Supersession rescoring** (default on): re-ranks merged results so that
-  superseded/outdated documents rank lower
+- **Supersession rescoring** (default on): demotes superseded/outdated chunks in
+  the assembled context (a stable partition, applied across both branches)
+- **Context budgets**: `HARS_MEMORY_CONTEXT_MAX_CHARS` (global, default 15000)
+  and `HARS_MEMORY_CONTEXT_MAX_DOC_CHARS` (per document, default 6000) — the
+  best-ranked chunks always win the space
 - **Section field**: each `fused_chunks` and `citations` entry includes a
   `section` field with the breadcrumb heading chain (e.g. `# K8s > ## Networking`)
   for section-level citation accuracy
