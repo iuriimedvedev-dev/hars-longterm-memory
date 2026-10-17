@@ -155,21 +155,27 @@ them the same way). `status` shows per part `done=/total`, last-progress age and
   no-op when unset. A consumer that renamed its own env vars in the past can
   list forbidden prefixes (comma-separated) here to fail closed at startup
   instead of silently reading stale values.
-- **Recall reranking** (`HARS_MEMORY_RERANK_BACKEND`): unset preserves the
-  current behavior (use LightRAG's local `rerank_model_func` if configured;
-  otherwise no reranking). Set to `off` to skip all reranking, `local` to use
-  that callback explicitly, or `http` to opt into the HTTP reranker. HTTP
-  and `off` also disable LightRAG's native rerank pass for the recall call;
-  unset/local preserve its existing default. HTTP options are
-  `HARS_MEMORY_RERANK_HTTP_URL` (default
+- **Recall reranking** (`HARS_MEMORY_RERANK_BACKEND`): **OFF by default**
+  (2026-10-17 product decision). Unset, `off` and `none` make **no reranker
+  call at all** — the cross-encoder (Qwen3-Reranker-0.6B on the iGPU) measured
+  7.4–14 s/query (97% of end-to-end latency) for +6.3 pts recall@1 on
+  saturated scores and is being replaced by a learned channel-fusion ranker.
+  `local` (LightRAG's `rerank_model_func`) and `http` (the external
+  cross-encoder) remain explicit opt-ins; both, plus `off`, also disable
+  LightRAG's native rerank pass for the recall call. Every hybrid block
+  includes `rerank: {backend, applied, latency_ms, fallback_reason, pool}`;
+  the default path reports `backend:"off", fallback_reason:"disabled_by_default"`.
+  Opt-in http options: `HARS_MEMORY_RERANK_HTTP_URL` (default
   `http://127.0.0.1:8081/v1/rerank`; a host or `/v1` base URL is accepted),
   `HARS_MEMORY_RERANK_HTTP_MODEL` (default `x`), `HARS_MEMORY_RERANK_POOL`
-  (default 20 candidates; the remaining fused chunks retain their order),
-  and `HARS_MEMORY_RERANK_TIMEOUT_S` (default 8 seconds). Every hybrid block
-  includes `rerank: {backend, applied, latency_ms, fallback_reason, pool}`;
-  failed HTTP reranks keep the original order. Measured placeholder from
-  `docs/search-research-2026-10-02.md` H1: +0.09 file_hit@1, +0.08 fact@3,
-  +0.07 MRR on 120 cases, +4s/query.
+  (default 8 candidates; the remaining fused chunks retain their order),
+  `HARS_MEMORY_RERANK_TIMEOUT_S` (default 4 s hard budget — on expiry the
+  fusion order is kept, `fallback_reason:"timeout"`), `HARS_MEMORY_RERANK_HTTP_DOC_CHARS`
+  (per-document cap sent to the reranker, default 2000), and the two guards
+  `HARS_MEMORY_RERANK_SKIP_FUSION_SCORE` (skip when the top fused score is
+  already confident, default 0.9) / `HARS_MEMORY_RERANK_FUSION_MARGIN`
+  (0.15 — the reranker may only swap pairs inside this fusion-score margin).
+  Failed/timed-out HTTP reranks keep the original order.
 
 ### Multilingual retrieval routing (opt-in)
 

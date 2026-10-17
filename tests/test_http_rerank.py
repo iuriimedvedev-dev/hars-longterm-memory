@@ -256,11 +256,14 @@ def test_http_default_is_unset_and_makes_no_request(tmp_path: Any, monkeypatch: 
     assert [chunk["chunk_id"] for chunk in result["fused_chunks"]] == [
         "chunk-0", "chunk-1", "chunk-2",
     ]
+    # 2026-10-17: the reranker is OFF the default path — unset resolves to
+    # `off`, honestly reported via fallback_reason (never a silent None), and
+    # no request is made.
     assert result["rerank"] == {
-        "backend": None,
+        "backend": "off",
         "applied": False,
         "latency_ms": None,
-        "fallback_reason": None,
+        "fallback_reason": "disabled_by_default",
         "pool": 0,
     }
     assert requests == []
@@ -281,6 +284,7 @@ def test_backend_off_skips_local_rerank_function(tmp_path: Any, monkeypatch: Any
     assert calls == []
     assert result["rerank"]["backend"] == "off"
     assert result["rerank"]["applied"] is False
+    assert result["rerank"]["fallback_reason"] == "disabled_by_default"
     assert [chunk["chunk_id"] for chunk in result["fused_chunks"]] == [
         "chunk-0", "chunk-1", "chunk-2",
     ]

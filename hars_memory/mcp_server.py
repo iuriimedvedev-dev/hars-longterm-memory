@@ -449,9 +449,17 @@ if _recall_view_default_raw not in (RECALL_VIEW_FULL, RECALL_VIEW_LEAN):
     )
 DEFAULT_RECALL_VIEW = _recall_view_default_raw
 
-# Reranking backend. An unset backend preserves the historical behavior:
-# use LightRAG's local rerank_model_func when one is configured, otherwise skip.
-RERANK_BACKENDS = ("off", "local", "http")
+# Reranking backend. The reranker is OFF the default path (2026-10-17 product
+# decision, superseding the tuning recommendation in
+# eval_agentic/rca/antigravity_review_real.md §4): the cross-encoder
+# (Qwen3-Reranker-0.6B on the llama.cpp Vulkan iGPU, :8792) measured
+# 7.4-14 s per recall for +6.3 pts recall@1 (3 of 48 queries) at saturated
+# scores (top-2 0.9996 vs 0.9998, RCA Q05) — 97% of end-to-end latency for
+# near-zero/negative signal. It is being replaced by a learned channel-fusion
+# ranker (sub-millisecond CPU inference). "off" and "none" are synonymous and
+# are what an unset HARS_MEMORY_RERANK_BACKEND resolves to; "local"/"http"
+# remain explicit opt-ins for experimentation. See `_resolve_rerank_backend`.
+RERANK_BACKENDS = ("off", "none", "local", "http")
 _rerank_backend_raw = os.environ.get("HARS_MEMORY_RERANK_BACKEND")
 if _rerank_backend_raw is not None and _rerank_backend_raw not in RERANK_BACKENDS:
     raise ValueError(
@@ -459,18 +467,46 @@ if _rerank_backend_raw is not None and _rerank_backend_raw not in RERANK_BACKEND
         f"{', '.join(repr(backend) for backend in RERANK_BACKENDS)}"
     )
 HARS_MEMORY_RERANK_BACKEND: str | None = _rerank_backend_raw
+# Reason recorded in `rerank.fallback_reason` when no reranker call is made
+# because the backend is off (the default). Kept distinct from the opt-in
+# skip reasons (`fusion_confident`, `empty_pool`, `timeout`, ...) so telemetry
+# never conflates "we chose not to run it" with "we ran it and it declined".
+RERANK_DISABLED_REASON = "disabled_by_default"
+
+
+def _resolve_rerank_backend() -> str:
+    """The effective rerank backend for this process.
+
+    Unset or ``none`` resolve to ``off``: the reranker is not on the default
+    path. ``local`` (LightRAG's ``rerank_model_func`` callback) and ``http``
+    (the external cross-encoder) stay available as explicit opt-ins.
+    """
+    raw = HARS_MEMORY_RERANK_BACKEND
+    if raw in (None, "none"):
+        return "off"
+    return raw
 HARS_MEMORY_RERANK_HTTP_URL = os.environ.get(
     "HARS_MEMORY_RERANK_HTTP_URL", "http://127.0.0.1:8081/v1/rerank"
 )
 HARS_MEMORY_RERANK_HTTP_MODEL = os.environ.get("HARS_MEMORY_RERANK_HTTP_MODEL", "x")
+# Opt-in http path only (the backend is `off` by default — see above). The
+# pool is capped at 8 candidates (was 20): the fusion branch already delivers
+# 0.979 recall@10, so reranking ranks 9-20 burned 60% of the iGPU compute for
+# near-zero gain (review §4 rec. 3, RCA px 3). The chunk-level pool entry is
+# already the section/chunk text, further capped to
+# HARS_MEMORY_RERANK_HTTP_DOC_CHARS per document at the request boundary.
 try:
-    HARS_MEMORY_RERANK_POOL = int(os.environ.get("HARS_MEMORY_RERANK_POOL", "20"))
+    HARS_MEMORY_RERANK_POOL = int(os.environ.get("HARS_MEMORY_RERANK_POOL", "8"))
 except ValueError as exc:
     raise ValueError("HARS_MEMORY_RERANK_POOL must be an integer") from exc
 if HARS_MEMORY_RERANK_POOL < 0:
     raise ValueError("HARS_MEMORY_RERANK_POOL must be >= 0")
+# Hard latency budget for the opt-in http path (was 30 s in the live service,
+# i.e. long enough to dominate the whole request). 4 s keeps a slow iGPU from
+# eating the request: on expiry `rerank_http` returns (None, "timeout") and the
+# fusion order is kept unchanged (fail-soft, reason=timeout).
 try:
-    HARS_MEMORY_RERANK_TIMEOUT_S = float(os.environ.get("HARS_MEMORY_RERANK_TIMEOUT_S", "8"))
+    HARS_MEMORY_RERANK_TIMEOUT_S = float(os.environ.get("HARS_MEMORY_RERANK_TIMEOUT_S", "4"))
 except ValueError as exc:
     raise ValueError("HARS_MEMORY_RERANK_TIMEOUT_S must be a number") from exc
 if not math.isfinite(HARS_MEMORY_RERANK_TIMEOUT_S) or HARS_MEMORY_RERANK_TIMEOUT_S <= 0:
@@ -729,14 +765,54 @@ app = Server("hars-longterm-memory")
 _rag_instance: object | None = None
 _rag_lock = asyncio.Lock()
 
-# Serialises the instance-level `rag.llm_model_func` swap in memory_recall's
-# synthesis path (LightRAG 1.5.6 has no QueryParam.model_func, so the shared
-# instance attribute is the only lever). Without this, two concurrent recalls
-# race: the first one's `finally` restores the ORIGINAL extractor func while
-# the second is still mid-query, so the second silently synthesises with the
-# extractor model — and whichever finishes last can leave the query model
-# permanently installed on the shared instance.
+# Serialises the query-role LLM swap in memory_recall's synthesis path.
+# LightRAG 1.5.7 builds per-role LLM wrappers ONCE at init and reads them from
+# `global_config["role_llm_funcs"]` on every query (`_build_global_config` is
+# called inside `aquery`/`aquery_llm`), so an after-init
+# `rag.llm_model_func = ...` assignment is a SILENT NO-OP — the synthesis path
+# was actually using the EXTRACTOR model. The supported runtime lever is
+# `await rag.aupdate_llm_role_config("query", model_func=...)` (lightrag
+# 1.5.7 `llm_roles.py`), which rewrites the role's raw func and rebuilds its
+# wrapper. Because that rewrites shared role state, concurrent recalls must
+# still be serialised (one restores the original while another is mid-query
+# otherwise). See docs/mcp-reference.md "Query-model role".
 _QUERY_MODEL_LOCK = asyncio.Lock()
+
+
+def _query_role_raw_llm_func(rag: object) -> Callable[..., Any] | None:
+    """Best-effort read of LightRAG's current RAW (unwrapped) `query`-role LLM
+    function, used to restore it after a synthesis call.
+
+    LightRAG 1.5.7 keeps role state in the private
+    ``_role_llm_states[role].raw_func`` map; there is no public getter and
+    reading the public ``role_llm_funcs[role]`` would return the priority-queue
+    WRAPPER, which must never be installed as a raw func (it would be double
+    wrapped). Returns ``None`` when the shape is unavailable (older LightRAG or
+    a stub), in which case the caller simply does not restore — the query role
+    keeps pointing at the query model, which is the intended steady state.
+    """
+    states = getattr(rag, "_role_llm_states", None)
+    if not isinstance(states, dict):
+        return None
+    state = states.get("query")
+    raw = getattr(state, "raw_func", None)
+    return raw if callable(raw) else None
+
+
+async def _aset_query_role_llm_func(rag: object, model_func: Any) -> bool:
+    """Point LightRAG's `query` role at `model_func` at runtime (1.5.7 API).
+
+    Returns ``True`` when the role-aware API was used, ``False`` when it is
+    absent — i.e. a pre-1.5.7 LightRAG or a test stub — so the caller can fall
+    back to the legacy instance-level ``rag.llm_model_func`` swap. Both the
+    extract path (role ``extract``) and keyword extraction (role ``keyword``)
+    are untouched.
+    """
+    updater = getattr(rag, "aupdate_llm_role_config", None)
+    if not callable(updater):
+        return False
+    await updater("query", model_func=model_func)
+    return True
 
 
 def json_text(data: Any) -> list[TextContent]:
@@ -1493,14 +1569,19 @@ async def _compute_hybrid_block(
         }
 
     rerank_func = getattr(rag, "rerank_model_func", None)
-    rerank_backend = HARS_MEMORY_RERANK_BACKEND
-    if rerank_backend is None and rerank_func:
-        rerank_backend = "local"
+    # OFF by default (`HARS_MEMORY_RERANK_BACKEND` unset/none/off): the
+    # cross-encoder is 97% of measured end-to-end latency for ~zero signal —
+    # see `_resolve_rerank_backend` / the constant block comment. `local` and
+    # `http` remain explicit opt-ins; the historical "unset + a configured
+    # local rerank_model_func => local" behaviour is deliberately gone.
+    rerank_backend = _resolve_rerank_backend()
     rerank_status: dict[str, Any] = {
         "backend": rerank_backend,
         "applied": False,
         "latency_ms": None,
-        "fallback_reason": None,
+        "fallback_reason": (
+            RERANK_DISABLED_REASON if rerank_backend == "off" else None
+        ),
         "pool": 0,
     }
 
@@ -1531,6 +1612,8 @@ async def _compute_hybrid_block(
             flat_channel_enabled,
             fuse,
             ripgrep_channel_enabled,
+            ripgrep_channel_mode,
+            ripgrep_scores_by_chunk_id,
         )
         from hars_memory.retrieval.tokenizer import extract_identifier_terms
 
@@ -1721,7 +1804,28 @@ async def _compute_hybrid_block(
         # contract of this function (ripgrep is not given its own separate
         # failure path since it shares this function's one try/except).
         ripgrep_report: dict[str, Any] = {"enabled": False, "reason": f"{HARS_MEMORY_RIPGREP_CHANNEL_ENV}=0 (default)"}
-        if ripgrep_channel_enabled():
+        # Live trace (SSE) — a `ripgrep_hits` frame mirroring `bm25_hits`
+        # (latency, matched chunk ids, scores) so the UI can show ripgrep as a
+        # real ranked channel rather than a footnote in the final result. The
+        # frame is emitted on EVERY path — enabled+available, enabled but
+        # unavailable (`rg` missing), and disabled — with `skipped` and a
+        # `reason` when it contributed nothing, so "channel off" is never
+        # silently indistinguishable from "channel ran and found nothing".
+        if not ripgrep_channel_enabled():
+            await trace_emit(
+                "ripgrep_hits",
+                enabled=False,
+                skipped=True,
+                reason=f"{HARS_MEMORY_RIPGREP_CHANNEL_ENV}=0",
+                latency_ms=None,
+                mode=None,
+                available=False,
+                query_terms=[],
+                hits=[],
+                matched_chunk_ids=[],
+            )
+            fused = fused_pool[:top_k]
+        else:
             from hars_memory.retrieval import ripgrep_channel
 
             rg_roots = ripgrep_channel.default_roots()
@@ -1731,17 +1835,22 @@ async def _compute_hybrid_block(
                 roots=rg_roots,
                 top_k=pool_size,
             )
+            # Keyed by basename, not chunk_id/file_stable_id — see
+            # retrieval/fusion.py's design note for why that is the only join
+            # key that actually holds across this corpus's channels. The
+            # channel's own `hits_by_basename` keeps the BEST hit per basename.
+            _rg_by_name = ripgrep_channel.hits_by_basename(rg_result.hits)
+            _rg_hits_by_basename = {
+                name: ChannelHit(
+                    score=hit.score, content=hit.content, file_path=hit.file_path
+                )
+                for name, hit in _rg_by_name.items()
+            }
+            matched_chunk_ids = list(
+                ripgrep_scores_by_chunk_id(fused_pool, _rg_hits_by_basename)
+            )
             if rg_result.available and rg_result.hits:
-                # Keyed by basename, not chunk_id/file_stable_id — see
-                # retrieval/fusion.py's design note for why that is the only
-                # join key that actually holds across this corpus's channels.
-                ripgrep_hits_by_basename = {
-                    Path(hit.file_path).name: ChannelHit(
-                        score=hit.score, content=hit.content, file_path=hit.file_path
-                    )
-                    for hit in rg_result.hits
-                }
-                fused = apply_ripgrep_gate(fused_pool, ripgrep_hits_by_basename, top_k=top_k)
+                fused = apply_ripgrep_gate(fused_pool, _rg_hits_by_basename, top_k=top_k)
             else:
                 fused = fused_pool[:top_k]
             ripgrep_report = {
@@ -1750,11 +1859,31 @@ async def _compute_hybrid_block(
                 "unavailable_reason": rg_result.unavailable_reason,
                 "query_terms": list(rg_result.query_terms),
                 "hits_count": len(rg_result.hits),
+                "matched_count": len(matched_chunk_ids),
                 "injected_count": sum(1 for c in fused if c.chunk_id.startswith("ripgrep:")),
                 "latency_ms": round(rg_result.latency_seconds * 1000, 2),
             }
-        else:
-            fused = fused_pool[:top_k]
+            await trace_emit(
+                "ripgrep_hits",
+                enabled=True,
+                skipped=not rg_result.available,
+                reason=rg_result.unavailable_reason,
+                latency_ms=round(rg_result.latency_seconds * 1000, 2),
+                mode=ripgrep_channel_mode(),
+                available=rg_result.available,
+                query_terms=list(rg_result.query_terms),
+                hits=[
+                    {
+                        "chunk_id": hit.chunk_id,
+                        "ripgrep_score": round(hit.score, 4),
+                        "match_count": hit.match_count,
+                        "matched_terms": hit.term_hits,
+                        **_trace_hit_doc_fields(hit.content, hit.file_path),
+                    }
+                    for hit in rg_result.hits[:HARS_MEMORY_TRACE_HITS_CAP]
+                ],
+                matched_chunk_ids=matched_chunk_ids[:HARS_MEMORY_TRACE_HITS_CAP],
+            )
 
         # Flat dense channel (retrieval/flat_index.py) — additive coverage
         # gate over the SAME dense+sparse fusion pool, run independently of
@@ -3156,7 +3285,8 @@ async def list_tools() -> list[Tool]:
         tool(
             "memory_recall",
             (
-                "Query the HARS knowledge graph. "
+                "Query the HARS knowledge graph. Retrieval runs as parallel channels: "
+                "vector + BM25 + ripgrep + graph. "
                 "IMPORTANT: supply ll_keywords (specific entities/codes, e.g. ['A2S32','Phase C','DINOv3']) "
                 "and hl_keywords (themes/concepts, e.g. ['hypothesis falsification','depth encoding']) — "
                 "you are the LLM, extract them from your question yourself; with keywords provided the "
@@ -3189,9 +3319,11 @@ async def list_tools() -> list[Tool]:
                 "AND ll_keywords, so it can surface files added or edited since the last consolidation "
                 "that the index has never seen at all — supplying ll_keywords (as instructed above) "
                 "directly improves this channel's recall, not just the graph-mode retrieval; see "
-                "`hybrid.ripgrep` for its own status (enabled/available/hits_count/query_terms). These "
-                "entries are always appended AFTER the real top_k dense/sparse results, never displacing "
-                "one. A separate flat-dense channel (HARS_MEMORY_FLAT_CHANNEL, default OFF — see "
+                "`hybrid.ripgrep` for its own status (enabled/available/hits_count/query_terms). In the "
+                "default ranked mode (HARS_MEMORY_RIPGREP_CHANNEL_MODE=ranked) the ripgrep literal-match "
+                "score re-ranks chunks WITHIN the top_k window; genuinely off-index files it finds are "
+                "still appended AFTER the top_k dense/sparse results as `ripgrep:<basename>` entries, "
+                "never displacing one. A separate flat-dense channel (HARS_MEMORY_FLAT_CHANNEL, default OFF — see "
                 "`hybrid.flat_dense` for status) can additively cover chunks present in the index's raw "
                 "chunk store but missing/stale in the primary vector store; off by default because that "
                 "gap is currently empty on this index and the channel pays its own CPU embed cost per "
@@ -3814,7 +3946,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
                 query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
                 query_param_options = dict(kw_args)
-                if HARS_MEMORY_RERANK_BACKEND in {"off", "http"}:
+                if _resolve_rerank_backend() in {"off", "http"}:
                     query_param_options["enable_rerank"] = False
                 if context_only:
                     # No local answer LLM: return the retrieved context and let
@@ -4032,13 +4164,22 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         response["hybrid"] = _compact_hybrid_block(hybrid_block, context_for_response)
                     return json_text(response)
                 graph_start = time.monotonic()
-                # LightRAG 1.5.6 does not support QueryParam.model_func.
-                # Temporarily swap the instance-level llm_model_func so the
-                # query LLM (rather than the extractor) is used for synthesis.
+                # Route the SYNTHESIS to the query LLM. LightRAG 1.5.7 has no
+                # QueryParam.model_func and ignores after-init
+                # `rag.llm_model_func` assignments (per-role wrappers are built
+                # once and read from `role_llm_funcs`), so the previous
+                # attribute swap was a silent no-op that synthesised with the
+                # EXTRACTOR model. Use the role API instead; keep the legacy
+                # attribute swap only as a fallback for a pre-1.5.7 instance or
+                # a test stub without the role API.
                 async with _QUERY_MODEL_LOCK:
+                    _orig_role_func = _query_role_raw_llm_func(rag)
+                    _query_func = create_query_model_func()
+                    _used_role_api = await _aset_query_role_llm_func(rag, _query_func)
                     _orig_llm_func = getattr(rag, "llm_model_func", None)
+                    if not _used_role_api:
+                        rag.llm_model_func = _query_func
                     try:
-                        rag.llm_model_func = create_query_model_func()
                         result = await asyncio.wait_for(
                             rag.aquery_llm(  # type: ignore[attr-defined]
                                 question,
@@ -4056,7 +4197,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                             timeout=query_timeout,
                         )
                     finally:
-                        rag.llm_model_func = _orig_llm_func
+                        if _used_role_api:
+                            if _orig_role_func is not None:
+                                await rag.aupdate_llm_role_config(  # type: ignore[attr-defined]
+                                    "query", model_func=_orig_role_func
+                                )
+                        else:
+                            rag.llm_model_func = _orig_llm_func
                 graph_channel_ms = (time.monotonic() - graph_start) * 1000
                 citations = _extract_citations(result, top_k)
                 # Live trace (SSE): the answer path has no rendered context

@@ -399,6 +399,80 @@ class TestRealPipelineTrace:
         assert strip(traced_resp) == strip(plain_resp)
         assert not any(key.startswith("_trace") for key in plain_resp)
 
+    async def test_ripgrep_hits_frame_reports_the_ranked_channel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`ripgrep_hits` mirrors `bm25_hits`: measured latency, matched chunk
+        ids and scores. It is a first-class frame, not a footnote in `result`."""
+        from hars_memory.retrieval import ripgrep_channel
+        from hars_memory.retrieval.ripgrep_channel import RipgrepSearchHit, RipgrepSearchResult
+
+        monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "1")
+        monkeypatch.setenv("HARS_MEMORY_FLAT_CHANNEL", "0")
+        mod = _load_mcp(_real_pipeline_env(tmp_path))
+        self._install(tmp_path, mod)
+
+        async def fake_asearch(question, **_kwargs):  # noqa: ANN001
+            return RipgrepSearchResult(
+                hits=[
+                    RipgrepSearchHit(
+                        chunk_id="file-stable-a2s32",
+                        score=3.5,
+                        content="A2S32 sidecar gate",
+                        file_path="/corpus/hyp_a2s32.md",
+                        match_count=1,
+                        term_hits={"A2S32": 1},
+                    )
+                ],
+                query_terms=("A2S32",),
+                available=True,
+                unavailable_reason=None,
+                latency_seconds=0.004,
+                timed_out=False,
+            )
+
+        monkeypatch.setattr(ripgrep_channel, "asearch", fake_asearch)
+        events = [
+            event
+            async for event in trace.stream_recall_events({
+                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+            })
+        ]
+        by_name = dict(events)
+        names = [name for name, _ in events]
+        assert "ripgrep_hits" in names
+        # channel frame precedes the fusion it feeds, like bm25/vector
+        assert names.index("vector_hits") < names.index("ripgrep_hits") < names.index("fusion")
+        frame = by_name["ripgrep_hits"]
+        assert frame["enabled"] is True and frame["skipped"] is False
+        assert frame["available"] is True and frame["mode"] == "ranked"
+        assert frame["latency_ms"] == 4.0
+        assert [h["chunk_id"] for h in frame["hits"]] == ["file-stable-a2s32"]
+        assert frame["hits"][0]["ripgrep_score"] == 3.5
+        assert frame["hits"][0]["matched_terms"] == {"A2S32": 1}
+        # the pool chunk whose (flattened) file_path matches the basename
+        assert frame["matched_chunk_ids"] == ["chunk-1"]
+
+    async def test_ripgrep_hits_frame_when_channel_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "0")
+        monkeypatch.setenv("HARS_MEMORY_FLAT_CHANNEL", "0")
+        mod = _load_mcp(_real_pipeline_env(tmp_path))
+        self._install(tmp_path, mod)
+        events = [
+            event
+            async for event in trace.stream_recall_events({
+                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+            })
+        ]
+        frame = dict(events)["ripgrep_hits"]
+        assert frame["enabled"] is False
+        assert frame["skipped"] is True
+        assert "HARS_MEMORY_RIPGREP_CHANNEL" in frame["reason"]
+        assert frame["latency_ms"] is None
+        assert frame["hits"] == [] and frame["matched_chunk_ids"] == []
+
 
 # ---------------------------------------------------------------------------
 # HTTP surface

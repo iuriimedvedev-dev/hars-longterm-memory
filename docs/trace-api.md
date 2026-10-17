@@ -59,13 +59,16 @@ UI at `:5174` can `EventSource` the endpoint); anything else → 404; a missing
 | 0 | `trace_start` | recall accepted | `{trace_id, seq, t_ms, question, mode, lightrag_mode, mode_fallback, top_k, fetch_top_k, fetch_top_k_source, alpha, index_id, index_dir, stale_days, last_ingest, context_only, context_priority, ll_keywords, hl_keywords}` |
 | 1 | `bm25_hits` | sparse channel done | `{trace_id, seq, t_ms, latency_ms, chunks_indexed, pool_size, hits:[{chunk_id, sparse_score, doc, section}]}` |
 | 2 | `vector_hits` | dense channel done | `{trace_id, seq, t_ms, latency_ms, embedder, pool_size, hits:[{chunk_id, dense_score, doc, section}]}` |
-| 3 | `fusion` | RRF/alpha blend + diversity done | `{trace_id, seq, t_ms, alpha, candidate_pool_size, pool_size, order:[chunk_id…], scores:{chunk_id: fused}}` |
-| 4 | `rerank` | cross-encoder done / skipped | `{trace_id, seq, t_ms, applied, backend, latency_ms, pool, fallback_reason, max_fusion_score, skip_threshold, blocked_inversions, fusion_margin, before:[ids], after:[ids]}` |
-| 5 | `graph_expand` | LightRAG entity/relation pass done — or skipped | `{trace_id, seq, t_ms, skipped, mode, latency_ms, entity_count, relation_count, traversed_edge_count, entities:[{name, type}], relations:[{entity1, entity2}], derived_from}`; when `skipped: true`: `{…, skipped: true, reason, mode: "skipped", setting, derived_from: null}` and **no** entity/relation counters at all |
-| 6 | `context` | prompt context assembled | `{trace_id, seq, t_ms, has_context, chars, context_priority_applied, source_count, entity_count, relation_count, sources:[{reference_id, doc, section}], caps:{max_chars, max_entity_tokens, max_relation_tokens}}` |
-| 7 | `result` | final | **today's full `memory_recall` JSON, unchanged** (no trace fields added) |
-| 8 | `done` | terminal (success) | `{trace_id, ok, total_ms, has_context}` |
-| 8 | `error` | terminal (failure) | `{trace_id, ok:false, total_ms, error_type, error, hint?}` |
+| 3 | `ripgrep_hits` | ripgrep channel done — or disabled/unavailable | `{trace_id, seq, t_ms, enabled, skipped, reason, latency_ms, mode, available, query_terms, hits:[{chunk_id, ripgrep_score, match_count, matched_terms, doc, section}], matched_chunk_ids:[chunk_id…]}`. Emitted on **every** path: `enabled:false, skipped:true, reason:"HARS_MEMORY_RIPGREP_CHANNEL=0"` when off; `enabled:true, skipped:true, reason:<unavailable_reason>` when `rg` is missing; `enabled:true, skipped:false` + hits when it ran. `matched_chunk_ids` are the pool chunks whose file the literal match joined to (the channel's ranked contribution), not the pre-join file-level hits. |
+| 4 | `fusion` | RRF/alpha blend + diversity done | `{trace_id, seq, t_ms, alpha, candidate_pool_size, pool_size, order:[chunk_id…], scores:{chunk_id: fused}}` |
+| 5 | `rerank` | cross-encoder done / skipped / disabled | `{trace_id, seq, t_ms, applied, backend, latency_ms, pool, fallback_reason, max_fusion_score, skip_threshold, blocked_inversions, fusion_margin, before:[ids], after:[ids]}`. With the default `HARS_MEMORY_RERANK_BACKEND` (off) this is emitted as `applied:false, backend:"off", latency_ms:null, fallback_reason:"disabled_by_default"` — never a fabricated timing. |
+| 6 | `graph_expand` | LightRAG entity/relation pass done — or skipped | `{trace_id, seq, t_ms, skipped, mode, latency_ms, entity_count, relation_count, traversed_edge_count, entities:[{name, type}], relations:[{entity1, entity2}], derived_from}`; when `skipped: true`: `{…, skipped: true, reason, mode: "skipped", setting, derived_from: null}` and **no** entity/relation counters at all |
+| 7 | `context` | prompt context assembled | `{trace_id, seq, t_ms, has_context, chars, context_priority_applied, source_count, entity_count, relation_count, sources:[{reference_id, doc, section}], caps:{max_chars, max_entity_tokens, max_relation_tokens}}` |
+| 8 | `result` | final | **today's full `memory_recall` JSON, unchanged** (no trace fields added) |
+| 9 | `done` | terminal (success) | `{trace_id, ok, total_ms, has_context}` |
+| 9 | `error` | terminal (failure) | `{trace_id, ok:false, total_ms, error_type, error, hint?}` |
+
+The pipeline is **parallel channels: vector + BM25 + ripgrep + graph**.
 
 Notes:
 
@@ -73,15 +76,17 @@ Notes:
   order, but it is a **linearisation of a two-branch DAG**, not a chain:
 
   ```
-  keywords/mode ─┬─ bm25_hits (sparse) ─┐
-                 ├─ vector_hits (dense) ┴─▶ fusion ─▶ rerank ─┐
-                 │        (ripgrep / flat / qwen gates feed fusion, too)  │
+  keywords/mode ─┬─ bm25_hits (sparse) ────┐
+                 ├─ vector_hits (dense) ────┤
+                 ├─ ripgrep_hits (literal) ─┴─▶ fusion ─▶ rerank ─┐
+                 │        (flat / qwen gates feed fusion, too)    │
                  └─ graph_expand (LightRAG aquery: entity/relation pass) ─┴─▶ context ─▶ result
   ```
 
-  `fusion` fuses **dense+sparse only** (`retrieval/fusion.py::fuse` +
-  the env-gated additive ripgrep/flat/3way gates; supersession is a
-  content-marker re-score, not a graph signal). It does **not** consume
+  `fusion` fuses **dense+sparse** (`retrieval/fusion.py::fuse`) plus the
+  env-gated additive ripgrep/flat/3way gates (supersession is a
+  content-marker re-score, not a graph signal); the ripgrep channel is default
+  ON in `ranked` mode and re-ranks chunks INSIDE the top-k window. It does **not** consume
   `graph_expand` output: LightRAG's graph pass runs *after* the whole hybrid
   block has finished (`mcp_server.py`: `_compute_hybrid_block` at the
   `memory_recall` body, then `rag.aquery`), and `graph_expand` is emitted
@@ -117,9 +122,14 @@ Notes:
 
   where `_compute_diverse` runs, not reconstructed from dense scores — this
   removes the only reconstructed pixel in the v1 demo.
-- A skipped rerank still emits event 4 (`applied=false`) with its recorded
-  `fallback_reason` (`fusion_confident`, `empty_pool`, …); `latency_ms` is
-  `null` when the backend was never called, never a fabricated `0`.
+- A skipped/disabled rerank still emits event 5 (`applied=false`) with its
+  recorded `fallback_reason` (`disabled_by_default` on the default path;
+  `fusion_confident`, `empty_pool`, `timeout`, … on the opt-in http path);
+  `latency_ms` is `null` when the backend was never called, never a fabricated
+  `0`.
+- A disabled/unavailable ripgrep channel still emits event 3 with
+  `enabled`/`skipped`/`reason` — a missing frame would be indistinguishable
+  from a channel that ran and found nothing.
 - `result` carries no `trace_id`/`seq`/`t_ms`: it is byte-for-byte the normal
   response (the client can correlate it via the terminal `done.trace_id`).
 - A recall whose implementation returns a bare `{ok:false, error…}` (no
@@ -130,10 +140,12 @@ Notes:
 
 **Measured** (read straight off the pipeline):
 
-- every `latency_ms` (`bm25_hits`, `vector_hits`, `rerank`, `graph_expand`) and
-  the terminal `total_ms`;
-- hit ids/scores/doc/section/file for both channels; `chunks_indexed`,
-  `candidate_pool_size`, `pool_size`; `alpha`; the whole rerank status
+- every `latency_ms` (`bm25_hits`, `vector_hits`, `ripgrep_hits`, `rerank`,
+  `graph_expand`) and the terminal `total_ms`;
+- hit ids/scores/doc/section/file for every channel; `chunks_indexed`,
+  `candidate_pool_size`, `pool_size`; `alpha`; the ripgrep channel's
+  `enabled`/`available`/`skipped`/`reason`/`mode`/`query_terms`/
+  `matched_chunk_ids`; the whole rerank status
   (`applied`, `backend`, `pool`, `fallback_reason`, `max_fusion_score`,
   `skip_threshold`, `blocked_inversions`, `fusion_margin`);
 - `order`/`before`/`after` (pre-rerank is captured before rerank mutates the
