@@ -119,21 +119,32 @@ def _sample_context() -> str:
 
 
 class _FakeChunksVdb:
-    def __init__(self, hits: list[dict]) -> None:
+    def __init__(self, hits: list[dict], calls: list[str] | None = None) -> None:
         self._hits = hits
+        self._calls = calls
 
     async def query(self, query: str, top_k: int) -> list[dict]:
+        if self._calls is not None:
+            self._calls.append("chunks_vdb.query")
         return self._hits[:top_k]
 
 
 class _TraceRag:
-    """Fake LightRAG exposing exactly what memory_recall touches."""
+    """Fake LightRAG exposing exactly what memory_recall touches.
+
+    `calls` records the order of the two passes memory_recall performs — the
+    dense chunk query that feeds `fusion` and the LightRAG `aquery` that IS the
+    graph pass — so a test can assert their real dependency order instead of
+    trusting the emitted frame order.
+    """
 
     def __init__(self, dense_hits: list[dict], context: str = "[no-context]") -> None:
-        self.chunks_vdb = _FakeChunksVdb(dense_hits)
+        self.calls: list[str] = []
+        self.chunks_vdb = _FakeChunksVdb(dense_hits, self.calls)
         self._context = context
 
     async def aquery(self, question: str, param: object) -> str:
+        self.calls.append("aquery")
         return self._context
 
 
@@ -307,6 +318,50 @@ class TestRealPipelineTrace:
         # the final result is the untouched memory_recall response
         assert by_name["result"]["ok"] is True
         assert by_name["result"]["hybrid"]["enabled"] is True
+
+    async def test_fusion_is_independent_of_the_later_graph_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dependency guard (verdict b): `fusion` is a dense+sparse blend emitted
+        by `_compute_hybrid_block`, which completes BEFORE LightRAG's graph pass
+        (`aquery`) runs. The later `graph_expand` frame only PARSES the rendered
+        context string; it feeds nothing back into fusion.
+
+        If a future change makes fusion consume graph output, the recorded call
+        order (`chunks_vdb.query` -> `aquery`) and/or the graph-free `fusion`
+        payload below will fail, which is exactly the intent: this ordering must
+        never be "fixed" by moving the graph pass first to match a label.
+        """
+        monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "0")
+        monkeypatch.setenv("HARS_MEMORY_FLAT_CHANNEL", "0")
+        mod = _load_mcp(_real_pipeline_env(tmp_path))
+        _write_chunks(tmp_path)
+        rag = _TraceRag(_dense_hits(), _sample_context())
+        mod._rag_instance = rag
+        events = [
+            event
+            async for event in trace.stream_recall_events({
+                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+            })
+        ]
+        by_name = dict(events)
+        names = [name for name, _ in events]
+        # The graph pass is invoked strictly after the dense channel it does not
+        # feed; there is no read of graph state before fusion.
+        assert rag.calls == ["chunks_vdb.query", "aquery"]
+        assert names.index("fusion") < names.index("graph_expand")
+        # The fusion frame is a pure channel blend: no entity/relation/edge field
+        # (i.e. no graph-derived score) is among its inputs.
+        graph_keys = {
+            "entities", "relations", "entity_count", "relation_count",
+            "traversed_edge_count", "graph", "graph_scores",
+        }
+        assert set(by_name["fusion"]) & graph_keys == set()
+        assert {"alpha", "candidate_pool_size", "pool_size", "order", "scores"} <= set(
+            by_name["fusion"]
+        )
+        # graph_expand is derived from the rendered context, and reports that.
+        assert by_name["graph_expand"]["derived_from"] == "context_string"
 
     async def test_non_trace_path_is_not_decorated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
