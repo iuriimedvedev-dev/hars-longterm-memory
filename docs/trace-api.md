@@ -69,7 +69,37 @@ UI at `:5174` can `EventSource` the endpoint); anything else → 404; a missing
 
 Notes:
 
+- **Dependency DAG vs wire order.** The wire order above is the real execution
+  order, but it is a **linearisation of a two-branch DAG**, not a chain:
+
+  ```
+  keywords/mode ─┬─ bm25_hits (sparse) ─┐
+                 ├─ vector_hits (dense) ┴─▶ fusion ─▶ rerank ─┐
+                 │        (ripgrep / flat / qwen gates feed fusion, too)  │
+                 └─ graph_expand (LightRAG aquery: entity/relation pass) ─┴─▶ context ─▶ result
+  ```
+
+  `fusion` fuses **dense+sparse only** (`retrieval/fusion.py::fuse` +
+  the env-gated additive ripgrep/flat/3way gates; supersession is a
+  content-marker re-score, not a graph signal). It does **not** consume
+  `graph_expand` output: LightRAG's graph pass runs *after* the whole hybrid
+  block has finished (`mcp_server.py`: `_compute_hybrid_block` at the
+  `memory_recall` body, then `rag.aquery`), and `graph_expand` is emitted
+  afterwards by **parsing the rendered context string** (`derived_from:
+  "context_string"`). The two branches are independent and converge only in
+  `context` (`context_priority=merged` round-robins fusion chunks with
+  LightRAG's own graph-retrieved chunks). A consumer must therefore not draw a
+  `graph_expand → fusion` edge; see
+  `tests/test_trace_endpoint.py::TestRealPipelineTrace::
+  test_fusion_is_independent_of_the_later_graph_pass`.
+- With `mode: hybrid` + `lightrag_mode: naive` (the `mode_fallback` case, or an
+  explicit `mode=naive`) there is no graph traversal, but the trace still emits
+  `graph_expand` — with `mode: naive` and `entity_count/relation_count/
+  traversed_edge_count` all `0` (parsed from a context string that contains no
+  entity/relation JSON lines). The frame is **not** skipped; a zeroed frame is
+  the honest signal that the branch ran and yielded nothing.
 - `order`/`scores`/`before`/`after` are the **true pre-rerank order**, measured
+
   where `_compute_diverse` runs, not reconstructed from dense scores — this
   removes the only reconstructed pixel in the v1 demo.
 - A skipped rerank still emits event 4 (`applied=false`) with its recorded
