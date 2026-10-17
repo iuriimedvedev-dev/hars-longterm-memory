@@ -867,7 +867,7 @@ requires-dist = [
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "ir-measures", specifier = ">=0.4.0" },
-    { name = "lightrag-hku", specifier = ">=1.4.16,<1.5" },
+    { name = "lightrag-hku", specifier = "==1.5.7" },
     { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
     { name = "networkx", specifier = ">=3.3" },
     { name = "openai", specifier = ">=2.0.0,<3.0.0" },
@@ -1163,7 +1163,7 @@ wheels = [
 
 [[package]]
 name = "lightrag-hku"
-version = "1.4.16"
+version = "1.5.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1180,14 +1180,15 @@ dependencies = [
     { name = "pydantic" },
     { name = "pypinyin" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "setuptools" },
     { name = "tenacity" },
     { name = "tiktoken" },
     { name = "xlsxwriter" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/91/ee/a56df1e6ffcc597a82aadb5bbab40b3b99b0b6359f19ada744402adfe561/lightrag_hku-1.4.16.tar.gz", hash = "sha256:4453582e2c82f91c7c675aa3e09939b8a66816775da3370cb11eea94776aa77e", size = 3655047 }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/dd/6bba8d88a07a50a6569de6eb1fc059d57dfdaafdfe9355ea767aab007978/lightrag_hku-1.5.7.tar.gz", hash = "sha256:4d2cbb3f983b2bec209f4f154845869fc9e5800a7a2a9bb7005ba7610f4fbe0a", size = 4921093 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/6c/f340c272846010ce3152d698e597350b37d6c0b876b3adbf4906c99fb453/lightrag_hku-1.4.16-py3-none-any.whl", hash = "sha256:ce8536411f1c8b329fea1c1e86ed3357456a76d3057120b0886e60b2233f8bda", size = 3623523 },
+    { url = "https://files.pythonhosted.org/packages/f3/29/44c9df718091da249c9d06967452f0f06560c58d0fdee26e57e6ac8dd25a/lightrag_hku-1.5.7-py3-none-any.whl", hash = "sha256:895b81d94ca447afc6290c0e049d339f6caed46fbf29e4324f6db987046c6fcb", size = 5039835 },
 ]
 
 [[package]]

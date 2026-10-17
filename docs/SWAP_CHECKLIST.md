@@ -33,24 +33,25 @@ Conventions:
       *Pass:* the indexer process is stopped and `$NEW` mtime is stable.
 - [ ] **Service version alignment is possible** — do Step 1 before any swap.
 
-## 1. Version alignment (HARD BLOCKER — see `docs/VERSION_PIN.md`)
+## 1. Version alignment (HARD BLOCKER — see `docs/VERSION_PIN.md`) — RESOLVED
 
 A 1.4.16 reader cannot faithfully read a 1.5.7-built `kv_store_doc_status.json`
 (1050/1340 rows `content_hash` → `TypeError`; `get_status_counts()` →
 `KeyError: 'parsing'`). Reader and builder must match at **1.5.7**.
 
-- [ ] Move the serving venv to 1.5.7 per `docs/VERSION_PIN.md` "Upgrade
-      procedure" (this requires the `chunking_by_token_size` /
-      `DEFAULT_ENTITY_TYPES` import migration first).
+- [x] **DONE (2026-10-17).** The serving venv is on `lightrag-hku==1.5.7`; the
+      `chunking_by_token_size` / `DEFAULT_ENTITY_TYPES` import migration landed
+      in the same change. Decisive proof: all 1340 rows of the
+      `20261017T132719Z` snapshot construct under the installed reader and
+      `get_status_counts()` returns the complete counts (see
+      `tests/test_lightrag_157_store_read.py` and `docs/VERSION_PIN.md`).
 - **Command (verify):**
   ```bash
   cd $Repo && uv run python -c "import importlib.metadata as m; print(m.version('lightrag-hku'))"
   ```
 - **Pass:** prints `1.5.7`. If it prints `1.4.16`, the swap is **blocked** —
-  do not proceed; either migrate (preferred) or normalise the new
-  `kv_store_doc_status.json` for 1.4.16 (strip `content_hash`; drop or relabel
-  `parsing`/`analyzing`) and re-run Steps 4-5.
-- **Alternative pass (only if staying on 1.4.16):** the normalised doc_status
+  re-land the migration (see `docs/VERSION_PIN.md`) before proceeding.
+- **Alternative pass (only if reverted to 1.4.16):** the normalised doc_status
   loads clean under 1.4.16:
   ```bash
   cd $Repo && NEW=$NEW uv run python - <<'PY'
@@ -300,7 +301,7 @@ missing gold doc caps Recall@10. Re-check against the *finished* build.
 
 | # | Gate | Pass criterion |
 | --- | --- | --- |
-| 1 | Version alignment | serving reader == builder (1.5.7) **or** normalised doc_status loads on 1.4.16 |
+| 1 | Version alignment | serving reader == builder (**1.5.7 — DONE**), verified by `tests/test_lightrag_157_store_read.py` |
 | 4 | Counts/schema | `parsing==0`, `pending==0`, `chunks==vdb_vectors`, `processed+failed==len(ds)` |
 | 5 | Failures | 0 non-duplicate failed rows |
 | 6 | Chunk audit | 0 chunks >512 tok, 0 vdb/chunk mismatches (no re-embed) |

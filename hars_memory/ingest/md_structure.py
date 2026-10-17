@@ -814,7 +814,7 @@ def md_struct_chunking_func(
     ``docs/configuration.md``).
     """
     def token_split() -> list[dict[str, Any]]:
-        from lightrag.operate import chunking_by_token_size
+        from lightrag.chunker import chunking_by_token_size
 
         return chunking_by_token_size(
             tokenizer, content, split_by_character, split_by_character_only,

@@ -294,7 +294,6 @@ async def _run() -> None:
         sparse = record["bm25"]
 
         hybrid20 = fuse_hybrid(dense, sparse, alpha=ALPHA, pool=20, top_k=20)
-        hybrid30 = fuse_hybrid(dense, sparse, alpha=ALPHA, pool=30, top_k=30)
 
         # (a) none = hybrid ranking of the same candidate set (full top-20 list).
         rows_by_method["h1_none"].append(

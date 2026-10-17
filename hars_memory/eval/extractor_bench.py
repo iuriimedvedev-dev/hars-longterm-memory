@@ -49,6 +49,25 @@ TUPLE_DELIMITER = "<|#|>"
 COMPLETION_DELIMITER = "<|COMPLETE|>"
 MAX_TOKENS = 4096
 
+# LightRAG 1.5.x removed ``lightrag.constants.DEFAULT_ENTITY_TYPES`` (the
+# 1.4.x list of generic entity types).  1.5 renders the vocabulary as a prose
+# ``entity_types_guidance`` block in the extraction prompt profile listing the
+# same 11 types; this list preserves the 1.4.16 value so the bench's ``meta``
+# block stays byte-comparable across the upgrade (see ``build_prompts``).
+DEFAULT_ENTITY_TYPES: list[str] = [
+    "Person",
+    "Creature",
+    "Organization",
+    "Location",
+    "Event",
+    "Concept",
+    "Method",
+    "Content",
+    "Data",
+    "Artifact",
+    "NaturalObject",
+]
+
 # Default model aliases: exact GGUF paths from the original bench report.
 MODEL_ALIASES: dict[str, str] = {
     "gemma-12b": (
@@ -98,9 +117,22 @@ def resolve_schema_path(explicit: Path | None = None) -> Path:
 def build_prompts(
     docs: dict[str, str], schema_path: Path | None = None
 ) -> dict[str, Any]:
-    """Build extraction prompts via the REAL PROMPTS dict + REAL schema loader."""
-    from lightrag.constants import DEFAULT_ENTITY_TYPES, DEFAULT_SUMMARY_LANGUAGE
-    from lightrag.prompt import PROMPTS
+    """Build extraction prompts via the REAL PROMPTS dict + REAL schema loader.
+
+    Mirrors ``lightrag.operate._process_single_content`` for lightrag-hku 1.5.7:
+    the entity vocabulary is the resolved prompt profile's prose
+    ``entity_types_guidance`` (1.5 removed ``DEFAULT_ENTITY_TYPES`` and the
+    ``{entity_types}`` template slot), and the system/user prompts also carry
+    the per-response row caps. The bench extracts whole documents, so the
+    optional per-chunk section-context block stays empty — the documented
+    no-context user-prompt path.
+    """
+    from lightrag.constants import (
+        DEFAULT_MAX_EXTRACTION_ENTITIES,
+        DEFAULT_MAX_EXTRACTION_RECORDS,
+        DEFAULT_SUMMARY_LANGUAGE,
+    )
+    from lightrag.prompt import PROMPTS, get_default_entity_extraction_prompt_profile
 
     from hars_memory.schema.loader import load_schema
 
@@ -111,18 +143,22 @@ def build_prompts(
 
     entity_types = list(DEFAULT_ENTITY_TYPES)
     language = DEFAULT_SUMMARY_LANGUAGE
-    examples = "\n".join(PROMPTS["entity_extraction_examples"]).format(
+    profile = get_default_entity_extraction_prompt_profile()
+    entity_types_guidance = profile["entity_types_guidance"]
+    examples = "\n".join(profile["entity_extraction_examples"]).format(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=", ".join(entity_types),
+        entity_types_guidance=entity_types_guidance,
         language=language,
     )
     context_base = {
         "tuple_delimiter": PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         "completion_delimiter": PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        "entity_types": ",".join(entity_types),
+        "entity_types_guidance": entity_types_guidance,
         "examples": examples,
         "language": language,
+        "max_total_records": DEFAULT_MAX_EXTRACTION_RECORDS,
+        "max_entity_records": DEFAULT_MAX_EXTRACTION_ENTITIES,
     }
     user_tmpl = PROMPTS["entity_extraction_user_prompt"]
     return {
@@ -137,7 +173,9 @@ def build_prompts(
         },
         "system": system_tmpl.format(**context_base),
         "users": {
-            name: user_tmpl.format(**{**context_base, "input_text": text})
+            name: user_tmpl.format(
+                **{**context_base, "input_text": text, "heading_context_block": ""}
+            )
             for name, text in docs.items()
         },
     }

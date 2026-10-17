@@ -445,7 +445,6 @@ def balance_cases(cases: list[dict[str, Any]], limit: int = TARGET_CASES) -> lis
 
     # target ~35% Russian
     target_ru = int(round(limit * 0.35))
-    target_en = limit - target_ru
     per_qtype = max(1, limit // len(QTYPES))
 
     selected: list[dict[str, Any]] = []

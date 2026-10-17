@@ -183,7 +183,16 @@ class TestBuildPrompts:
         # Real delimiters, real examples block, schema guidance appended.
         assert prompts["meta"]["tuple_delimiter"] == PROMPTS["DEFAULT_TUPLE_DELIMITER"]
         assert "hello world" in prompts["users"]["doc_a"]
-        assert PROMPTS["entity_extraction_examples"][0].split()[0] in prompts["system"]
+        # lightrag 1.5 renders the user prompt from a {heading_context_block}
+        # slot too; the bench extracts whole docs so it stays empty.
+        assert prompts["users"]["doc_a"].endswith("---Output---\n")
+        # The REAL examples block (formatted with the real delimiters) must be
+        # embedded verbatim in the system prompt — not paraphrased.
+        examples_block = "\n".join(PROMPTS["entity_extraction_examples"]).format(
+            tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+            completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        ).rstrip()
+        assert examples_block and examples_block in prompts["system"]
         from hars_memory.schema.loader import load_schema
 
         guidance = load_schema(eb.resolve_schema_path(None)).guidance

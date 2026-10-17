@@ -602,8 +602,6 @@ def create_lightrag(
     # Cohere-style /rerank endpoint (e.g. the code-diver llama.cpp reranker on
     # 127.0.0.1:8792).  Neither construction path loads a model or touches the
     # network, so this costs nothing until the first actual rerank call.
-    from hars_memory.server.reranker import make_rerank_func_from_env
-
     rerank_func = make_rerank_func_from_env(hf_cache_dir=_emb_cache)
     # LightRAG's own default (DEFAULT_MIN_RERANK_SCORE in lightrag/constants.py)
     # is already 0.0 in 1.4.16, i.e. no filtering. Resolved explicitly here

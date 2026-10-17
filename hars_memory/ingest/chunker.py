@@ -1509,7 +1509,7 @@ def lightrag_chunking_func(
     to LightRAG's own ``chunking_by_token_size`` unchanged.  Overlap is not
     applied to structure-aware chunks (they split at semantic boundaries).
     """
-    from lightrag.operate import chunking_by_token_size
+    from lightrag.chunker import chunking_by_token_size
 
     def token_split() -> list[dict[str, Any]]:
         return chunking_by_token_size(

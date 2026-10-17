@@ -326,7 +326,6 @@ class TestMaxCharsMcpArgument:
 
     def test_tool_schema_declares_max_chars(self) -> None:
         import asyncio
-        import json
 
         mod = _load_mcp_module_with_env({})
         tools = asyncio.run(mod.list_tools())
