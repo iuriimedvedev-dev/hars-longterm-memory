@@ -76,8 +76,8 @@ Timeout, retries and concurrency reuse `HARS_MEMORY_LLM_TIMEOUT_SECONDS`, `HARS_
 
 | Variable | Default | Description |
 |---|---|---|
-| `HARS_MEMORY_CHUNK_TOKEN_SIZE` | `512` | Token budget per chunk (tiktoken `cl100k_base`). Overridden by `CHUNKER_CHUNK_SIZE` for legacy compat |
-| `HARS_MEMORY_CHUNK_OVERLAP_TOKENS` | `128` | Token overlap between adjacent chunks |
+| `HARS_MEMORY_CHUNK_TOKEN_SIZE` | `512` | Token budget per chunk (tiktoken `cl100k_base`; the chunker's unit is tokens). With `HARS_MEMORY_CHUNKER=md_struct` this token budget is converted to the section chunker's char budget via the canonical `CHARS_PER_TOKEN=4` ratio (`target_chars = budget * 4`) — see `hars_memory/ingest/md_structure.py`. Overridden by `CHUNKER_CHUNK_SIZE` for legacy compat |
+| `HARS_MEMORY_CHUNK_OVERLAP_TOKENS` | `64` | Token overlap for the legacy token/markdown chunkers. `md_struct` is section-aligned and applies **no** overlap (its breadcrumb prefix + section boundaries replace it) |
 | `HARS_MEMORY_GPU_GUARD_SCRIPT_PATH` | — | Path to a Python file exposing `assert_gpu_free(api_base_url)`. Loaded dynamically; if unset, no GPU-concurrency check is performed |
 | `HARS_MEMORY_ENTITY_SCHEMA_PATH` | — | Path to custom entity/relation schema YAML. Default uses `hars_memory/schema/default_schema.yaml` |
 | `HARS_MEMORY_LEGACY_ENV_PREFIXES` | — | Comma-separated forbidden env prefixes (e.g. `GRAPHRAG_`). Fails closed at startup if any env var with that prefix is set |

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import statistics
 from pathlib import Path
 
 import pytest
@@ -338,3 +340,129 @@ class TestAdapterAndSwitch:
 
         with pytest.raises(ValueError, match="HARS_MEMORY_CHUNKER_MODE"):
             resolve_chunker()
+
+
+# ---------------------------------------------------------------------------
+# Units: a token budget must not be applied to a char measure (rec #3)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTok:
+    """Tokenizer stub whose ``encode`` yields ``chars // 4`` 'tokens'."""
+
+    @staticmethod
+    def encode(text: str) -> list[int]:
+        return [0] * (len(text) // 4)
+
+
+#: Known-content note: the ``## Big`` section is long enough to require
+#: several split parts under a 512-token budget, and the tiny ``## Outro``
+#: is large enough not to be merged away.
+_BIG_NOTE = (
+    "# Known Note\n\n"
+    "## Intro\n\n"
+    "Short intro with a couple of words.\n\n"
+    "## Big\n\n"
+    + "\n\n".join(
+        f"Paragraph {i}. " + " ".join(f"w{i}_{j}" for j in range(90))
+        for i in range(40)
+    )
+    + "\n\n## Outro\n\n"
+    + "Closing paragraph that is comfortably above the merge threshold. " * 4
+    + "\n"
+)
+
+
+class TestChunkTokenBudgetUnits:
+    def test_chars_per_token_is_the_canonical_ratio(self) -> None:
+        # The ratio must be the codebase's existing one (chars // 4), not a
+        # freshly invented number: estimate_tokens derives from it.
+        assert md.CHARS_PER_TOKEN == 4
+        assert estimate_tokens("a" * 400) == 100
+        assert estimate_tokens("a" * 4 * md.CHARS_PER_TOKEN) == 4
+        assert estimate_tokens("/" * 7) == 7 // md.CHARS_PER_TOKEN
+
+    def test_units_are_explicit_and_documented(self) -> None:
+        sig = inspect.signature(md.md_struct_chunking_func)
+        assert "chunk_token_budget" in sig.parameters
+        assert "chunk_token_size" not in sig.parameters
+        doc = md.md_struct_chunking_func.__doc__ or ""
+        assert "tokens" in doc.lower()
+        assert "CHARS_PER_TOKEN" in doc
+        assert "chars" in doc.lower()
+
+    def _records(self, budget: int) -> list[dict]:
+        return md.md_struct_chunking_func(_FakeTok(), _BIG_NOTE, None, False, 64, budget)
+
+    def test_chunk_token_estimates_within_band(self) -> None:
+        budget = 512
+        records = self._records(budget)
+        assert records
+        est = [estimate_tokens(r["content"]) for r in records]
+        # No chunk may blow past the budget by more than the allowed slack
+        # (the pre-fix token-measure bug produced ~2048-token chunks here).
+        assert max(est) <= budget * 1.4, est
+        # The typical (split-part) chunk must actually use the budget, not a
+        # 4x-smaller or 4x-larger section of it.
+        assert budget * 0.6 <= statistics.median(est) <= budget * 1.4, est
+
+    def test_no_chunk_exceeds_hard_char_cap(self) -> None:
+        budget = 512
+        cap = budget * md.CHARS_PER_TOKEN
+        for record in self._records(budget):
+            assert len(record["content"]) <= cap
+
+    def test_budget_scales_chunk_count(self) -> None:
+        # A larger token budget must not produce more chunks than a smaller
+        # one (it is a ceiling on section-merge and split size).
+        assert len(self._records(1024)) <= len(self._records(128))
+
+    def test_tokens_field_is_real_tokenizer_count(self) -> None:
+        for record in self._records(512):
+            assert record["tokens"] == len(record["content"]) // 4
+
+
+class TestNoOverlapByDesign:
+    def test_overlap_parameter_is_ignored(self) -> None:
+        # md_struct is section-aligned: it accepts chunk_overlap_token_size
+        # for call-contract compatibility but must never apply overlap.
+        a = md.md_struct_chunking_func(_FakeTok(), _BIG_NOTE, None, False, 0, 512)
+        b = md.md_struct_chunking_func(_FakeTok(), _BIG_NOTE, None, False, 256, 512)
+        assert [r["content"] for r in a] == [r["content"] for r in b]
+
+    def test_split_parts_have_non_overlapping_line_spans(self) -> None:
+        chunks = chunk_note_structured(
+            _BIG_NOTE, target_chars=512 * md.CHARS_PER_TOKEN, min_merge_chars=0
+        )
+        assert len(chunks) > 1
+        for prev, nxt in zip(chunks, chunks[1:]):
+            # Breadcrumb + section boundaries replace overlap; adjacent
+            # chunks must not cover the same input lines.
+            assert nxt.start_line > prev.end_line, (prev, nxt)
+
+    def test_no_duplicated_content_between_adjacent_chunks(self) -> None:
+        chunks = chunk_note_structured(
+            _BIG_NOTE, target_chars=512 * md.CHARS_PER_TOKEN, min_merge_chars=0
+        )
+        for prev, nxt in zip(chunks, chunks[1:]):
+            prev_body = prev.text.rsplit("\n", 1)[-1]
+            assert prev_body.strip() not in nxt.text
+
+
+class TestOversizedTableHeader:
+    def test_oversized_table_header_does_not_explode(self) -> None:
+        # When the table's first two rows alone exceed the budget, repeating
+        # the header while row-splitting used to emit one piece per character
+        # (a 26 kB table -> 22 003 overlapping chunks).  It must instead fall
+        # back to a plain hard split.
+        header = "| " + "x" * 1500 + " |\n| " + "y" * 1500 + " |"
+        rows = "\n".join(f"| row{i} | " + "z" * 150 + " |" for i in range(6))
+        note = "# T\n\n## Table\n\n" + header + "\n" + rows + "\n"
+        budget = 512
+        chunks = chunk_note_structured(note, target_chars=budget, measure=len)
+
+        assert 1 < len(chunks) < 50, len(chunks)
+        assert all(len(c.text) <= budget for c in chunks)
+        assert all(len(c.text) > 3 for c in chunks)  # no 1-char fragments
+        # No per-character explosion: emitted text stays near input size.
+        assert sum(len(c.text) for c in chunks) < 3 * len(note)
