@@ -89,6 +89,10 @@ from hars_memory.projects import (
 from hars_memory.server.embedder import qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
+from hars_memory.trace import emit as trace_emit
+from hars_memory.trace import hit_doc_fields as _trace_hit_doc_fields
+from hars_memory.trace import parse_context_blocks as _trace_parse_context_blocks
+from hars_memory.trace import trace_config_from_env as _trace_config_from_env
 
 setup_logging()
 logger = logging.getLogger("hars-longterm-memory-mcp")
@@ -139,6 +143,14 @@ HARS_MEMORY_QDRANT_COLLECTION = os.environ.get("HARS_MEMORY_QDRANT_COLLECTION", 
 # silently falling back to the unprefixed (collision-prone) collection names.
 HARS_MEMORY_QDRANT_COLLECTION_PREFIX = os.environ.get("HARS_MEMORY_QDRANT_COLLECTION_PREFIX", "")
 HARS_MEMORY_EMBED_MODEL = os.environ.get("HARS_MEMORY_EMBED_MODEL", "unsloth/embeddinggemma-300m")
+# Live-trace (SSE) hit-array cap: how many rows the per-channel `*_hits` trace
+# events carry. Purely a payload-size knob — the full pool still travels in the
+# final `result` frame, exactly as in the normal memory_recall response. A
+# malformed value must not block startup (this is peripheral telemetry).
+try:
+    HARS_MEMORY_TRACE_HITS_CAP = int(os.environ.get("HARS_MEMORY_TRACE_HITS_CAP", "30"))
+except ValueError:
+    HARS_MEMORY_TRACE_HITS_CAP = 30
 HF_HOME = os.environ.get("HF_HOME", "/mnt/datasets/models/.hf_home")
 HARS_API_BASE_URL = os.environ.get("HARS_API_BASE_URL", "http://localhost:8765")
 HARS_MEMORY_EXTRACTOR_BASE_URL = os.environ.get("HARS_MEMORY_EXTRACTOR_BASE_URL", "http://localhost:8080/v1")
@@ -1486,6 +1498,42 @@ async def _compute_hybrid_block(
             for entry in dense_raw
         }
 
+        # Live trace (SSE) — channel events, emitted in real execution order
+        # (sparse is measured first, then dense) and only when a trace session
+        # is active (`trace_emit` is a no-op otherwise, so the MCP/CLI path is
+        # untouched). Payloads are the measured pools; `hits` is capped for
+        # payload size, the full pool still travels in the final `result`.
+        await trace_emit(
+            "bm25_hits",
+            latency_ms=round(sparse_elapsed_ms, 2),
+            chunks_indexed=bm25_index.chunk_count,
+            pool_size=pool_size,
+            hits=[
+                {
+                    "chunk_id": hit.chunk_id,
+                    "sparse_score": round(hit.score, 4),
+                    **_trace_hit_doc_fields(hit.content, hit.file_path),
+                }
+                for hit in sparse_search_hits[:HARS_MEMORY_TRACE_HITS_CAP]
+            ],
+        )
+        await trace_emit(
+            "vector_hits",
+            latency_ms=round(dense_elapsed_ms, 2),
+            embedder=HARS_MEMORY_EMBED_MODEL,
+            pool_size=pool_size,
+            hits=[
+                {
+                    "chunk_id": str(entry.get("id", "")),
+                    "dense_score": round(float(entry.get("distance", 0.0)), 4),
+                    **_trace_hit_doc_fields(
+                        str(entry.get("content", "")), str(entry.get("file_path", ""))
+                    ),
+                }
+                for entry in dense_raw[:HARS_MEMORY_TRACE_HITS_CAP]
+            ],
+        )
+
         # Full pool, NOT sliced to top_k yet — apply_ripgrep_gate (if the
         # channel is enabled) needs the whole pool so an off-index file it
         # finds can be APPENDED beyond top_k rather than requiring it to
@@ -1663,6 +1711,21 @@ async def _compute_hybrid_block(
             fused = list(fused_pool) + additive_tail
         fused = _select_diverse_fused_chunks(fused, len(fused))
 
+        # Pre-rerank order — the TRUE fusion order v1 could only approximate
+        # (compile_trace reconstructed "before" from dense scores). Captured
+        # here, before rerank mutates `fused`, so both the `fusion` event and
+        # `rerank.before` carry measured ids, not a reconstruction.
+        pre_rerank_order = [chunk.chunk_id for chunk in fused]
+        pre_rerank_scores = {chunk.chunk_id: round(chunk.fused_score, 4) for chunk in fused}
+        await trace_emit(
+            "fusion",
+            alpha=HARS_MEMORY_HYBRID_ALPHA,
+            candidate_pool_size=pool_size,
+            pool_size=len(fused),
+            order=pre_rerank_order[:HARS_MEMORY_TRACE_HITS_CAP],
+            scores=pre_rerank_scores,
+        )
+
         # Cross-encoder reranking is opt-in for HTTP and remains compatible
         # with the historical local LightRAG callback when backend is unset.
         rerank_elapsed_ms = None
@@ -1767,6 +1830,26 @@ async def _compute_hybrid_block(
 
         # Legacy local rerank errors are fail-soft; HTTP client failures are
         # represented by rerank_status and never change the original ordering.
+
+        # Live trace — rerank outcome. `before` is the measured pre-rerank
+        # order captured above; `after` is the post-rerank order. A skipped
+        # rerank still emits (applied=false) with its recorded reason
+        # (fusion_confident, empty_pool, ...), and latency_ms is null when the
+        # backend was never called — never a fabricated 0.
+        await trace_emit(
+            "rerank",
+            applied=bool(rerank_status.get("applied")),
+            backend=rerank_status.get("backend"),
+            latency_ms=rerank_status.get("latency_ms"),
+            pool=rerank_status.get("pool", 0),
+            fallback_reason=rerank_status.get("fallback_reason"),
+            max_fusion_score=rerank_status.get("max_fusion_score"),
+            skip_threshold=rerank_status.get("skip_threshold"),
+            blocked_inversions=rerank_status.get("blocked_inversions"),
+            fusion_margin=rerank_status.get("fusion_margin"),
+            before=pre_rerank_order[:HARS_MEMORY_TRACE_HITS_CAP],
+            after=[chunk.chunk_id for chunk in fused][:HARS_MEMORY_TRACE_HITS_CAP],
+        )
 
         if routing_status is not None:
             routing_status["latency_ms"]["total"] = round(
@@ -3327,6 +3410,35 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "anything added or changed after that date is absent from this response."
                 )
 
+            # Live trace (SSE): the keywords+mode stage. Emitted before RAG
+            # init and channel work so a live client gets its first frame
+            # immediately; every field is measured config/state. No-op unless a
+            # trace session installed an emitter (see hars_memory/trace.py).
+            _trace_index_dir = (
+                HARS_MEMORY_INDEX_DIR
+                if project_id == "default"
+                else getattr(project_meta, "index_dir", "")
+            )
+            await trace_emit(
+                "trace_start",
+                question=question,
+                mode=mode,
+                lightrag_mode=rag_mode,
+                mode_fallback=mode_fallback,
+                top_k=top_k,
+                fetch_top_k=fetch_top_k,
+                fetch_top_k_source=fetch_top_k_source,
+                alpha=HARS_MEMORY_HYBRID_ALPHA,
+                index_id=Path(str(_trace_index_dir)).name if _trace_index_dir else "",
+                index_dir=str(_trace_index_dir) if _trace_index_dir else "",
+                stale_days=stale_days,
+                last_ingest=last_ingest,
+                context_only=context_only,
+                context_priority=context_priority,
+                ll_keywords=ll_keywords,
+                hl_keywords=hl_keywords,
+            )
+
             rag = await _get_rag(project_id)
 
             # Additive hybrid (dense + BM25 sparse) fields — computed once, attached
@@ -3440,6 +3552,56 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         )
                     else:
                         context_for_response = None
+                    # Live trace (SSE): graph pass + assembled context. The
+                    # entity/relation/source rows are *derived* by parsing the
+                    # rendered LightRAG context (the only place they exist on
+                    # this path); latency, char count, caps and the priority
+                    # actually applied are measured.
+                    ctx_blocks = _trace_parse_context_blocks(context if isinstance(context, str) else "")
+                    await trace_emit(
+                        "graph_expand",
+                        mode=rag_mode,
+                        latency_ms=round(graph_channel_ms, 2),
+                        entity_count=len(ctx_blocks["entities"]),
+                        relation_count=len(ctx_blocks["relations"]),
+                        traversed_edge_count=len(ctx_blocks["relations"]),
+                        entities=[
+                            {"name": item.get("entity"), "type": item.get("type")}
+                            for item in ctx_blocks["entities"][:HARS_MEMORY_TRACE_HITS_CAP]
+                        ],
+                        relations=[
+                            {"entity1": item.get("entity1"), "entity2": item.get("entity2")}
+                            for item in ctx_blocks["relations"][:HARS_MEMORY_TRACE_HITS_CAP]
+                        ],
+                        derived_from="context_string",
+                    )
+                    await trace_emit(
+                        "context",
+                        has_context=has_context,
+                        chars=len(context_for_response) if isinstance(context_for_response, str) else 0,
+                        context_priority_applied=context_priority_applied,
+                        source_count=len(ctx_blocks["sources"]),
+                        entity_count=len(ctx_blocks["entities"]),
+                        relation_count=len(ctx_blocks["relations"]),
+                        sources=[
+                            {
+                                "reference_id": item.get("reference_id"),
+                                **_trace_hit_doc_fields(
+                                    str(item.get("content", "")),
+                                    str(
+                                        item.get("file_path")
+                                        or ctx_blocks["references"].get(str(item.get("reference_id")), "")
+                                    ),
+                                ),
+                            }
+                            for item in ctx_blocks["sources"][:HARS_MEMORY_TRACE_HITS_CAP]
+                        ],
+                        caps={
+                            "max_chars": max_chars_arg,
+                            "max_entity_tokens": DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                            "max_relation_tokens": DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                        },
+                    )
                     _emit_recall_event(
                         ok=has_context,
                         results=[
@@ -3516,6 +3678,27 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         rag.llm_model_func = _orig_llm_func
                 graph_channel_ms = (time.monotonic() - graph_start) * 1000
                 citations = _extract_citations(result, top_k)
+                # Live trace (SSE): the answer path has no rendered context
+                # string to parse, so graph entities come from the result's own
+                # `data.entities` (measured) and no `context` event is emitted —
+                # the assembled answer/citations already travel in the final
+                # `result` frame. The context_only path (the trace default) is
+                # the high-fidelity one.
+                _answer_entities = _extract_entities_used(result, HARS_MEMORY_TRACE_HITS_CAP)
+                await trace_emit(
+                    "graph_expand",
+                    mode=rag_mode,
+                    latency_ms=round(graph_channel_ms, 2),
+                    entity_count=len(_answer_entities),
+                    relation_count=None,
+                    traversed_edge_count=None,
+                    entities=[
+                        {"name": entity.get("id"), "type": entity.get("entity_type")}
+                        for entity in _answer_entities
+                    ],
+                    relations=None,
+                    derived_from="answer_result",
+                )
                 if _extract_entities_used(result, 1):
                     hybrid_block["confidence"]["low_confidence"] = False
                 _emit_recall_event(
@@ -4391,8 +4574,31 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
 
 async def _serve() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    # Read-only live-trace SSE listener on a sibling port. supergateway (the
+    # Node Streamable-HTTP bridge in front of this stdio server) cannot host
+    # extra routes, so the trace surface runs here, on the same event loop, and
+    # shares `_rag_instance` + caches with the MCP path. Disable with
+    # HARS_MEMORY_TRACE_HTTP_PORT=0. Bind failure is non-fatal: the MCP server
+    # must always start even if the trace port is taken.
+    trace_server = None
+    trace_cfg = _trace_config_from_env()
+    if trace_cfg is not None:
+        try:
+            from hars_memory.trace import start_trace_server
+
+            trace_server = await start_trace_server(*trace_cfg)
+        except Exception as exc:
+            logger.warning("Live trace SSE endpoint disabled (bind failed): %s", exc)
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    finally:
+        if trace_server is not None:
+            trace_server.close()
+            try:
+                await trace_server.wait_closed()
+            except Exception:  # pragma: no cover - best effort on shutdown
+                pass
 
 
 def main() -> None:
