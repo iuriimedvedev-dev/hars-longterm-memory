@@ -241,19 +241,19 @@ systemctl --user restart hars-longterm-memory-mcp.service
 
 ### Call-site change in `hars_memory/mcp_server.py` (owned by another agent)
 
-1. Add `ripgrep_channel_mode` and `ripgrep_scores_by_chunk_id` to the
-   `from hars_memory.retrieval.fusion import (…)` block in
-   `_compute_hybrid_block`.
-2. Select the ranked mode (one line):
+**No change is required for the ranking itself.** `apply_ripgrep_gate`'s
+`mode=None` now resolves to the env mode (`HARS_MEMORY_RIPGREP_CHANNEL_MODE`,
+default `ranked`) internally, read fresh on every call — so the existing
+`apply_ripgrep_gate(fused_pool, ripgrep_hits_by_basename, top_k=top_k)` call in
+`_compute_hybrid_block` re-ranks automatically once the channel is enabled.
+(Explicit `mode=` still wins; the legacy tests pass `mode="injection"`.)
 
-   ```python
-   # was: fused = apply_ripgrep_gate(fused_pool, ripgrep_hits_by_basename, top_k=top_k)
-   fused = apply_ripgrep_gate(
-       fused_pool, ripgrep_hits_by_basename, top_k=top_k, mode=ripgrep_channel_mode()
-   )
-   ```
-3. Emit the trace frame (a `ripgrep_hits` frame, same shape as `bm25_hits`),
-   immediately after `rg_result = await ripgrep_channel.asearch(...)`:
+The only *desirable* call-site change is the trace frame, so the UI can show
+`rg` as a real channel. Add `ripgrep_scores_by_chunk_id` /
+`ripgrep_channel_mode` to the `from hars_memory.retrieval.fusion import (…)`
+block in `_compute_hybrid_block`, then emit a `ripgrep_hits` frame (same shape
+as `bm25_hits`) immediately after
+`rg_result = await ripgrep_channel.asearch(...)`:
 
    ```python
    _rg_by_name = ripgrep_channel.hits_by_basename(rg_result.hits)

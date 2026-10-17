@@ -1150,7 +1150,7 @@ def apply_ripgrep_gate(
     max_injected: int = RIPGREP_MAX_INJECTED,
     enable_boost: bool = False,
     enable_injection: bool = True,
-    mode: str = _MODE_INJECTION,
+    mode: str | None = None,
     weight: float | None = None,
 ) -> list[FusedChunk]:
     """Additively boost + presence-gate `fused` (the FULL pre-truncation
@@ -1159,19 +1159,21 @@ def apply_ripgrep_gate(
     hits, keyed by FILE BASENAME (see design note above for why basename,
     not chunk_id).
 
-    `mode` selects the channel's behaviour:
-      - `"injection"` (the DEFAULT here, preserving this function's
-        pre-2026-10-17 contract for every existing direct caller/test): only
-        ANNOTATE `ripgrep_score` and append the exclusive tail; `fused_score`
-        and the top-k ORDER are untouched unless `enable_boost=True`.
-      - `"ranked"`: delegate to `apply_ripgrep_ranked` — the literal-match
-        score re-ranks the pool INSIDE the top-k window. The live call site
-        passes `mode=ripgrep_channel_mode()`, whose default is `"ranked"`, so
-        an operator who turns the channel on gets the ranked behaviour
-        without a second knob; a direct caller that omits `mode` keeps the
-        legacy injection behaviour. `weight` is forwarded to ranked mode.
-    Neither mode changes the channel ON/OFF default (`_RIPGREP_CHANNEL_DEFAULT
-    = "0"`).
+    `mode` selects the channel's behaviour (default `None` → the current
+    effective `HARS_MEMORY_RIPGREP_CHANNEL_MODE`, i.e. `"ranked"` unless the
+    operator set `"injection"` — read fresh per call, the same convention every
+    other knob in this module uses):
+      - `"ranked"` (default): delegate to `apply_ripgrep_ranked` — the
+        literal-match score re-ranks the pool INSIDE the top-k window. This is
+        the shipped, default-ON behaviour.
+      - `"injection"` (opt-in): only ANNOTATE `ripgrep_score` and append the
+        exclusive tail; `fused_score` and the top-k order are untouched unless
+        `enable_boost=True`. This is the pre-2026-10-17 freshness-only
+        behaviour, preserved verbatim for callers that want it.
+    `weight` is forwarded to ranked mode.
+
+    Passing `mode=...` explicitly (e.g. `mode="injection"` in a test that pins
+    the legacy contract) always wins over the env.
 
     Returns up to `top_k + max_injected` chunks: the top `top_k` of the
     (possibly boosted) fused pool, followed by up to `max_injected`
@@ -1212,7 +1214,8 @@ def apply_ripgrep_gate(
     `ripgrep_hits_by_basename` is empty — the common case (channel disabled,
     unavailable, or the question had no identifier-shaped term).
     """
-    if mode == _MODE_RANKED:
+    effective_mode = ripgrep_channel_mode() if mode is None else mode
+    if effective_mode == _MODE_RANKED:
         return apply_ripgrep_ranked(
             fused,
             ripgrep_hits_by_basename,
@@ -1221,8 +1224,8 @@ def apply_ripgrep_gate(
             max_injected=max_injected,
             enable_injection=enable_injection,
         )
-    if mode not in _VALID_RIPGREP_MODES:
-        raise ValueError(f"mode must be one of {sorted(_VALID_RIPGREP_MODES)}, got {mode!r}")
+    if effective_mode not in _VALID_RIPGREP_MODES:
+        raise ValueError(f"mode must be one of {sorted(_VALID_RIPGREP_MODES)}, got {effective_mode!r}")
     if not ripgrep_hits_by_basename:
         return fused[:top_k]
 
