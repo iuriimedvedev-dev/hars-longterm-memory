@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from hars_memory.retrieval.bm25_index import BM25SparseIndex
-from hars_memory.retrieval.fusion import ChannelHit, fuse
+from hars_memory.retrieval.fusion import ChannelHit, apply_ripgrep_gate, fuse
 from hars_memory.retrieval.tokenizer import extract_identifier_terms
 
 # Matches HYBRID_CANDIDATE_POOL_MULTIPLIER in hars_longterm_memory_mcp.py — each
@@ -108,6 +108,79 @@ async def hybrid_bm25(
     return [
         RankedHit(rank=i, file_path=c.file_path, chunk_id=c.chunk_id, score=c.fused_score)
         for i, c in enumerate(fused, start=1)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Channel 2b: hybrid dense + BM25 + the RANKED ripgrep channel
+# (retrieval/ripgrep_channel.py + retrieval/fusion.py's apply_ripgrep_gate
+# with mode="ranked"). Added 2026-10-17: before this, `ab_bench` never
+# exercised the ripgrep gate at all (it was only referenced as a strict-env
+# knob), so a ranked-ripgrep change could not be measured — this is the
+# harness entry point that makes it measurable through the same scoring path
+# as every other channel.
+# ---------------------------------------------------------------------------
+
+
+async def hybrid_bm25_ripgrep(
+    rag: Any,
+    bm25_index: BM25SparseIndex,
+    question: str,
+    top_k: int,
+    alpha: float,
+    pool_multiplier: int = DEFAULT_POOL_MULTIPLIER,
+    *,
+    ripgrep_mode: str = "ranked",
+    ripgrep_weight: float | None = None,
+    ripgrep_roots: list[Any] | None = None,
+    ll_keywords: list[str] | None = None,
+) -> list[RankedHit]:
+    """`hybrid_bm25` plus the ripgrep channel, wired EXACTLY as the live
+    server wires it (`apply_ripgrep_gate` over the full pre-truncation fused
+    pool, keyed by basename). `ripgrep_mode="ranked"` re-ranks inside top_k;
+    `"injection"` reproduces the pre-2026-10-17 append-only behaviour. Fails
+    soft: when `rg` is unavailable or finds nothing, the result is identical
+    to `hybrid_bm25`.
+    """
+    from hars_memory.retrieval import ripgrep_channel as ripgrep_mod
+
+    pool_size = max(top_k * pool_multiplier, top_k)
+    sparse_hits = await asyncio.to_thread(bm25_index.search, question, pool_size)
+    dense_raw = await rag.chunks_vdb.query(question, top_k=pool_size)
+
+    sparse = {
+        hit.chunk_id: ChannelHit(score=hit.score, content=hit.content, file_path=hit.file_path)
+        for hit in sparse_hits
+    }
+    dense = {
+        str(entry["id"]): ChannelHit(
+            score=float(entry.get("distance", 0.0)),
+            content=str(entry.get("content", "")),
+            file_path=str(entry.get("file_path", "")),
+        )
+        for entry in dense_raw
+    }
+    fused_pool = fuse(dense, sparse, alpha)
+
+    roots = ripgrep_roots if ripgrep_roots is not None else ripgrep_mod.default_roots()
+    keywords = ll_keywords if ll_keywords is not None else derive_keywords(question)[0]
+    rg_result = await ripgrep_mod.asearch(
+        question, ll_keywords=keywords, roots=roots, top_k=pool_size
+    )
+    by_basename = {
+        name: ChannelHit(score=hit.score, content=hit.content, file_path=hit.file_path)
+        for name, hit in ripgrep_mod.hits_by_basename(rg_result.hits).items()
+    }
+    gated = apply_ripgrep_gate(
+        fused_pool,
+        by_basename,
+        top_k=top_k,
+        mode=ripgrep_mode,
+        weight=ripgrep_weight,
+    )
+    return [
+        RankedHit(rank=i, file_path=c.file_path, chunk_id=c.chunk_id, score=c.fused_score)
+        for i, c in enumerate(gated[:top_k], start=1)
     ]
 
 
@@ -384,6 +457,7 @@ __all__ = [
     "ranked_file_paths",
     "dense_only",
     "hybrid_bm25",
+    "hybrid_bm25_ripgrep",
     "hybrid_bm25_rerank",
     "lightrag_mode",
     "parse_reference_document_list",

@@ -56,6 +56,7 @@ from hars_memory.eval.channels import (
     dense_only,
     hybrid_bm25,
     hybrid_bm25_rerank,
+    hybrid_bm25_ripgrep,
     install_query_embedding_cache,
     lightrag_mode,
     ranked_file_paths,
@@ -137,6 +138,8 @@ FUSION_SCORING_ENV_VARS: tuple[str, ...] = (
     fusion_config.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV,
     fusion_config.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV,
     fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_ENV,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV,
 )
 
 # env_var -> zero-arg getter returning that knob's CURRENT effective value
@@ -152,6 +155,8 @@ _FUSION_KNOB_GETTERS: dict[str, Callable[[], Any]] = {
     fusion_config.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV: fusion_config.marker_penalty_sub_flag,
     fusion_config.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV: fusion_config.recency_discount_sub_flag,
     fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_ENV: fusion_config.ripgrep_channel_enabled,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV: fusion_config.ripgrep_channel_mode,
+    fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV: fusion_config.ripgrep_channel_weight,
 }
 
 
@@ -228,7 +233,7 @@ def _print_config_snapshot(snapshot: dict[str, Any]) -> None:
     print()
 
 
-def _check_strict_env(*, alpha_cli_overridden: bool) -> None:
+def _check_strict_env(*, alpha_cli_overridden: bool, cli_overridden_extra: frozenset[str] = frozenset()) -> None:
     """`--strict-env` enforcement: refuse to run while any
     `FUSION_SCORING_ENV_VARS` knob is set in the ambient environment without
     an explicit CLI override (today, only `ab`'s `--alpha` provides one —
@@ -243,6 +248,7 @@ def _check_strict_env(*, alpha_cli_overridden: bool) -> None:
     unrelated `ab` run, and nothing in that run's output could have shown
     it."""
     cli_overridden = {HARS_MEMORY_HYBRID_ALPHA_ENV} if alpha_cli_overridden else set()
+    cli_overridden |= set(cli_overridden_extra)
     polluted = sorted(
         v for v in FUSION_SCORING_ENV_VARS if v in os.environ and v not in cli_overridden
     )
@@ -268,6 +274,7 @@ def _check_strict_env(*, alpha_cli_overridden: bool) -> None:
 ALL_CONFIGS = (
     "dense_only",
     "hybrid_bm25",
+    "hybrid_bm25_ripgrep",
     "hybrid_bm25_rerank",
     "naive",
     "local",
@@ -347,6 +354,9 @@ async def run_config(
     max_entity_tokens: int | None = None,
     max_relation_tokens: int | None = None,
     max_total_tokens: int | None = None,
+    ripgrep_mode: str = "ranked",
+    ripgrep_weight: float | None = None,
+    ripgrep_roots: list[Any] | None = None,
 ) -> RunOutcome:
     """Dispatch one (config, question) pair to its channel and time it.
 
@@ -364,6 +374,20 @@ async def run_config(
             raise RuntimeError("hybrid_bm25 config requires a BM25 index")
         hits = await hybrid_bm25(
             rag, bm25_index, question, top_k, alpha, pool_multiplier=pool_multiplier
+        )
+    elif config == "hybrid_bm25_ripgrep":
+        if bm25_index is None:
+            raise RuntimeError("hybrid_bm25_ripgrep config requires a BM25 index")
+        hits = await hybrid_bm25_ripgrep(
+            rag,
+            bm25_index,
+            question,
+            top_k,
+            alpha,
+            pool_multiplier=pool_multiplier,
+            ripgrep_mode=ripgrep_mode,
+            ripgrep_weight=ripgrep_weight,
+            ripgrep_roots=ripgrep_roots,
         )
     elif config == "hybrid_bm25_rerank":
         if bm25_index is None or rerank_func is None:
@@ -545,6 +569,20 @@ def _build_rerank_func(model_name: str, hf_cache_dir: str) -> Any:
     return make_rerank_func(model_name=model_name, device="cpu", hf_cache_dir=hf_cache_dir)
 
 
+def _resolve_ripgrep_roots(args: argparse.Namespace) -> list[Any] | None:
+    """Search roots for the `hybrid_bm25_ripgrep` config: the explicit
+    `--ripgrep-roots` CLI list when given, else
+    `ripgrep_channel.default_roots()` (the live deployment's own resolution:
+    `HARS_MEMORY_RIPGREP_ROOTS`, else the knowledge-source manifest, else the
+    appended Claude memory dir). `None` means "let the channel resolve it"."""
+    raw = getattr(args, "ripgrep_roots", None)
+    if raw is None:
+        return None
+    from pathlib import Path as _Path
+
+    return [_Path(p.strip()) for p in raw.split(",") if p.strip()]
+
+
 # ---------------------------------------------------------------------------
 # `ab` subcommand
 # ---------------------------------------------------------------------------
@@ -559,11 +597,12 @@ async def _run_ab(args: argparse.Namespace) -> int:
     bm25_index = None
     rerank_func = None
     try:
-        if any(c in {"hybrid_bm25", "hybrid_bm25_rerank"} for c in configs):
+        if any(c in {"hybrid_bm25", "hybrid_bm25_ripgrep", "hybrid_bm25_rerank"} for c in configs):
             working_dir = os.environ.get(HARS_MEMORY_INDEX_DIR_ENV, "")
             bm25_index = await _build_bm25(working_dir, args.bm25_cache_dir)
         if "hybrid_bm25_rerank" in configs:
             rerank_func = _build_rerank_func(args.rerank_model, args.hf_cache_dir)
+        ripgrep_roots = _resolve_ripgrep_roots(args)
 
         results: dict[str, dict[str, Any]] = {}
         per_query_raw: dict[str, dict[str, list[str]]] = {}
@@ -585,6 +624,9 @@ async def _run_ab(args: argparse.Namespace) -> int:
                     max_entity_tokens=args.max_entity_tokens,
                     max_relation_tokens=args.max_relation_tokens,
                     max_total_tokens=args.max_total_tokens,
+                    ripgrep_mode=args.ripgrep_mode,
+                    ripgrep_weight=args.ripgrep_weight,
+                    ripgrep_roots=ripgrep_roots,
                 )
                 scores.append(
                     score_query(
@@ -911,6 +953,38 @@ def main() -> None:
     )
     p_ab.add_argument("--rerank-model", type=str, default=DEFAULT_RERANK_MODEL)
     p_ab.add_argument("--hf-cache-dir", type=str, default="")
+    p_ab.add_argument(
+        "--ripgrep-mode",
+        type=str,
+        default="ranked",
+        choices=["ranked", "injection"],
+        help=(
+            "Ripgrep channel behaviour for the hybrid_bm25_ripgrep config: "
+            "'ranked' re-ranks inside top_k (default), 'injection' reproduces "
+            "the pre-2026-10-17 append-past-top_k behaviour."
+        ),
+    )
+    p_ab.add_argument(
+        "--ripgrep-weight",
+        type=float,
+        default=None,
+        help=(
+            "Additive weight on the min-max-normalized ripgrep score in ranked "
+            "mode (default: fusion.ripgrep_channel_weight(), i.e. the "
+            f"{fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV} env value or "
+            "its built-in default)."
+        ),
+    )
+    p_ab.add_argument(
+        "--ripgrep-roots",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated literal-search roots for the hybrid_bm25_ripgrep "
+            "config. Default: ripgrep_channel.default_roots() "
+            "(HARS_MEMORY_RIPGREP_ROOTS / knowledge-source manifest)."
+        ),
+    )
     p_ab.add_argument("--dump-hits", type=Path, default=None, help="Optional: dump raw per-query ranked file_paths per config")
     p_ab.add_argument(
         "--chunk-top-k",
@@ -971,7 +1045,15 @@ def main() -> None:
         args.resolved_alpha = resolved_alpha
         args.alpha = resolved_alpha.value
         if args.strict_env:
-            _check_strict_env(alpha_cli_overridden=resolved_alpha.source == "cli")
+            overridden: set[str] = set()
+            if args.ripgrep_weight is not None:
+                overridden.add(fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV)
+            if args.ripgrep_mode != "ranked":
+                overridden.add(fusion_config.HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV)
+            _check_strict_env(
+                alpha_cli_overridden=resolved_alpha.source == "cli",
+                cli_overridden_extra=frozenset(overridden),
+            )
         raise SystemExit(asyncio.run(_run_ab(args)))
     elif args.command == "alpha-sweep":
         if args.strict_env:

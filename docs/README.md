@@ -16,6 +16,8 @@ and CPU-only embeddings.
 | [Release process](release-process.md) | How to publish a new version — PyPI package, container image, CI/CD |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
 | [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
+| [Ripgrep ranked channel](ripgrep-ranked-channel.md) | The literal-search channel as a first-class RANKED fusion channel (default ON): structural verdict, scoring, flags, measurements, deployment |
+| [Channel hygiene](CHANNEL_HYGIENE.md) | Per-channel audit: what is live, dormant, redundant, or a deletion candidate |
 
 ### CLI Reference
 

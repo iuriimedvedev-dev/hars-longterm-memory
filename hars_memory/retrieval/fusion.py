@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Final
 
 from hars_memory.retrieval.supersession import apply_supersession_scoring
@@ -444,17 +443,23 @@ def single_channel_signal_mode() -> str:
     return _single_channel_signal_mode()
 
 
-def _pool_mean_std(hits: dict[str, "ChannelHit"]) -> tuple[float, float]:
-    """(mean, population std) of one channel's own raw returned scores.
-    `n<=1` or a degenerate (all-tied) pool returns std=0.0 — callers must
-    treat that as "no basis to claim decisiveness," not divide by it."""
-    values = [hit.score for hit in hits.values()]
+def _scores_mean_std(values: list[float]) -> tuple[float, float]:
+    """(mean, population std) of a list of raw scores. `n<=1` or a
+    degenerate (all-tied) list returns std=0.0 — callers must treat that as
+    "no basis to claim decisiveness," not divide by it."""
     n = len(values)
     if n == 0:
         return 0.0, 0.0
     mean = sum(values) / n
     variance = sum((v - mean) ** 2 for v in values) / n
     return mean, variance**0.5
+
+
+def _pool_mean_std(hits: dict[str, "ChannelHit"]) -> tuple[float, float]:
+    """(mean, population std) of one channel's own raw returned scores —
+    thin wrapper over `_scores_mean_std` for the dict-keyed channel pools
+    `fuse()` works with."""
+    return _scores_mean_std([hit.score for hit in hits.values()])
 
 
 def _channel_zscore(raw_score: float | None, mean: float, std: float) -> float:
@@ -667,11 +672,19 @@ def fuse(
 
 
 # ---------------------------------------------------------------------------
-# Ripgrep channel wiring (retrieval/ripgrep_channel.py) — additive gate, not a
-# third convex weight. See the design note below for why, and
-# `fuse_ripgrep_as_third_weight` (further down) for the rejected alternative,
-# kept as a measurable, importable function rather than deleted so the
-# decision stays falsifiable instead of asserted.
+# Ripgrep channel wiring (retrieval/ripgrep_channel.py).
+#
+# UPDATED 2026-10-17: this channel now has a RANKED mode (see the "Ripgrep as
+# a RANKED channel" section further down — `apply_ripgrep_ranked` /
+# `HARS_MEMORY_RIPGREP_CHANNEL_MODE`), which DOES re-rank inside top_k. The
+# "additive gate, not a third convex weight" framing below still holds for
+# the ranking term itself (it is bounded and additive, never a convex
+# dilution of dense/sparse), but the "ripgrep can only append past top_k"
+# conclusion at point (b) describes the injection-only mode, which is now the
+# opt-in alternative rather than the default. See
+# `fuse_ripgrep_as_third_weight` (further down) for the rejected CONVEX
+# alternative, kept as a measurable, importable function rather than deleted
+# so the decision stays falsifiable instead of asserted.
 #
 # WHY ADDITIVE GATE, NOT A THIRD CONVEX WEIGHT (measured, not guessed — via
 # a scratch harness built only on tools/memory/eval/ab_bench.py's own
@@ -734,81 +747,61 @@ def fuse(
 #       recall@k/ndcg@k/mrr on a labeled set scored by exactly those metrics
 #       — the worst case is a wasted, ignored extra slot.
 #
-# Matching key: FILE BASENAME (`Path(file_path).name`), not chunk_id and not
-# `file_stable_id()`. Empirically the only join key that actually holds
-# across this corpus's channels: `kv_store_full_docs.json` /
-# `kv_store_text_chunks.json` both store `file_path` as a bare basename for
-# every curated-note/experiment/hypothesis document (2047/2289 entries,
-# verified 2026-07-30), never a directory-qualified path, and the 242
-# remaining entries (staged notes under `/mnt/datasets/graphrag/staging/`)
-# carry a full absolute path whose OWN basename still agrees with what
-# `ripgrep_channel.search()` reports for the same file (ripgrep's
-# `file_path` is whatever absolute/relative form its search `roots` were
-# given — see ripgrep_channel.py's module docstring "Search roots and
-# filters" — but `.name` is invariant to that).
+# Matching key: the pool's (possibly FLATTENED) `file_path` matched against a
+# ripgrep hit's on-disk BASENAME, via `_matching_ripgrep_basename` below —
+# never chunk_id and never `file_stable_id()`. CORRECTED 2026-10-17: the
+# earlier claim here ("file_path is a bare basename whose `.name` equals
+# ripgrep's basename") is FALSE for this corpus and was the reason the join
+# never fired. `kv_store_text_chunks.json` stores a path with directory
+# separators COLLAPSED to `-` (`.plans/2026-06-20_x.md` ->
+# `.plans-2026-06-20_x.md`, `docs/specs/x.md` -> `docs-specs-x.md`), so
+# `Path(file_path).name` is the whole flattened string and equals ripgrep's
+# basename (`2026-06-20_x.md`) for 0/48 gold docs (verified directly against
+# the live index). `_matching_ripgrep_basename` instead accepts an equality OR
+# an `-<basename>` / `/<basename>` suffix, which is the only join that holds
+# on the real index (4/48 gold docs connect; see the ranked-channel header
+# note for the measured counts).
 HARS_MEMORY_RIPGREP_CHANNEL_ENV = "HARS_MEMORY_RIPGREP_CHANNEL"
 
-# Default OFF. The channel is fully implemented and unit-tested, but it
-# ships disabled so that the code default and the live deployment agree:
-# cortex/.mcp.json sets HARS_MEMORY_RIPGREP_CHANNEL=0, and this constant is
-# the fallback for any deployment that does not set it. Set
-# HARS_MEMORY_RIPGREP_CHANNEL=1 to opt in (see the "Escape hatch" note at the
-# bottom of this block).
+# DECISION 2026-10-17 (product owner: "rg должен быть каналом 100%"): DEFAULT
+# ON, and a first-class RANKED fusion channel — not the injection-only
+# afterthought it was.
 #
-# When enabled it runs in INJECTION-ONLY mode (`apply_ripgrep_gate`'s own
-# `enable_boost` defaults False — see that function's docstring). Measured
-# 2026-07-30, two independent pieces of evidence:
+# WHY THE OLD DEFAULT OFF WAS WRONG (structural, verified in code): the
+# previous wiring could not affect any top-k metric BY CONSTRUCTION. Two
+# independent reasons, both proven against the live index, are documented in
+# full in the "Ripgrep as a RANKED channel" header note below
+# (`HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV`): (a) it only APPENDED hits past
+# `top_k`, and (b) its basename join was broken on this corpus's flattened
+# `file_path`s, so it did not even connect to indexed chunks. The prior "no
+# regression" measurement was therefore evidence that the channel was inert,
+# not that it was harmless-but-useful. A channel that cannot move a metric is
+# not an evaluated channel.
 #
-# 1. No-regression on the 46-query tools/memory/eval/retrieval_queries.yaml
-#    labeled set (hybrid_bm25 channel, top_k=10, pool_multiplier=3):
-#    recall@1/recall@10/ndcg@10/mrr/supersession_error_rate/no_answer_hit_
-#    rate, AND the full per-query-type breakdown, are IDENTICAL to the
-#    no-ripgrep baseline in every run (reproduced across 2 separate runs
-#    with slightly different absolute baseline numbers from Qdrant ANN
-#    floating-point jitter — see .session/2026-07-30_qdrant-migration-
-#    execution.md's own documented sub-1e-6-ULP variance — injection
-#    tracked the baseline exactly both times). This is not a coincidence of
-#    this particular label set's queries: injection only ever APPENDS past
-#    `top_k` (never evicts — see `apply_ripgrep_gate`'s docstring), so it is
-#    structurally incapable of moving a recall@10/ndcg@10/mrr score
-#    computed over the first `top_k` ranks, for ANY query.
-# 2. The freshness demonstration this label set cannot express (see the
-#    report): 3 real files that post-date the last consolidation and are
-#    confirmed absent from `kv_store_full_docs.json` (checked directly, not
-#    assumed) — the shipped no-ripgrep pipeline returns 0/3 of them
-#    anywhere in top-10 (structurally impossible: they have no chunk_id in
-#    the index at all), the ripgrep-gated pipeline surfaces 3/3 via
-#    injection.
+# WHY ON NOW: (1) the corpus is keyword/identifier-dense and literal search
+# demonstrably beats the rest of the stack on it in agentic A/B (see
+# eval_agentic/rca/RCA.md), (2) the ranked path below makes ripgrep affect
+# the top-k ordering at all (the whole point), and (3) the freshness
+# guarantee (a file the index has never seen still surfaces) is a real,
+# unique capability worth having on by default. `HARS_MEMORY_RIPGREP_CHANNEL_MODE`
+# defaults to "ranked" (see that constant) so enabling the channel gives the
+# ranked behaviour; set it to "injection" for the old freshness-only mode.
 #
-# Why OFF despite point (2): the freshness win needs a file that post-dates
-# the last consolidation AND is absent from the index — a state that has no
-# live trigger on the current index (the `kv_store_text_chunks.json` chunk-id
-# set matches `vdb_chunks.json`'s payload-id set every cycle). Point (1) is
-# structural — injection appends past `top_k` and can never move a top-k
-# metric — so with the freshness case unreachable on the live index the only
-# operative effect of enabling it is the added latency below. Re-enable
-# (HARS_MEMORY_RIPGREP_CHANNEL=1) while an index is known to lag its source
-# files, or when a `memory_status` divergence check flags one.
+# LATENCY GUARDRAILS (mandatory — this now runs on every query): one `rg`
+# subprocess per query over the corpus (no per-chunk spawns), a hard
+# `timeout_seconds` wall-clock bound (ripgrep_channel._DEFAULT_TIMEOUT_SECONDS,
+# re-measured 2026-10-17 — see that module), a fixed result cap (`top_k`
+# passed by the caller), and fail-soft when `rg` is missing (contributes
+# nothing, no crash). Queries with no identifier-shaped term never invoke
+# `rg` at all. Measured added latency on the 48-query GC-fixed set is in
+# docs/ripgrep-ranked-channel.md (p50/p95) — the `rg` call is a few
+# milliseconds on this ~1.5k-file corpus and is dwarfed by the dense channel.
 #
-# Added latency (ripgrep_channel.search() call itself, the only added
-# cost — dense/sparse/fuse() are unchanged): mean 13.1ms across all 46
-# queries (most have no identifier-shaped term and skip invoking `rg`
-# entirely — near-zero cost), mean ~18-26ms across the ~22 queries that DO
-# fire, one observed outlier at 70ms (a broad single-token co-occurrence
-# query). No case exceeded `ripgrep_channel.py`'s own 2s subprocess
-# timeout.
-#
-# Boost (see `apply_ripgrep_gate`'s docstring) is NOT part of this default:
-# it measured a small ndcg@10/mrr regression with no offsetting labeled-set
-# benefit, so it stays available but opt-in via
-# `apply_ripgrep_gate(..., enable_boost=True)`, not reachable through this
-# top-level channel flag.
-#
-# Escape hatch: HARS_MEMORY_RIPGREP_CHANNEL=1 turns the channel on. Keep it
-# off when `rg` is unavailable in a deployment (it fails soft either way,
-# but off avoids paying the check-availability cost on every query) or when
-# isolating whether a retrieval regression traces back to this channel.
-_RIPGREP_CHANNEL_DEFAULT = "0"
+# Escape hatch: set HARS_MEMORY_RIPGREP_CHANNEL=0 to disable the channel
+# entirely (returns the pre-ripgrep dense+sparse fusion bit-for-bit), or
+# HARS_MEMORY_RIPGREP_CHANNEL_MODE=injection for freshness-only. Both are
+# read fresh on every call.
+_RIPGREP_CHANNEL_DEFAULT = "1"
 
 
 def ripgrep_channel_enabled() -> bool:
@@ -817,6 +810,198 @@ def ripgrep_channel_enabled() -> bool:
     every call (not cached at import time), matching
     `supersession_scoring_enabled()`'s convention above."""
     return os.environ.get(HARS_MEMORY_RIPGREP_CHANNEL_ENV, _RIPGREP_CHANNEL_DEFAULT).strip().lower() in _TRUTHY
+
+
+# ---------------------------------------------------------------------------
+# Ripgrep as a RANKED channel (2026-10-17).
+#
+# STRUCTURAL PROBLEM this section fixes: the original wiring
+# (`apply_ripgrep_gate`, above) can only ever APPEND ripgrep hits PAST
+# `top_k` — it never changes a rank inside the top-k window, so it is
+# structurally incapable of moving recall@k/ndcg@k/mrr at any k. Two
+# concrete reasons, both verified against the live index (not assumed):
+#
+#   1. `apply_ripgrep_gate` computes `top = boosted[:top_k]` where `boosted`
+#      is the fused pool with ONLY `FusedChunk.ripgrep_score` annotated (via
+#      `replace`) when `enable_boost` is False — the shipped call site passes
+#      no `enable_boost`, so `fused_score` is untouched and the order inside
+#      top_k is IDENTICAL to the pre-ripgrep fusion. The only ripgrep effect
+#      is the appended `ripgrep:<basename>` tail (`top + injected`).
+#   2. The join key was broken for the overwhelming majority of this corpus:
+#      the pool's `file_path` is a FLATTENED path (`.plans`, `.reports`,
+#      `docs-specs` -> separators replaced by `-`, e.g.
+#      `.plans-2026-06-20_generic-mlops-orchestration-plan.md`), while
+#      ripgrep reports the real on-disk path (`.plans/2026-06-20_generic-
+#      mlops-orchestration-plan.md`). `Path(chunk.file_path).name` is the
+#      WHOLE flattened string, which never equals ripgrep's basename
+#      (`2026-06-20_generic-mlops-orchestration-plan.md`). So in practice
+#      `matched_basenames` stayed EMPTY, every ripgrep hit was classified
+#      "exclusive", and even the (injection-only) presence guarantee could
+#      only ever fire for genuinely off-index files. Measured on the 48
+#      GC-fixed gold queries: ripgrep produced >=1 hit for 20/48 queries,
+#      but under the old equality join 0/48 connected to an indexed chunk;
+#      under the suffix join below, with the deployment's curated roots, 7 of
+#      those 20 firing queries have the gold file in ripgrep's top-30 (4/20
+#      with `roots=<whole cortex tree>`).
+#
+# FIX (both halves are library-side, in this file):
+#
+#   - `_matching_ripgrep_basename` accepts a chunk `file_path` that EQUALS
+#     the hit basename OR ENDS WITH `-<basename>` / `/<basename>` (the
+#     flattening separator is `-`, and staging docs keep a `/`). This is a
+#     path-component-boundary match, so `plan.md` cannot accidentally match
+#     `xplan.md`.
+#   - `apply_ripgrep_ranked` scores the WHOLE fused pool: for every chunk
+#     whose file matched, `fused_score += weight * minmax(file raw rg score)`,
+#     then re-sorts with `fuse()`'s own deterministic sort key and re-slices
+#     to `top_k`. This is score-wise min-max fusion (the SAME
+#     `_min_max_normalize` convention dense/sparse already use — see the
+#     module docstring "WHY min-max"; no WRRF implementation exists in this
+#     tree, and the module docstring already documents why a *pure rank*
+#     fusion was rejected for the primary blend: it discards magnitude). It
+#     is additive on top of the unchanged dense/sparse convex term, so a
+#     chunk with no ripgrep hit keeps its pre-existing `fused_score`
+#     bit-for-bit — only literally-matching chunks move.
+#
+# The exclusive-file INJECTION tail is preserved in ranked mode too
+# (`enable_injection`, default True): ranking answers "did we order the
+# indexed candidates better", injection answers "can an index-invisible file
+# still surface at all". They are independent and both useful.
+#
+# MODE: `HARS_MEMORY_RIPGREP_CHANNEL_MODE` selects `"ranked"` (default — the
+# new first-class behaviour) or `"injection"` (the pre-2026-10-17
+# freshness-only behaviour, kept available). The channel is ON by default
+# (`_RIPGREP_CHANNEL_DEFAULT = "1"`, product decision 2026-10-17), so ranked
+# mode is what every query runs by default; `"injection"` and channel-OFF both
+# remain one env var away.
+#
+# WEIGHT: `HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT` bounds how far a literal match
+# can move a candidate. It is a bounded additive term, NOT a convex weight —
+# the dense/sparse split is untouched (see `fuse_ripgrep_as_third_weight`
+# below for the rejected convex variant and its measured regression).
+HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV = "HARS_MEMORY_RIPGREP_CHANNEL_MODE"
+HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV = "HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT"
+_MODE_RANKED = "ranked"
+_MODE_INJECTION = "injection"
+_VALID_RIPGREP_MODES: Final[frozenset[str]] = frozenset({_MODE_RANKED, _MODE_INJECTION})
+_DEFAULT_RIPGREP_CHANNEL_MODE = _MODE_RANKED
+# 0.25 is a deliberately conservative default, picked by the 2026-10-17
+# measurement on the 48-query GC-fixed set (see docs/ripgrep-ranked-channel.md
+# for the weight sweep): with the dense/sparse blend capped at 1.0, a 0.25
+# additive bonus is enough to promote a gold chunk that literal-matches while
+# staying far below the margin that separates a dominant dense/sparse win
+# from its nearest competitor. Override for a re-measurement; do not trust it
+# as a swept optimum.
+_DEFAULT_RIPGREP_CHANNEL_WEIGHT: Final[float] = 0.25
+
+
+def ripgrep_channel_mode() -> str:
+    """Public: current effective `HARS_MEMORY_RIPGREP_CHANNEL_MODE` mode
+    (`"ranked"` by default, `"injection"` to restore the pre-2026-10-17
+    freshness-only behaviour), read fresh on every call — same convention as
+    `ripgrep_channel_enabled()` above. Only consulted when the channel is
+    enabled."""
+    raw = os.environ.get(HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV, _DEFAULT_RIPGREP_CHANNEL_MODE).strip().lower()
+    if raw not in _VALID_RIPGREP_MODES:
+        raise ValueError(
+            f"{HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV} must be one of "
+            f"{sorted(_VALID_RIPGREP_MODES)}, got {raw!r}"
+        )
+    return raw
+
+
+def ripgrep_channel_weight() -> float:
+    """Public: current effective `HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT` — the
+    bounded additive weight applied to the min-max-normalized ripgrep score
+    in ranked mode, read fresh on every call."""
+    raw = os.environ.get(HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV)
+    if raw is None:
+        return _DEFAULT_RIPGREP_CHANNEL_WEIGHT
+    value = float(raw)
+    if value < 0.0:
+        raise ValueError(f"{HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV} must be >= 0.0, got {value}")
+    return value
+
+
+def _chunk_matches_ripgrep_basename(chunk_file_path: str, basename: str) -> bool:
+    """True if `chunk_file_path` (the pool's possibly-FLATTENED `file_path`)
+    refers to the same document as a ripgrep hit whose on-disk basename is
+    `basename`. See this section's header for the flattening convention.
+    Boundary-anchored so `plan.md` never matches `xplan.md`."""
+    if not chunk_file_path or not basename:
+        return False
+    return (
+        chunk_file_path == basename
+        or chunk_file_path.endswith("-" + basename)
+        or chunk_file_path.endswith("/" + basename)
+    )
+
+
+def _matching_ripgrep_basename(
+    chunk_file_path: str, ripgrep_hits_by_basename: dict[str, "ChannelHit"]
+) -> str | None:
+    """The ripgrep hit's key (its basename) that matches `chunk_file_path`,
+    or None. Deterministic when several basenames match (highest raw score
+    wins, then lexicographic key) so the caller's bookkeeping is stable."""
+    best_key: str | None = None
+    best_score = float("-inf")
+    for basename, hit in ripgrep_hits_by_basename.items():
+        if not _chunk_matches_ripgrep_basename(chunk_file_path, basename):
+            continue
+        if hit.score > best_score or (hit.score == best_score and (best_key is None or basename < best_key)):
+            best_key = basename
+            best_score = hit.score
+    return best_key
+
+
+def ripgrep_scores_by_chunk_id(
+    fused: list["FusedChunk"], ripgrep_hits_by_basename: dict[str, "ChannelHit"]
+) -> dict[str, float]:
+    """`{chunk_id: best raw ripgrep score}` for every pool chunk whose file
+    matched a ripgrep hit (via `_matching_ripgrep_basename`). This is the
+    chunk-level ranked signal `apply_ripgrep_ranked` normalizes and blends,
+    exposed publicly so callers that only need to REPORT the match (e.g. the
+    live trace's `ripgrep_hits` frame) don't have to re-derive the join."""
+    scores: dict[str, float] = {}
+    for chunk in fused:
+        basename = _matching_ripgrep_basename(chunk.file_path, ripgrep_hits_by_basename)
+        if basename is None:
+            continue
+        score = ripgrep_hits_by_basename[basename].score
+        if score > scores.get(chunk.chunk_id, float("-inf")):
+            scores[chunk.chunk_id] = score
+    return scores
+
+
+def _ripgrep_ranked_bonus(chunk_id: str, norms: dict[str, float], weight: float) -> float:
+    """`weight * minmax(rg_score)` for one chunk, or 0.0 when it had no
+    literal hit — the bounded additive term ranked mode adds to
+    `fused_score`."""
+    return weight * norms.get(chunk_id, 0.0)
+
+
+def _resort_after_rescoring(fused: list["FusedChunk"]) -> list["FusedChunk"]:
+    """Re-sort a fused pool that already carries `fused_score`/`dense_score`/
+    `sparse_score`, using EXACTLY `fuse()`'s `(quantized_score, zscore
+    tiebreak, chunk_id)` (or `(quantized_score, chunk_id)`) ordering — so
+    adding the ripgrep term cannot perturb tie-break behaviour relative to
+    the pre-existing fusion."""
+    epsilon = _fusion_tie_epsilon()
+    signal_mode = _single_channel_signal_mode()
+    if signal_mode == _SIGNAL_ZSCORE_TIEBREAK:
+        dense_stats = _scores_mean_std([c.dense_score for c in fused if c.dense_score is not None])
+        sparse_stats = _scores_mean_std([c.sparse_score for c in fused if c.sparse_score is not None])
+        fused.sort(
+            key=lambda c: (
+                round(c.fused_score / epsilon) if epsilon > 0.0 else c.fused_score,
+                _single_channel_tiebreak_component(c, dense_stats, sparse_stats),
+                c.chunk_id,
+            ),
+            reverse=True,
+        )
+    else:
+        fused.sort(key=lambda c: _deterministic_sort_key(c, epsilon), reverse=True)
+    return fused
 
 
 # Bounded additive-boost constants — NOT per-query min-max normalized (see
@@ -864,6 +1049,99 @@ def _ripgrep_boost(raw_score: float) -> float:
     return min(raw_score / RIPGREP_BOOST_SCORE_SCALE, 1.0) * RIPGREP_BOOST_CAP
 
 
+def apply_ripgrep_ranked(
+    fused: list[FusedChunk],
+    ripgrep_hits_by_basename: dict[str, ChannelHit],
+    *,
+    top_k: int,
+    weight: float | None = None,
+    max_injected: int = RIPGREP_MAX_INJECTED,
+    enable_injection: bool = True,
+) -> list[FusedChunk]:
+    """RANKED ripgrep channel: score the whole fused pool with ripgrep's
+    literal-match strength and re-slice to `top_k`, so ripgrep can move a
+    candidate WITHIN the top-k window (unlike `apply_ripgrep_gate`, which can
+    only append past it — see this section's header note).
+
+    Per-chunk raw score = the best `RipgrepSearchHit.score` among the
+    ripgrep hits whose file matches that chunk's (possibly flattened)
+    `file_path` (see `_matching_ripgrep_basename`). That score is already the
+    signal this channel computes (matched-term count via the co-occurrence
+    multiplier, per-term match count capped at
+    `MAX_COUNTED_MATCHES_PER_TERM`, whole-token vs substring weighting, path
+    type and a floored recency multiplier — see ripgrep_channel.py's "Scoring"
+    docstring). The raw scores are min-max normalized over this query's
+    matched chunks with `_min_max_normalize` — the SAME convention `fuse()`
+    uses for dense/sparse, including the degenerate single/tied-pool -> 0.5
+    rule — then added to `fused_score` as `weight * norm`.
+
+    The dense/sparse convex term is untouched: a chunk with no ripgrep hit
+    keeps its pre-existing `fused_score` exactly, so this is a bounded
+    ADDITIVE ranking term, not a third convex weight (the convex variant is
+    measured-negative — see `fuse_ripgrep_as_third_weight`).
+
+    `enable_injection` (default True) preserves the presence/freshness
+    guarantee independently: ripgrep-exclusive files the pool never contained
+    are appended past `top_k` up to `max_injected`, exactly as the injection
+    path does. Set it False to measure pure reordering.
+
+    No-op passthrough (`fused[:top_k]`, unmodified) when there are no hits or
+    none match a pool chunk.
+    """
+    if not ripgrep_hits_by_basename:
+        return fused[:top_k]
+
+    effective_weight = ripgrep_channel_weight() if weight is None else weight
+    if effective_weight < 0.0:
+        raise ValueError(f"ripgrep ranked weight must be >= 0.0, got {effective_weight}")
+
+    matched_scores = ripgrep_scores_by_chunk_id(fused, ripgrep_hits_by_basename)
+    matched_basenames: set[str] = set()
+    for chunk in fused:
+        basename = _matching_ripgrep_basename(chunk.file_path, ripgrep_hits_by_basename)
+        if basename is not None:
+            matched_basenames.add(basename)
+
+    if matched_scores:
+        norms = _min_max_normalize(matched_scores)
+        rescored = [
+            replace(
+                chunk,
+                fused_score=chunk.fused_score + _ripgrep_ranked_bonus(chunk.chunk_id, norms, effective_weight),
+                ripgrep_score=matched_scores.get(chunk.chunk_id, chunk.ripgrep_score),
+            )
+            for chunk in fused
+        ]
+        fused = _resort_after_rescoring(rescored)
+
+    top = fused[:top_k]
+    if not enable_injection:
+        return top
+
+    exclusive = [
+        (basename, hit)
+        for basename, hit in ripgrep_hits_by_basename.items()
+        if basename not in matched_basenames
+    ]
+    # Deterministic: highest raw score first, basename as a stable tie-break.
+    exclusive.sort(key=lambda item: (-item[1].score, item[0]))
+    injected = [
+        FusedChunk(
+            chunk_id=f"ripgrep:{basename}",
+            fused_score=_ripgrep_boost(hit.score),
+            dense_score=None,
+            sparse_score=None,
+            dense_norm=0.0,
+            sparse_norm=0.0,
+            content=hit.content,
+            file_path=hit.file_path,
+            ripgrep_score=hit.score,
+        )
+        for basename, hit in exclusive[:max_injected]
+    ]
+    return top + injected
+
+
 def apply_ripgrep_gate(
     fused: list[FusedChunk],
     ripgrep_hits_by_basename: dict[str, ChannelHit],
@@ -872,12 +1150,28 @@ def apply_ripgrep_gate(
     max_injected: int = RIPGREP_MAX_INJECTED,
     enable_boost: bool = False,
     enable_injection: bool = True,
+    mode: str = _MODE_INJECTION,
+    weight: float | None = None,
 ) -> list[FusedChunk]:
     """Additively boost + presence-gate `fused` (the FULL pre-truncation
     dense+sparse fusion pool — callers must NOT have already sliced this to
     `[:top_k]`, or an off-index file could never be appended) with ripgrep
     hits, keyed by FILE BASENAME (see design note above for why basename,
     not chunk_id).
+
+    `mode` selects the channel's behaviour:
+      - `"injection"` (the DEFAULT here, preserving this function's
+        pre-2026-10-17 contract for every existing direct caller/test): only
+        ANNOTATE `ripgrep_score` and append the exclusive tail; `fused_score`
+        and the top-k ORDER are untouched unless `enable_boost=True`.
+      - `"ranked"`: delegate to `apply_ripgrep_ranked` — the literal-match
+        score re-ranks the pool INSIDE the top-k window. The live call site
+        passes `mode=ripgrep_channel_mode()`, whose default is `"ranked"`, so
+        an operator who turns the channel on gets the ranked behaviour
+        without a second knob; a direct caller that omits `mode` keeps the
+        legacy injection behaviour. `weight` is forwarded to ranked mode.
+    Neither mode changes the channel ON/OFF default (`_RIPGREP_CHANNEL_DEFAULT
+    = "0"`).
 
     Returns up to `top_k + max_injected` chunks: the top `top_k` of the
     (possibly boosted) fused pool, followed by up to `max_injected`
@@ -918,17 +1212,29 @@ def apply_ripgrep_gate(
     `ripgrep_hits_by_basename` is empty — the common case (channel disabled,
     unavailable, or the question had no identifier-shaped term).
     """
+    if mode == _MODE_RANKED:
+        return apply_ripgrep_ranked(
+            fused,
+            ripgrep_hits_by_basename,
+            top_k=top_k,
+            weight=weight,
+            max_injected=max_injected,
+            enable_injection=enable_injection,
+        )
+    if mode not in _VALID_RIPGREP_MODES:
+        raise ValueError(f"mode must be one of {sorted(_VALID_RIPGREP_MODES)}, got {mode!r}")
     if not ripgrep_hits_by_basename:
         return fused[:top_k]
 
     boosted: list[FusedChunk] = []
     matched_basenames: set[str] = set()
     for chunk in fused:
-        hit = ripgrep_hits_by_basename.get(Path(chunk.file_path).name)
-        if hit is None:
+        basename = _matching_ripgrep_basename(chunk.file_path, ripgrep_hits_by_basename)
+        if basename is None:
             boosted.append(chunk)
             continue
-        matched_basenames.add(Path(chunk.file_path).name)
+        matched_basenames.add(basename)
+        hit = ripgrep_hits_by_basename[basename]
         if not enable_boost:
             boosted.append(replace(chunk, ripgrep_score=hit.score))
             continue
@@ -1344,11 +1650,17 @@ __all__ = [
     "FusedChunk",
     "fuse",
     "HARS_MEMORY_RIPGREP_CHANNEL_ENV",
+    "HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV",
+    "HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV",
     "ripgrep_channel_enabled",
+    "ripgrep_channel_mode",
+    "ripgrep_channel_weight",
     "RIPGREP_BOOST_CAP",
     "RIPGREP_BOOST_SCORE_SCALE",
     "RIPGREP_MAX_INJECTED",
     "apply_ripgrep_gate",
+    "apply_ripgrep_ranked",
+    "ripgrep_scores_by_chunk_id",
     "fuse_ripgrep_as_third_weight",
     "HARS_MEMORY_FLAT_CHANNEL_ENV",
     "flat_channel_enabled",

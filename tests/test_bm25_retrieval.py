@@ -530,13 +530,13 @@ class TestRipgrepFusion:
         )
 
         monkeypatch.delenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, raising=False)
-        assert ripgrep_channel_enabled() is False  # audit 2026-10-17: default OFF, matches live env
-
-        monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "0")
-        assert ripgrep_channel_enabled() is False
+        assert ripgrep_channel_enabled() is True  # 2026-10-17 product decision: default ON
 
         monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "1")
         assert ripgrep_channel_enabled() is True
+
+        monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_ENV, "0")
+        assert ripgrep_channel_enabled() is False
 
 
 class TestRipgrepThirdWeightRejectedVariant:

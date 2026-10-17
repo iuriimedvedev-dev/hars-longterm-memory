@@ -450,6 +450,25 @@ def _warn_if_legacy_ignore_file(root: Path) -> None:
         )
 
 
+def hits_by_basename(hits: list[RipgrepSearchHit]) -> dict[str, RipgrepSearchHit]:
+    """Collapse file-level hits into `{on-disk basename: best hit}`, keeping
+    the highest-scoring hit when several files share a basename (e.g. the
+    same note present in the main tree and in a worktree under the search
+    root). This is the dict shape `fusion.apply_ripgrep_gate` /
+    `fusion.apply_ripgrep_ranked` consume, and the join key the fusion pool's
+    (possibly flattened) `file_path` is matched against — see fusion.py's
+    "Ripgrep as a RANKED channel" note for why a suffix match, not
+    `Path(...).name` equality, is required on this corpus.
+    """
+    by_name: dict[str, RipgrepSearchHit] = {}
+    for hit in hits:
+        name = Path(hit.file_path).name
+        previous = by_name.get(name)
+        if previous is None or hit.score > previous.score:
+            by_name[name] = hit
+    return by_name
+
+
 def default_roots(
     *,
     roots_env: str = HARS_MEMORY_RIPGREP_ROOTS_ENV,
@@ -855,6 +874,7 @@ __all__ = [
     "RipgrepSearchResult",
     "check_availability",
     "extract_terms",
+    "hits_by_basename",
     "default_roots",
     "search",
     "asearch",

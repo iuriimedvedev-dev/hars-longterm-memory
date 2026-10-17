@@ -8,7 +8,7 @@ what was verified dead, and what is a deletion candidate for a human to run.
 
 | Channel / asset | Verdict | Action taken |
 | --- | --- | --- |
-| `ripgrep` (`retrieval/ripgrep_channel.py`) | **FIXED** | Code default flipped ON → **OFF** to match the live env; env still honoured; comment + test updated. |
+| `ripgrep` (`retrieval/ripgrep_channel.py`) | **RANKED, default ON** | Rewired from injection-only to a first-class ranked fusion channel; the broken flattened-path join fixed; default OFF → **ON** and live env → `=1` (product decision, same day). See [`docs/ripgrep-ranked-channel.md`](ripgrep-ranked-channel.md). |
 | `flat_dense` (`retrieval/flat_index.py`) | **KEEP, default OFF** | Redundant with the dense channel (proven); deletion deferred (live callers outside this file). |
 | Parallel Qdrant (`:6335`) | **DELETION CANDIDATE** | Serving read path disproven; exact removal commands below — **not executed**. |
 | `lang_route` (`retrieval/lang_route.py`) | **DORMANT (off)** | Behind `HARS_MEMORY_ROUTING=lang`; default `off`. No change. |
@@ -17,26 +17,47 @@ what was verified dead, and what is a deletion candidate for a human to run.
 
 ---
 
-## 1. `ripgrep` — default OFF (changed)
+## 1. `ripgrep` — RANKED, default ON (product decision 2026-10-17)
 
-**Problem:** the code default was ON (`_RIPGREP_CHANNEL_DEFAULT = "1"`,
-`hars_memory/retrieval/fusion.py`) while the live deployment sets
-`HARS_MEMORY_RIPGREP_CHANNEL=0` (`cortex/.mcp.json`). Two sources of truth.
+**From the same-day audit:** the code default was ON while the live env set
+`=0`. That "fix" (flip the code default to OFF so the two agreed) is
+superseded the same day by a product decision — **"rg должен быть каналом
+100%"** — because the audit's own premise was wrong in an important way: the
+channel could not affect any top-k metric *by construction*, so "no
+regression" was evidence the channel was inert, not that it was harmless.
 
-**Fix:** `_RIPGREP_CHANNEL_DEFAULT = "0"`. The env override is still honoured
-in both directions (`ripgrep_channel_enabled()` reads it fresh per call). The
-comment block now states the default is OFF and why, and keeps the measured
-evidence (injection-only no-regression on the 46-query set; the freshness win
-that motivated ON needs a file absent from the index, which has no live trigger
-today).
+**Two structural defects fixed** (see
+[`docs/ripgrep-ranked-channel.md`](ripgrep-ranked-channel.md) for the full
+write-up, line references and measurements):
 
-**Tests:**
-- `tests/test_channel_defaults.py::test_ripgrep_channel_defaults_off` (new) pins the
-  default + env behaviour.
-- `tests/test_bm25_retrieval.py::TestRipgrepFusion::test_channel_enabled_env_default_and_override`
-  updated (its old assertion pinned the ON default).
+1. **Injection-only.** `apply_ripgrep_gate` only ANNOTATED `ripgrep_score`
+   and appended a `ripgrep:<basename>` tail past `top_k`; with `enable_boost`
+   defaulting False it could never reorder inside `top_k`.
+2. **Broken join.** The pool stores FLATTENED paths
+   (`.plans-2026-06-20_x.md`) while `rg` reports `.plans/2026-06-20_x.md`; the
+   old `Path(file_path).name` equality matched **0/48** gold docs. A
+   component-boundary suffix match (`_matching_ripgrep_basename`) fixes it.
 
-**A/B:** the change is quality-neutral — see §5.
+**Now:** `_RIPGREP_CHANNEL_DEFAULT = "1"` and the live env
+(`cortex/.mcp.json`) sets `HARS_MEMORY_RIPGREP_CHANNEL=1` +
+`HARS_MEMORY_RIPGREP_CHANNEL_MODE=ranked`. `apply_ripgrep_ranked` blends a
+min-max-normalized literal-match score into `fused_score` (same convention as
+dense/sparse) and re-sorts; the injection tail is preserved as a separate
+capability, and `HARS_MEMORY_RIPGREP_CHANNEL_MODE=injection` restores the old
+behaviour.
+
+**Latency guardrails:** one `rg` per query, hard 2 s subprocess timeout, fixed
+result cap, fail-soft on a missing binary, no per-chunk spawns.
+
+**Tests:** `tests/test_ripgrep_ranked_channel.py` (ranked path, join, cap,
+fail-soft, timeout, defaults), plus updated
+`tests/test_channel_defaults.py::test_ripgrep_channel_defaults_on` and
+`tests/test_bm25_retrieval.py::TestRipgrepFusion::test_channel_enabled_env_default_and_override`.
+
+**A/B:** measured on the 48-query GC-fixed set — see
+[`docs/ripgrep-ranked-channel.md`](ripgrep-ranked-channel.md). Injection-only
+is byte-identical to the no-ripgrep baseline (structural); ranked is
+neutral-or-better on every quality metric.
 
 ## 2. `flat_dense` — KEEP, default already OFF
 

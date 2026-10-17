@@ -122,7 +122,7 @@ class TestResolveAlpha:
 
 
 class TestResolveFusionKnobs:
-    def test_covers_exactly_the_seven_fusion_env_vars(self) -> None:
+    def test_covers_exactly_the_fusion_env_vars(self) -> None:
         resolved = ab_bench._resolve_fusion_knobs()
         assert set(resolved) == {
             fusion.HARS_MEMORY_FUSION_TIE_EPSILON_ENV,
@@ -132,6 +132,8 @@ class TestResolveFusionKnobs:
             fusion.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV,
             fusion.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV,
             fusion.HARS_MEMORY_RIPGREP_CHANNEL_ENV,
+            fusion.HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV,
+            fusion.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV,
         }
 
     def test_source_is_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -292,6 +294,8 @@ class TestFusionScoringEnvVarsScope:
             "HARS_MEMORY_SUPERSESSION_MARKER_PENALTY",
             "HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT",
             "HARS_MEMORY_RIPGREP_CHANNEL",
+            "HARS_MEMORY_RIPGREP_CHANNEL_MODE",
+            "HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT",
         }
 
     def test_sourced_from_fusion_modules_own_exported_env_constants(self) -> None:
@@ -305,6 +309,8 @@ class TestFusionScoringEnvVarsScope:
         assert fusion.HARS_MEMORY_SUPERSESSION_MARKER_PENALTY_ENV in ab_bench.FUSION_SCORING_ENV_VARS
         assert fusion.HARS_MEMORY_SUPERSESSION_RECENCY_DISCOUNT_ENV in ab_bench.FUSION_SCORING_ENV_VARS
         assert fusion.HARS_MEMORY_RIPGREP_CHANNEL_ENV in ab_bench.FUSION_SCORING_ENV_VARS
+        assert fusion.HARS_MEMORY_RIPGREP_CHANNEL_MODE_ENV in ab_bench.FUSION_SCORING_ENV_VARS
+        assert fusion.HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV in ab_bench.FUSION_SCORING_ENV_VARS
 
 
 # ---------------------------------------------------------------------------
