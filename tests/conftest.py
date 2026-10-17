@@ -24,3 +24,8 @@ def _default_required_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """
     monkeypatch.setenv("HARS_MEMORY_INDEX_DIR", str(tmp_path / "index"))
     monkeypatch.setenv("HARS_MEMORY_STAGING_DIR", str(tmp_path / "staging"))
+    # Keep the live-trace SSE listener (mcp_server._serve) OFF for the whole
+    # suite. It is read-only and harmless, but tests should never bind a port
+    # implicitly; TestTraceEndpoint starts its own listener on an ephemeral
+    # port, and the live integration test targets the running service by URL.
+    monkeypatch.setenv("HARS_MEMORY_TRACE_HTTP_PORT", "0")
