@@ -748,7 +748,14 @@ def fuse(
 # filters" — but `.name` is invariant to that).
 HARS_MEMORY_RIPGREP_CHANNEL_ENV = "HARS_MEMORY_RIPGREP_CHANNEL"
 
-# Default ON, in INJECTION-ONLY mode (`apply_ripgrep_gate`'s own
+# Default OFF. The channel is fully implemented and unit-tested, but it
+# ships disabled so that the code default and the live deployment agree:
+# cortex/.mcp.json sets HARS_MEMORY_RIPGREP_CHANNEL=0, and this constant is
+# the fallback for any deployment that does not set it. Set
+# HARS_MEMORY_RIPGREP_CHANNEL=1 to opt in (see the "Escape hatch" note at the
+# bottom of this block).
+#
+# When enabled it runs in INJECTION-ONLY mode (`apply_ripgrep_gate`'s own
 # `enable_boost` defaults False — see that function's docstring). Measured
 # 2026-07-30, two independent pieces of evidence:
 #
@@ -773,6 +780,16 @@ HARS_MEMORY_RIPGREP_CHANNEL_ENV = "HARS_MEMORY_RIPGREP_CHANNEL"
 #    the index at all), the ripgrep-gated pipeline surfaces 3/3 via
 #    injection.
 #
+# Why OFF despite point (2): the freshness win needs a file that post-dates
+# the last consolidation AND is absent from the index — a state that has no
+# live trigger on the current index (the `kv_store_text_chunks.json` chunk-id
+# set matches `vdb_chunks.json`'s payload-id set every cycle). Point (1) is
+# structural — injection appends past `top_k` and can never move a top-k
+# metric — so with the freshness case unreachable on the live index the only
+# operative effect of enabling it is the added latency below. Re-enable
+# (HARS_MEMORY_RIPGREP_CHANNEL=1) while an index is known to lag its source
+# files, or when a `memory_status` divergence check flags one.
+#
 # Added latency (ripgrep_channel.search() call itself, the only added
 # cost — dense/sparse/fuse() are unchanged): mean 13.1ms across all 46
 # queries (most have no identifier-shaped term and skip invoking `rg`
@@ -787,12 +804,11 @@ HARS_MEMORY_RIPGREP_CHANNEL_ENV = "HARS_MEMORY_RIPGREP_CHANNEL"
 # `apply_ripgrep_gate(..., enable_boost=True)`, not reachable through this
 # top-level channel flag.
 #
-# Escape hatch: HARS_MEMORY_RIPGREP_CHANNEL=0 disables the channel entirely
-# (identical to pre-this-change behaviour) — e.g. if `rg` is unavailable in
-# a deployment (fails soft either way, but this avoids paying the
-# check-availability cost on every query) or an operator wants to isolate
-# whether a retrieval regression traces back to this channel.
-_RIPGREP_CHANNEL_DEFAULT = "1"
+# Escape hatch: HARS_MEMORY_RIPGREP_CHANNEL=1 turns the channel on. Keep it
+# off when `rg` is unavailable in a deployment (it fails soft either way,
+# but off avoids paying the check-availability cost on every query) or when
+# isolating whether a retrieval regression traces back to this channel.
+_RIPGREP_CHANNEL_DEFAULT = "0"
 
 
 def ripgrep_channel_enabled() -> bool:
@@ -1036,6 +1052,24 @@ def fuse_ripgrep_as_third_weight(
 # ---------------------------------------------------------------------------
 # Flat dense channel wiring (retrieval/flat_index.py) — additive coverage
 # gate, NOT a third convex weight and NOT a boost. See the design note below.
+#
+# DECISION 2026-10-17 (audit): KEEP, default OFF. The review classed this
+# channel as redundant-`dense` and proposed deleting `flat_index.py`. The
+# redundancy claim is correct and measured — it embeds the SAME
+# `kv_store_text_chunks.json` payload with the SAME `rag.embedding_func` in
+# the SAME asymmetric doc/query convention as LightRAG's `rag.chunks_vdb`,
+# so standalone it reproduces `dense_only` (recall@10 0.6852 vs 0.685,
+# ndcg@10 0.6096 vs 0.610) and rescues 0/6 simulated gaps. Deletion is
+# nonetheless deferred: `flat_index.py` still has live callers outside this
+# file (`hars_memory/mcp_server.py`'s `_get_flat_dense_index` gate and
+# `hars_memory/corpus/query.py`, the standalone corpus-query path) and its
+# own test module (`tests/test_flat_index.py`, `tests/test_bm25_retrieval.py`),
+# so removing the module is an mcp_server/corpus change, not a self-contained
+# one. The default is already OFF (`_FLAT_CHANNEL_DEFAULT = "0"` below) and
+# the live env (`HARS_MEMORY_FLAT_CHANNEL=0`) agrees. DELETION CANDIDATE for
+# a later cleanup once the mcp_server flat gate and corpus/query.py migration
+# land: remove `flat_index.py`, `apply_flat_dense_gate`, `flat_channel_enabled`,
+# the `HARS_MEMORY_FLAT_*` config, and `flat_dense_cache_compact_20260903/`.
 #
 # WHY GATE-ONLY (no boost variant, unlike apply_ripgrep_gate above):
 #
