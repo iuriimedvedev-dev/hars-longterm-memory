@@ -297,6 +297,39 @@ def _json_response(status: str, payload: Any) -> bytes:
     ).encode("utf-8") + body
 
 
+def _export_response(path: str, params: dict[str, str]) -> bytes:
+    """Handle one /stats | /graph | /coords request (read-only index export).
+
+    These run the graphml parse / kv-store counts / UMAP-cache read inline; the
+    heavy paths are mtime-keyed cached (in memory for the graph and stats, in
+    ``coords_cache.json`` for the projection). Any failure is a compact JSON
+    error with a machine-readable name + hint — never a stack trace, and the
+    listener stays up (``_handle_connection`` guards the socket anyway).
+    """
+    # Imported lazily: keeps trace.py importable without an index and keeps the
+    # export surface one-directional (export -> never touches recall).
+    from hars_memory import graph_export
+
+    try:
+        if path == "/stats":
+            return _json_response("200 OK", graph_export.stats_payload())
+        if path == "/graph":
+            return _json_response("200 OK", graph_export.graph_payload(params))
+        return _json_response("200 OK", graph_export.coords_payload(params))
+    except graph_export.ExportError as exc:
+        body: dict[str, Any] = {"ok": False, "error": str(exc)}
+        if exc.hint:
+            body["hint"] = exc.hint
+        status = {400: "400 Bad Request", 404: "404 Not Found"}.get(exc.status, "503 Service Unavailable")
+        return _json_response(status, body)
+    except Exception as exc:  # pragma: no cover - defensive, keep listener alive
+        logger.exception("export %s failed", path)
+        return _json_response(
+            "500 Internal Server Error",
+            {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:200]},
+        )
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -396,9 +429,28 @@ async def _handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWr
         writer.write(_json_response("200 OK", {"ok": True, "service": NAME, "trace": True}))
         await writer.drain()
         return
+
+    # ---- read-only cosmos export (Memory Travel): /stats /graph /coords ----
+    if path in ("/stats", "/graph", "/coords"):
+        if method != "GET":
+            writer.write(_json_response("405 Method Not Allowed", {"ok": False, "error": "GET only"}))
+        else:
+            writer.write(_export_response(path, params))
+        await writer.drain()
+        return
+
     if path != "/trace":
         writer.write(
-            _json_response("404 Not Found", {"ok": False, "error": "use GET /trace?question=..."})
+            _json_response(
+                "404 Not Found",
+                {
+                    "ok": False,
+                    "error": (
+                        "use GET /trace?question=... — also served: "
+                        "/healthz, /stats, /graph, /coords (read-only index export)"
+                    ),
+                },
+            )
         )
         await writer.drain()
         return
