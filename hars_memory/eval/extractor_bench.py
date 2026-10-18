@@ -75,10 +75,10 @@ MODEL_ALIASES: dict[str, str] = {
         "snapshots/3249fa54d5efa384afc552cc6700ad091efd5c39/"
         "gemma-4-12b-it-Q4_K_M.gguf"
     ),
-    "qwen3.5-9b": "/home/angkira/models/qwen3.5-9b-gguf/Qwen3.5-9B-Q4_K_M.gguf",
-    "qwen3.8-27b": "/home/angkira/models/qwen3.8-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf",
+    "qwen3.5-9b": "/home/demo/models/qwen3.5-9b-gguf/Qwen3.5-9B-Q4_K_M.gguf",
+    "qwen3.8-27b": "/home/demo/models/qwen3.8-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf",
     "muse-glimmer-30b": (
-        "/home/angkira/models/muse-glimmer-30b-gguf/"
+        "/home/demo/models/muse-glimmer-30b-gguf/"
         "muse-glimmer-30B-kquant-dynamic.gguf"
     ),
 }

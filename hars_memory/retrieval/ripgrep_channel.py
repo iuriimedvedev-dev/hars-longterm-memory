@@ -3,7 +3,7 @@
 WHY this channel exists (two motivations — the second is the bigger one):
 
 1. Exact literal matching. The corpus is queried with identifiers
-   (`A2S32`, `phase_c1_lora_safe`, `vea_native`, `hyp:7f62cfb4`, config keys,
+   (`Q7X42`, `phase_x1_adapter_safe`, `vma_native`, `hyp:1a2b3c4d`, config keys,
    metric names). Dense embeddings cannot represent these; BM25
    (`retrieval/bm25_index.py`) already helps measurably, but it still
    searches a *built* index.
@@ -261,7 +261,7 @@ _DEFAULT_TOP_K: Final[int] = 10
 # per-query rg cost scale with an input this channel does not control.
 # MAX_QUERY_TERMS bounds that worst case while staying well above realistic
 # usage: the memory_recall tool's own documented example supplies 3
-# ll_keywords (['A2S32', 'Phase C', 'DINOv3']), and `extract_identifier_terms`
+# ll_keywords (['Q7X42', 'Phase C', 'VisionX3']), and `extract_identifier_terms`
 # rarely yields more than 2-3 distinct identifiers out of one natural-
 # language question. 8 comfortably covers "a question's own identifiers plus
 # a full documented-example-sized keyword list" with margin, while still

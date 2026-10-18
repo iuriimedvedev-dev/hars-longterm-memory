@@ -1,7 +1,7 @@
 """Identifier-preserving tokenizer for BM25 sparse retrieval.
 
-This corpus is queried with exact identifiers: `A2S32`, `phase_c1_lora_safe`,
-`vea_native`, `hyp:7f62cfb4`. A tokenizer that stems, strips underscores/digits,
+This corpus is queried with exact identifiers: `Q7X42`, `phase_x1_adapter_safe`,
+`vma_native`, `hyp:1a2b3c4d`. A tokenizer that stems, strips underscores/digits,
 or splits inside alphanumeric codes destroys exactly the signal BM25 exists to
 provide here (CORE-Bench / arXiv:2606.11864 names this failure mode explicitly
 for dense retrieval; the whole point of adding a sparse channel is to not repeat
@@ -14,11 +14,11 @@ Design (see `tokenize_identifiers` for the full algorithm):
    this means punctuation like commas, parentheses, and quotes act as natural
    token boundaries for free, without needing a stopword/punctuation list.
 2. Emit the **whole run** as one token, casefolded. This is what makes
-   `A2S32` / `phase_c1_lora_safe` / `hyp:7f62cfb4` survive intact and match
+   `Q7X42` / `phase_x1_adapter_safe` / `hyp:1a2b3c4d` survive intact and match
    exactly at query time (query text goes through the identical function).
 3. ALSO emit sub-tokens: split on `_ - : . /` delimiters, then split again on
    lowercase→uppercase (camelCase) boundaries. This lets a partial query like
-   "lora safe" or "A2" still surface the chunk containing the full identifier,
+   "adapter safe" or "q7" still surface the chunk containing the full identifier,
    without which BM25's exact-term matching would be too brittle for queries
    that don't reproduce an identifier verbatim.
 4. Casefold (not aggressive stemming/normalization) is applied identically to
@@ -29,8 +29,8 @@ Design (see `tokenize_identifiers` for the full algorithm):
 
 Known, deliberate limitation: the camelCase sub-token split in step 3 uses
 case information (a lowercase/digit -> uppercase transition), so it can only
-fire on tokens that still carry that transition. "A2S32" splits into "a2" /
-"s32"; an already-all-lowercase "a2s32" cannot — the transition it would be
+fire on tokens that still carry that transition. "Q7X42" splits into "q7" /
+"x42"; an already-all-lowercase "q7x42" cannot — the transition it would be
 based on does not exist in an all-lowercase string. This affects sub-token
 *recall* only; the whole-token exact match (point 2, the primary guarantee
 this module exists for) is unaffected and fully case-symmetric either way.
@@ -52,24 +52,24 @@ import re
 _IDENTIFIER_RUN_RE = re.compile(r"[A-Za-z0-9_\-:./]+")
 
 # Delimiter characters that separate sub-tokens *inside* an identifier run,
-# e.g. "phase_c1_lora_safe" -> "phase", "c1", "lora", "safe";
-#      "hyp:7f62cfb4"       -> "hyp", "7f62cfb4".
+# e.g. "phase_x1_adapter_safe" -> "phase", "x1", "adapter", "safe";
+#      "hyp:1a2b3c4d"       -> "hyp", "1a2b3c4d".
 _DELIMITER_RE = re.compile(r"[_\-:./]+")
 
 # camelCase boundary: a lowercase letter or digit immediately followed by an
-# uppercase letter, e.g. "VeaNative" -> "Vea", "Native"; "A2S32" -> "A2", "S32"
-# (the digit '2' before 'S' counts as the lowercase-or-digit side).
+# uppercase letter, e.g. "VmaNative" -> "Vma", "Native"; "Q7X42" -> "Q7", "X42"
+# (the digit '7' before 'X' counts as the lowercase-or-digit side).
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 # Characters that only carry meaning *between* other identifier characters,
 # not at the edges of a run (e.g. a sentence-final period after a word, or a
 # leading "--" on a CLI flag). Stripped only from the edges, never internally,
-# so "e.g." -> "e.g" but "phase_c1_lora_safe" is untouched.
+# so "e.g." -> "e.g" but "phase_x1_adapter_safe" is untouched.
 _EDGE_STRIP_CHARS = "_-:./"
 
 # An identifier-shaped token: contains a colon-prefixed hex-ish suffix
-# (`hyp:7f62cfb4`), an underscore (`phase_c1_lora_safe`), a camelCase boundary,
-# or a mix of letters AND digits at least 3 chars long (`A2S32`). Used to
+# (`hyp:1a2b3c4d`), an underscore (`phase_x1_adapter_safe`), a camelCase boundary,
+# or a mix of letters AND digits at least 3 chars long (`Q7X42`). Used to
 # decide when a query token should trigger the dedicated exact-identifier
 # lookup path rather than relying on fusion weighting alone.
 _PREFIXED_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*:[0-9A-Za-z]{4,}$")
@@ -117,8 +117,8 @@ def tokenize_identifiers(text: str) -> list[str]:
 def looks_like_identifier(token: str) -> bool:
     """True if `token` has the shape of a code identifier rather than a plain word.
 
-    Matches: `hyp:7f62cfb4`-style prefixed IDs, `snake_case` names, camelCase
-    names, and alphanumeric codes mixing letters and digits (`A2S32`). Used to
+    Matches: `hyp:1a2b3c4d`-style prefixed IDs, `snake_case` names, camelCase
+    names, and alphanumeric codes mixing letters and digits (`Q7X42`). Used to
     decide when a query should trigger the dedicated exact-identifier lookup
     (see `retrieval.fusion`), not to gate normal tokenization.
     """

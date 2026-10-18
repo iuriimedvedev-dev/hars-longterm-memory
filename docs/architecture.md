@@ -87,7 +87,7 @@ The `memory_recall` tool orchestrates up to 4 retrieval channels:
 
 ### 1. Dense+BM25 fusion channel (always on — the default path)
 - Dense vector search over the indexed chunk store (`chunks_vdb`) fused with BM25 sparse retrieval
-- Sparse keyword retrieval over the indexed chunk store, exact identifier matching (e.g. `A2S32`, `hyp:7f62cfb4`) — dense embeddings miss these
+- Sparse keyword retrieval over the indexed chunk store, exact identifier matching (e.g. `Q7X42`, `hyp:1a2b3c4d`) — dense embeddings miss these
 - Alpha-weighted fusion with dense results (`HARS_MEMORY_HYBRID_ALPHA`, default 0.5)
 - Atomic index save via temp dir + `os.replace` (no half-written index reads)
 - BM25 query runs in `asyncio.to_thread` — does not block the event loop

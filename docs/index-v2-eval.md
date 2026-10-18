@@ -4,7 +4,7 @@ Three arms: `old` = live index (token chunker), `md` = `VARIANT=md` (structure-a
 `md-merge` = `VARIANT=md-merge` (structure-aware + small-chunk merge). Build the two markdown arms with
 `VARIANT=<arm> scripts/build_index_md_v2.sh run` (exit 4 = timeout, re-run to resume; stalled batches are
 cancelled and finished synchronously, see AGENTS.md "Stragglers").
-Caveat: the baseline used gpt-5.6-luna and the markdown arms use gpt-6-luna, so graph quality
+Note: the baseline used gpt-5.6-luna and the markdown arms use gpt-6-luna, so graph quality
 differs by model as well as by chunker; doc/chunk-level retrieval numbers are the cleaner signal.
 
 Everything here is retrieval-only: CPU embedder (+ optional CPU cross-encoder), no

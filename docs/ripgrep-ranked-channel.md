@@ -143,9 +143,9 @@ gate was only referenced as a strict-env knob. Added:
 Reproduce (48-query GC-fixed set, live index/embedder):
 
 ```bash
-cd /home/angkira/Project/software/hars-longterm-memory
+cd /home/demo/Project/software/hars-longterm-memory
 set -a; source eval_agentic-data/bench_env.sh; set +a
-export HARS_MEMORY_RIPGREP_ROOTS="/mnt/datasets/graphrag/staging/ingested,/home/angkira/Project/software/cortex/.plans,/home/angkira/Project/software/cortex/.reports,/home/angkira/Project/software/cortex/.session,/home/angkira/Project/software/cortex/docs,/home/angkira/Project/software/cortex/hypotheses,/home/angkira/Project/software/cortex/hypothesis_links"
+export HARS_MEMORY_RIPGREP_ROOTS="/mnt/datasets/graphrag/staging/ingested,/home/demo/Project/software/cortex/.plans,/home/demo/Project/software/cortex/.reports,/home/demo/Project/software/cortex/.session,/home/demo/Project/software/cortex/docs,/home/demo/Project/software/cortex/hypotheses,/home/demo/Project/software/cortex/hypothesis_links"
 uv run --project . python -m hars_memory.eval.ab_bench ab \
   --queries eval_agentic-data/retrieval_queries_current_gcfixed.yaml \
   --configs dense_only hybrid_bm25 hybrid_bm25_ripgrep \
@@ -210,7 +210,7 @@ The ripgrep call (`ripgrep_channel.search`) over the 48 queries, curated roots:
 
 End-to-end, in one shared-process pass (`hybrid_bm25` → `hybrid_bm25_ripgrep`):
 **+166 ms mean** (41 ms → 208 ms), consistent with ~400 ms × 20/48 firing
-queries. **Caveat:** the host was at high load during capture (dense-only
+queries. **Note:** the host was at high load during capture (dense-only
 measured 858 ms/query), so treat latency as an upper bound; the `rg`-call
 figures above are the stable part. There is no meaningful latency risk when the
 query has no identifier term — `rg` is not invoked.

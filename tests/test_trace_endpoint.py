@@ -88,25 +88,25 @@ def _write_chunks(index_dir: Path) -> None:
     index_dir.mkdir(parents=True, exist_ok=True)
     chunks = {
         "chunk-1": {
-            "content": "[Document: hyp_a2s32.md | Section: gate | Date: 2026-05-01]\n\nA2S32 sidecar gate.",
-            "file_path": "hyp_a2s32.md",
+            "content": "[Document: hyp_q7x42.md | Section: gate | Date: 2026-05-01]\n\nQ7X42 sidecar gate.",
+            "file_path": "hyp_q7x42.md",
         },
         "chunk-2": {
-            "content": "phase_c1_lora_safe ran 3000 steps.",
+            "content": "phase_x1_adapter_safe ran 3000 steps.",
             "file_path": "exp_phase_c1.md",
         },
         "chunk-3": {
-            "content": "vea_native encodes video tokens.",
-            "file_path": "feedback_vea_native.md",
+            "content": "vma_native encodes video tokens.",
+            "file_path": "feedback_vma_native.md",
         },
     }
     (index_dir / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
 
 
 def _sample_context() -> str:
-    entity = {"entity": "A2S32", "type": "experiment", "description": "sidecar gate"}
-    relation = {"entity1": "A2S32", "entity2": "Sidecar Gate", "description": "uses"}
-    chunk = {"reference_id": "1", "content": "[Document: hyp_a2s32.md | Section: gate]\n\nbody", "section": "gate"}
+    entity = {"entity": "Q7X42", "type": "experiment", "description": "sidecar gate"}
+    relation = {"entity1": "Q7X42", "entity2": "Sidecar Gate", "description": "uses"}
+    chunk = {"reference_id": "1", "content": "[Document: hyp_q7x42.md | Section: gate]\n\nbody", "section": "gate"}
     return (
         "\nKnowledge Graph Data (Entity):\n\n```json\n"
         + json.dumps(entity)
@@ -114,7 +114,7 @@ def _sample_context() -> str:
         + json.dumps(relation)
         + "\n```\n\nDocument Chunks (Each entry has a reference_id):\n\n```json\n"
         + json.dumps(chunk)
-        + "\n```\n\nReference Document List (Each entry starts with a [reference_id]):\n\n```\n[1] hyp_a2s32.md\n```\n"
+        + "\n```\n\nReference Document List (Each entry starts with a [reference_id]):\n\n```\n[1] hyp_q7x42.md\n```\n"
     )
 
 
@@ -161,9 +161,9 @@ def _real_pipeline_env(tmp_path: Path) -> dict[str, str]:
 
 def _dense_hits() -> list[dict]:
     return [
-        {"id": "chunk-1", "distance": 0.91, "content": "[Document: hyp_a2s32.md | Section: gate]\n\nA2S32 gate.", "file_path": "hyp_a2s32.md"},
-        {"id": "chunk-2", "distance": 0.55, "content": "phase_c1_lora_safe ran.", "file_path": "exp_phase_c1.md"},
-        {"id": "chunk-3", "distance": 0.22, "content": "vea_native.", "file_path": "feedback_vea_native.md"},
+        {"id": "chunk-1", "distance": 0.91, "content": "[Document: hyp_q7x42.md | Section: gate]\n\nQ7X42 gate.", "file_path": "hyp_q7x42.md"},
+        {"id": "chunk-2", "distance": 0.55, "content": "phase_x1_adapter_safe ran.", "file_path": "exp_phase_c1.md"},
+        {"id": "chunk-3", "distance": 0.22, "content": "vma_native.", "file_path": "feedback_vma_native.md"},
     ]
 
 
@@ -180,10 +180,10 @@ class TestFramingAndParsing:
 
     def test_parse_context_blocks_classifies_lines(self) -> None:
         blocks = trace.parse_context_blocks(_sample_context())
-        assert [e["entity"] for e in blocks["entities"]] == ["A2S32"]
+        assert [e["entity"] for e in blocks["entities"]] == ["Q7X42"]
         assert blocks["relations"][0]["entity2"] == "Sidecar Gate"
         assert [s["reference_id"] for s in blocks["sources"]] == ["1"]
-        assert blocks["references"] == {"1": "hyp_a2s32.md"}
+        assert blocks["references"] == {"1": "hyp_q7x42.md"}
 
     def test_hit_doc_fields_prefers_document_header(self) -> None:
         fields = trace.hit_doc_fields("[Document: d.md | Section: s | Date: 2026-01-01]\n\nbody", "x.md")
@@ -294,7 +294,7 @@ class TestRealPipelineTrace:
         mod = _load_mcp(_real_pipeline_env(tmp_path))
         self._install(tmp_path, mod)
         events = [event async for event in trace.stream_recall_events({
-            "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+            "question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "top_k": 3,
         })]
         by_name = {name: payload for name, payload in events}
         names = [name for name, _ in events]
@@ -341,7 +341,7 @@ class TestRealPipelineTrace:
         events = [
             event
             async for event in trace.stream_recall_events({
-                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+                "question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "top_k": 3,
             })
         ]
         by_name = dict(events)
@@ -375,7 +375,7 @@ class TestRealPipelineTrace:
         monkeypatch.setenv("HARS_MEMORY_FLAT_CHANNEL", "0")
         mod = _load_mcp(_real_pipeline_env(tmp_path))
         self._install(tmp_path, mod)
-        args = {"question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3}
+        args = {"question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "top_k": 3}
 
         traced = [
             event async for event in trace.stream_recall_events(dict(args))
@@ -416,15 +416,15 @@ class TestRealPipelineTrace:
             return RipgrepSearchResult(
                 hits=[
                     RipgrepSearchHit(
-                        chunk_id="file-stable-a2s32",
+                        chunk_id="file-stable-q7x42",
                         score=3.5,
-                        content="A2S32 sidecar gate",
-                        file_path="/corpus/hyp_a2s32.md",
+                        content="Q7X42 sidecar gate",
+                        file_path="/corpus/hyp_q7x42.md",
                         match_count=1,
-                        term_hits={"A2S32": 1},
+                        term_hits={"Q7X42": 1},
                     )
                 ],
-                query_terms=("A2S32",),
+                query_terms=("Q7X42",),
                 available=True,
                 unavailable_reason=None,
                 latency_seconds=0.004,
@@ -435,7 +435,7 @@ class TestRealPipelineTrace:
         events = [
             event
             async for event in trace.stream_recall_events({
-                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+                "question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "top_k": 3,
             })
         ]
         by_name = dict(events)
@@ -447,9 +447,9 @@ class TestRealPipelineTrace:
         assert frame["enabled"] is True and frame["skipped"] is False
         assert frame["available"] is True and frame["mode"] == "ranked"
         assert frame["latency_ms"] == 4.0
-        assert [h["chunk_id"] for h in frame["hits"]] == ["file-stable-a2s32"]
+        assert [h["chunk_id"] for h in frame["hits"]] == ["file-stable-q7x42"]
         assert frame["hits"][0]["ripgrep_score"] == 3.5
-        assert frame["hits"][0]["matched_terms"] == {"A2S32": 1}
+        assert frame["hits"][0]["matched_terms"] == {"Q7X42": 1}
         # the pool chunk whose (flattened) file_path matches the basename
         assert frame["matched_chunk_ids"] == ["chunk-1"]
 
@@ -463,7 +463,7 @@ class TestRealPipelineTrace:
         events = [
             event
             async for event in trace.stream_recall_events({
-                "question": "A2S32 sidecar gate", "ll_keywords": ["A2S32"], "top_k": 3,
+                "question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "top_k": 3,
             })
         ]
         frame = dict(events)["ripgrep_hits"]
@@ -571,7 +571,7 @@ class TestLiveTraceEndpoint:
             events = await _read_sse(
                 client,
                 url,
-                params={"question": "A2S32 sidecar gate", "ll_keywords": "A2S32", "top_k": "3"},
+                params={"question": "Q7X42 sidecar gate", "ll_keywords": "Q7X42", "top_k": "3"},
             )
         names = [name for name, _ in events]
         for stage in EXPECTED_STAGES:

@@ -42,9 +42,9 @@ _EXPECTED_COUNTS = {"processed": 958, "failed": 290, "parsing": 75, "pending": 1
 _ENV_VAR = "HARS_LIGHTRAG_157_SNAPSHOT"
 
 _CANDIDATE_SNAPSHOTS = (
-    Path("/home/angkira/mem-probe/scratch_157/index_full_mdstruct_20261014"),
+    Path("/home/demo/mem-probe/scratch_157/index_full_mdstruct_20261014"),
     Path(
-        "/home/angkira/mem-probe/index_snaps/20261017T132719Z/"
+        "/home/demo/mem-probe/index_snaps/20261017T132719Z/"
         "index_full_mdstruct_20261014"
     ),
 )

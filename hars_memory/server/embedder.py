@@ -36,8 +36,8 @@ HARS_MEMORY_EMBED_QUERY_PROMPT_NAME
     Document-side embedding (context="document") is UNAFFECTED by this var —
     it keeps using HARS_MEMORY_EMBED_PROMPT_NAME/HARS_MEMORY_EMBED_DOC_PREFIX above
     (default: no prefix at all), which is what the existing index at
-    /home/angkira/.local/share/hars-graphrag/index_gemma_v4 (relocated
-    2026-07-29 from /mnt/datasets/graphrag/index_gemma_v4) was actually
+    /home/demo/.local/share/hars-graphrag/index_v4 (relocated
+    2026-07-29 from /mnt/datasets/graphrag/index_v4) was actually
     built with. Changing
     the document-side prompt WOULD require a full re-embed — see
     embeddinggemma's "document" prompt ("title: none | text: ") for the
@@ -772,8 +772,8 @@ def make_embedding_func(
     model_name:
         HuggingFace model ID.  Default: unsloth/embeddinggemma-300m (dim=768) —
         this matches the model the deployed index at
-        /home/angkira/.local/share/hars-graphrag/index_gemma_v4 (relocated
-        2026-07-29 from /mnt/datasets/graphrag/index_gemma_v4) was actually built with.
+        /home/demo/.local/share/hars-graphrag/index_v4 (relocated
+        2026-07-29 from /mnt/datasets/graphrag/index_v4) was actually built with.
     hf_cache_dir:
         Override HF_HOME for offline operation (e.g. /mnt/datasets/models/.hf_home).
     batch_size:

@@ -1,18 +1,18 @@
 # Phase-D index swap checklist
 
-Replacing the live index (`index_compact_20260903_imported`) with the new
+Replacing the live index (`index_compact`) with the new
 md_struct build (`index_full_mdstruct_20261014`). Ordered; every step has a
 command and a pass criterion. **Stop at the first failing step and roll back.**
 
 Evidence behind the non-obvious steps: `docs/VERSION_PIN.md`,
 `docs/CHANNEL_HYGIENE.md`, and the audit of the 2026-10-17 snapshot
-(`/home/angkira/mem-probe/index_snaps/20261017T132719Z/`).
+(`/home/demo/mem-probe/index_snaps/20261017T132719Z/`).
 
 Conventions:
-- `LIVE=/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported`
-- `NEW=/home/angkira/.local/share/hars-graphrag/index_full_mdstruct_20261014`
-- `BENCH=/home/angkira/Project/software/hars-longterm-memory/eval_agentic-data`
-- Repo = `/home/angkira/Project/software/hars-longterm-memory`
+- `LIVE=/home/demo/.local/share/hars-graphrag/index_compact`
+- `NEW=/home/demo/.local/share/hars-graphrag/index_full_mdstruct_20261014`
+- `BENCH=/home/demo/Project/software/hars-longterm-memory/eval_agentic-data`
+- Repo = `/home/demo/Project/software/hars-longterm-memory`
 - Env for harness runs: `set -a; source $BENCH/bench_env.sh; set +a; export HARS_MEMORY_EMBED_PROVIDER=http`
   (override `HARS_MEMORY_INDEX_DIR` to point at the candidate index).
 
@@ -220,7 +220,7 @@ missing gold doc caps Recall@10. Re-check against the *finished* build.
 
 - **Command:**
   ```bash
-  rm -rf /home/angkira/.local/share/hars-graphrag/bm25_cache_compact_20260903
+  rm -rf /home/demo/.local/share/hars-graphrag/bm25_cache_compact_20260903
   # first serve/query against $NEW rebuilds it; or force via the harness (Step 7).
   ```
 - **Pass:** the cache dir is repopulated on first use and Step 7's `hybrid_bm25`
@@ -239,7 +239,7 @@ missing gold doc caps Recall@10. Re-check against the *finished* build.
   uv run python - <<'PY'
   import json, yaml, pathlib
   hits=json.load(open("/tmp/phaseD_hits.json"))         # {config: {query_id: [file_path, ...]}}
-  q=yaml.safe_load(open("/home/angkira/Project/software/hars-longterm-memory/eval_agentic-data/retrieval_queries_current_gcfixed.yaml"))
+  q=yaml.safe_load(open("/home/demo/Project/software/hars-longterm-memory/eval_agentic-data/retrieval_queries_current_gcfixed.yaml"))
   pick={it["id"]: it["gold_docs"][0] for it in q["queries"] if it["type"]=="identifier"}
   for qid in list(pick)[:3]:
       ranked=[pathlib.Path(p).name for p in hits["hybrid_bm25"][qid]]
@@ -273,7 +273,7 @@ missing gold doc caps Recall@10. Re-check against the *finished* build.
   bites — Step 1 exists to prevent exactly this.**
 - **Smoke — recall:**
   ```bash
-  curl -sN --max-time 60 "http://10.66.66.99:8098/trace?question=<a gold question>&context_only=true" | tail
+  curl -sN --max-time 60 "http://127.0.0.1:8098/trace?question=<a gold question>&context_only=true" | tail
   ```
   **Pass:** a terminal `done` event, `rerank`/`graph` stages present, and the
   gold doc appears in the returned context.
@@ -288,7 +288,7 @@ missing gold doc caps Recall@10. Re-check against the *finished* build.
   rm -rf "$LIVE" && mv "${LIVE}.pre-phaseD" "$LIVE"
   # or restore from the Step-2 backup:
   rm -rf "$LIVE" && cp -a "${LIVE}.bak-$(cat /tmp/phaseD_backup_ts)" "$LIVE"
-  rm -rf /home/angkira/.local/share/hars-graphrag/bm25_cache_compact_20260903   # force rebuild
+  rm -rf /home/demo/.local/share/hars-graphrag/bm25_cache_compact_20260903   # force rebuild
   ```
 - [ ] Restart the service; re-run the Step-11 smoke.
 - **Pass:** `memory_status` + recall smoke green on the restored store.

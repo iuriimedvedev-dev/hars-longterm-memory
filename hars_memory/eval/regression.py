@@ -12,7 +12,7 @@ Supported report shapes
 ------------------------
 Both of the following are accepted, independently, for ``baseline`` and
 ``candidate`` (a comparison can even mix the two, though that is rarely
-meaningful — see the caveat below):
+meaningful — see the warning below):
 
 1. ``eval/corpus_eval.py::run_eval``'s report — detected by the presence of
    a top-level ``corpus_fingerprint`` key. Carries exactly one mode/config's
@@ -30,7 +30,7 @@ common internal ``_NormalizedReport`` (fingerprint/query-set identity +
 ``{"recall@k": ..., "ndcg@k": ..., "mrr": ...}`` + latency p95) before any
 comparison happens — see ``_normalize``.
 
-CAVEAT on mixing shapes: an ``ab_bench`` report has no ``corpus_fingerprint``
+WARNING on mixing shapes: an ``ab_bench`` report has no ``corpus_fingerprint``
 at all (LightRAG mode configs don't correspond 1:1 with a corpus-build
 fingerprint), so comparing a ``corpus_eval`` baseline against an
 ``ab_bench`` candidate skips the fingerprint-equality check entirely (see

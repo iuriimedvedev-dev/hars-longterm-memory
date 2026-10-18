@@ -101,9 +101,9 @@ class TestPoolFeatures:
         assert row.features[LTR_FEATURE_NAMES.index("ripgrep_norm")] == 0.5
 
     def test_exact_identifier_match(self) -> None:
-        hit = _chunk("c", fused_score=0.5, content="the A2S32 run failed")
+        hit = _chunk("c", fused_score=0.5, content="the Q7X42 run failed")
         miss = _chunk("d", fused_score=0.4, content="unrelated prose")
-        rows = extract_pool_features([hit, miss], "how did A2S32 fail?")
+        rows = extract_pool_features([hit, miss], "how did Q7X42 fail?")
         idx = LTR_FEATURE_NAMES.index("exact_identifier_match")
         assert rows[0].features[idx] == 1.0
         assert rows[1].features[idx] == 0.0
@@ -137,10 +137,10 @@ class TestPoolFeatures:
 
 class TestQueryFeatures:
     def test_content_terms_exclude_identifiers_and_stopwords(self) -> None:
-        q = QueryFeatures.from_question("What configuration file is the A2S32 resume plan?")
-        assert "A2S32" in q.identifier_terms
+        q = QueryFeatures.from_question("What configuration file is the Q7X42 resume plan?")
+        assert "Q7X42" in q.identifier_terms
         assert "what" not in q.content_terms
-        assert all(term.lower() not in {"a2s32"} for term in q.content_terms)
+        assert all(term.lower() not in {"q7x42"} for term in q.content_terms)
 
 
 class TestCorpusContext:
@@ -161,7 +161,7 @@ class TestCorpusContext:
             },
         }
         entities = {
-            "A2S32": {"chunk_ids": ["chunk-0001"], "count": 7},
+            "Q7X42": {"chunk_ids": ["chunk-0001"], "count": 7},
             "val/thing": {"chunk_ids": ["chunk-0002"], "count": 2},
         }
         (index / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
@@ -177,14 +177,14 @@ class TestCorpusContext:
         assert ctx.doc_age_days("missing.md") is None
         assert ctx.chunk_heading_depth("chunk-0001", "irrelevant") == 1
         assert ctx.entity_fanin_max("chunk-0001") == 7
-        assert ctx.entity_match_fraction("chunk-0001", ["A2S32"]) == 1.0
-        assert ctx.entity_match_fraction("chunk-0002", ["A2S32"]) == 0.0
+        assert ctx.entity_match_fraction("chunk-0001", ["Q7X42"]) == 1.0
+        assert ctx.entity_match_fraction("chunk-0002", ["Q7X42"]) == 0.0
 
     def test_features_with_context_populate_doc_and_graph_columns(self, tmp_path: Path) -> None:
         index = self._write_index(tmp_path)
         ctx = LtrCorpusContext.load(index)
         chunk = _chunk("chunk-0001", fused_score=0.5, file_path="docs-2026-07-15_alpha.md")
-        (row,) = extract_pool_features([chunk], "what about A2S32", context=ctx)
+        (row,) = extract_pool_features([chunk], "what about Q7X42", context=ctx)
         assert row.features[LTR_FEATURE_NAMES.index("doc_age_days_log")] > 0.0
         assert row.features[LTR_FEATURE_NAMES.index("graph_entity_fanin_log")] > 0.0
         assert row.features[LTR_FEATURE_NAMES.index("graph_entity_match")] == 1.0
@@ -199,7 +199,7 @@ class TestFuseIntegration:
 
     def test_extract_over_real_fuse_pool(self) -> None:
         dense = {
-            "c1": ChannelHit(score=0.9, content="alpha A2S32", file_path="a.md"),
+            "c1": ChannelHit(score=0.9, content="alpha Q7X42", file_path="a.md"),
             "c2": ChannelHit(score=0.5, content="beta", file_path="b.md"),
         }
         sparse = {
@@ -208,7 +208,7 @@ class TestFuseIntegration:
         }
         pool = fuse(dense, sparse, 0.5)
         assert pool
-        rows = extract_pool_features(pool, "A2S32 beta")
+        rows = extract_pool_features(pool, "Q7X42 beta")
         assert len(rows) == len(pool)
         for row in rows:
             assert len(row.features) == len(LTR_FEATURE_NAMES)

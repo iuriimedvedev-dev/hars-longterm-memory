@@ -23,7 +23,7 @@ has none)
 (``corpus/build.py`` stores ``doc.source_path``, which ``ingest/walker.py``
 always resolves to an absolute path, in every chunk-store entry's
 ``file_path``). Existing gold sets such as ``eval/retrieval_queries.yaml``
-record ``gold_docs`` as bare BASENAMES (e.g. ``feedback_qwen35_vea_native.md``)
+record ``gold_docs`` as bare BASENAMES (e.g. ``feedback_qwen35_vma_native.md``)
 — that matches what LightRAG's OWN ``kv_store_text_chunks.json`` happens to
 store for curated notes, which is what ``eval/ab_bench.py`` scores against.
 ``ab_bench.py`` does NO basename normalization: it compares ``gold_docs``

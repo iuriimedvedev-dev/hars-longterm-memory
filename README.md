@@ -192,7 +192,7 @@ cp config/.env.example config/.env
 
 ### 4. Run indexing (GPU MUST be free)
 
-Wait until no `vea/expert/ai_tuner/finetune/distillation` experiment is running.
+Wait until no `vma/expert/ai_tuner/finetune/distillation` experiment is running.
 Confirm the OpenAI-compatible extractor endpoint is live before starting:
 
 ```bash
@@ -485,7 +485,7 @@ GPU-guard script only if `HARS_MEMORY_GPU_GUARD_SCRIPT_PATH` is set, pointing
 at a Python file exposing `assert_gpu_free(api_base_url)`; if unset, no
 GPU-concurrency check is performed and indexing proceeds. Cortex's own guard
 (`tools/memory-config/scripts/gpu_guard.py`) queries the HARS backend for
-running experiments and refuses to proceed if `vea/expert/ai_tuner/
+running experiments and refuses to proceed if `vma/expert/ai_tuner/
 finetune/distillation` is running. **Query tools never call the GPU guard** —
 CPU embeddings keep `memory_status()` and `memory_recall()` always available
 even mid-training.

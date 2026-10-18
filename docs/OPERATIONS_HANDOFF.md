@@ -6,21 +6,21 @@ before touching anything below.
 ## 1. Live serving (workstation `angkira-kubuntu-pc`)
 
 - **Index dir (configured name, keep it):**
-  `/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported`
+  `/home/demo/.local/share/hars-graphrag/index_compact`
   (1847 docs / 47355 nodes / 60117→54502 edges after 2026-10-14 dupe GC).
   Backups next to it: `*.bak_20261013`, `index_pre_dupe_gc_20261014`.
 - **Service:** `hars-longterm-memory-mcp.service` (systemd --user, linger on) →
   `cortex/scripts/hars-longterm-memory-mcp-http.sh` → supergateway
   **`--stateful`** (one stdio child; without it every request paid 13–15 s
   LightRAG re-init) → `uv run --project ../hars-longterm-memory memory mcp`
-  → HTTP bridge `10.66.66.99:8099/mcp` (WireGuard-only bind via preload).
+  → HTTP bridge `127.0.0.1:8099/mcp` (WireGuard-only bind via preload).
 - **Env single source of truth:** `cortex/.mcp.json` →
   `mcpServers["hars-longterm-memory"].env`. Currently: embedder
   `PROVIDER=http` → code-diver `:8791`, rerank `BACKEND=http` → `:8792`
   (`POOL=20`, `TIMEOUT_S=30`), extractor/query → gemma `:8083`, index dir as
   above. Change env → `systemctl --user restart hars-longterm-memory-mcp`.
 - **Live trace SSE (2026-10-17):** the same stdio child also serves a read-only
-  recall-trace endpoint on `10.66.66.99:8098` (same WireGuard-only bind):
+  recall-trace endpoint on `127.0.0.1:8098` (same WireGuard-only bind):
   `GET /trace?question=...&ll_keywords=...&top_k=...` streams one SSE event per
   pipeline stage (`trace_start`→`bm25_hits`→`vector_hits`→`fusion`→`rerank`→
   `graph_expand`→`context`→`result`→`done`); `GET /healthz` is the liveness

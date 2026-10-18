@@ -2,8 +2,8 @@
 and dense/sparse fusion. GPU-free, no LLM calls, no network.
 
 Covers the acceptance criteria from the hybrid-retrieval feature spec:
-- identifier tokenization preserves whole identifiers (`phase_c1_lora_safe`,
-  `A2S32`) rather than stemming/stripping them away.
+- identifier tokenization preserves whole identifiers (`phase_x1_adapter_safe`,
+  `Q7X42`) rather than stemming/stripping them away.
 - fusion math is correct at alpha=0 (pure sparse) and alpha=1 (pure dense).
 - the on-disk BM25 index cache invalidates when the source
   kv_store_text_chunks.json mtime changes, and is reused when it doesn't.
@@ -29,21 +29,21 @@ class TestTokenizerPreservesIdentifiers:
     """Item: tokenization must not destroy the exact-identifier signal."""
 
     def test_whole_identifiers_survive_as_single_tokens(self) -> None:
-        for identifier in ("A2S32", "phase_c1_lora_safe", "vea_native", "hyp:7f62cfb4"):
+        for identifier in ("Q7X42", "phase_x1_adapter_safe", "vma_native", "hyp:1a2b3c4d"):
             tokens = tokenize_identifiers(identifier)
             assert identifier.casefold() in tokens, (
                 f"whole identifier {identifier!r} must survive as one token; got {tokens}"
             )
 
     def test_sub_tokens_are_additive_not_replacing(self) -> None:
-        tokens = tokenize_identifiers("phase_c1_lora_safe")
-        assert "phase_c1_lora_safe" in tokens
-        assert {"phase", "c1", "lora", "safe"} <= set(tokens)
+        tokens = tokenize_identifiers("phase_x1_adapter_safe")
+        assert "phase_x1_adapter_safe" in tokens
+        assert {"phase", "x1", "adapter", "safe"} <= set(tokens)
 
     def test_alnum_code_splits_on_digit_letter_boundary_but_keeps_whole(self) -> None:
-        tokens = tokenize_identifiers("A2S32")
-        assert "a2s32" in tokens
-        assert {"a2", "s32"} <= set(tokens)
+        tokens = tokenize_identifiers("Q7X42")
+        assert "q7x42" in tokens
+        assert {"q7", "x42"} <= set(tokens)
 
     def test_whole_token_match_is_case_symmetric(self) -> None:
         # The primary guarantee: a query typed in different case than the
@@ -51,41 +51,41 @@ class TestTokenizerPreservesIdentifiers:
         # applied identically on both sides (tokenizer.py module docstring
         # item 4). This is the guarantee `looks_like_identifier`/BM25 exact
         # lookup actually relies on.
-        assert "a2s32" in tokenize_identifiers("A2S32")
-        assert "a2s32" in tokenize_identifiers("a2s32")
-        assert "phase_c1_lora_safe" in tokenize_identifiers("Phase_C1_Lora_Safe")
-        assert "phase_c1_lora_safe" in tokenize_identifiers("phase_c1_lora_safe")
+        assert "q7x42" in tokenize_identifiers("Q7X42")
+        assert "q7x42" in tokenize_identifiers("q7x42")
+        assert "phase_x1_adapter_safe" in tokenize_identifiers("Phase_X1_Adapter_Safe")
+        assert "phase_x1_adapter_safe" in tokenize_identifiers("phase_x1_adapter_safe")
 
     def test_underscore_split_sub_tokens_are_case_symmetric(self) -> None:
         # Delimiter-based sub-tokens (underscore/hyphen/colon/dot/slash) do not
         # depend on case at all, so they ARE fully symmetric.
-        assert tokenize_identifiers("Phase_C1_Lora_Safe") == tokenize_identifiers(
-            "phase_c1_lora_safe"
+        assert tokenize_identifiers("Phase_X1_Adapter_Safe") == tokenize_identifiers(
+            "phase_x1_adapter_safe"
         )
 
     def test_camel_case_sub_split_is_not_recoverable_from_all_lowercase(self) -> None:
-        # Documented limitation, not a bug: "A2S32" carries a real camelCase
-        # boundary (digit '2' -> uppercase 'S') that "a2s32" structurally does
+        # Documented limitation, not a bug: "Q7X42" carries a real camelCase
+        # boundary (digit '7' -> uppercase 'X') that "q7x42" structurally does
         # not contain — an all-lowercase string has no case-transition
         # information to split on. Sub-token recall differs; the whole-token
         # exact match (asserted above) does not.
-        assert tokenize_identifiers("A2S32") != tokenize_identifiers("a2s32")
-        assert {"a2", "s32"} <= set(tokenize_identifiers("A2S32"))
-        assert set(tokenize_identifiers("a2s32")) == {"a2s32"}
+        assert tokenize_identifiers("Q7X42") != tokenize_identifiers("q7x42")
+        assert {"q7", "x42"} <= set(tokenize_identifiers("Q7X42"))
+        assert set(tokenize_identifiers("q7x42")) == {"q7x42"}
 
     def test_no_stemming_digits_and_underscores_survive(self) -> None:
-        tokens = tokenize_identifiers("phase_c1_lora_safe")
+        tokens = tokenize_identifiers("phase_x1_adapter_safe")
         # A stemmer/aggressive-normalizer would strip the digit or the
         # underscores; neither is acceptable for identifier retrieval.
-        assert any("c1" in t for t in tokens)
-        assert "phase_c1_lora_safe" in tokens  # underscores intact
+        assert any("x1" in t for t in tokens)
+        assert "phase_x1_adapter_safe" in tokens  # underscores intact
 
     def test_prose_tokenizes_without_crashing_on_punctuation(self) -> None:
-        text = "See A2S32 (also phase_c1_lora_safe), e.g. vea_native — done."
+        text = "See Q7X42 (also phase_x1_adapter_safe), e.g. vma_native — done."
         tokens = tokenize_identifiers(text)
-        assert "a2s32" in tokens
-        assert "phase_c1_lora_safe" in tokens
-        assert "vea_native" in tokens
+        assert "q7x42" in tokens
+        assert "phase_x1_adapter_safe" in tokens
+        assert "vma_native" in tokens
 
     def test_empty_text_returns_empty_list(self) -> None:
         assert tokenize_identifiers("") == []
@@ -93,7 +93,7 @@ class TestTokenizerPreservesIdentifiers:
 
 class TestIdentifierDetection:
     def test_recognizes_known_identifier_shapes(self) -> None:
-        for identifier in ("A2S32", "phase_c1_lora_safe", "vea_native", "hyp:7f62cfb4"):
+        for identifier in ("Q7X42", "phase_x1_adapter_safe", "vma_native", "hyp:1a2b3c4d"):
             assert looks_like_identifier(identifier), identifier
 
     def test_rejects_plain_words(self) -> None:
@@ -101,9 +101,9 @@ class TestIdentifierDetection:
             assert not looks_like_identifier(word), word
 
     def test_extract_identifier_terms_from_question(self) -> None:
-        question = "What happened in phase_c1_lora_safe and does A2S32 relate to vea_native?"
+        question = "What happened in phase_x1_adapter_safe and does Q7X42 relate to vma_native?"
         terms = extract_identifier_terms(question)
-        assert terms == ["phase_c1_lora_safe", "A2S32", "vea_native"]
+        assert terms == ["phase_x1_adapter_safe", "Q7X42", "vma_native"]
 
     def test_extract_identifier_terms_empty_for_plain_question(self) -> None:
         assert extract_identifier_terms("What happened in training yesterday?") == []
@@ -698,16 +698,16 @@ class TestBM25IndexCache:
     def _sample_chunks(self) -> dict[str, dict]:
         return {
             "chunk-1": {
-                "content": "Experiment A2S32 stabilized the gate at step 80.",
-                "file_path": "hyp_a2s32.md",
+                "content": "Experiment Q7X42 stabilized the gate at step 80.",
+                "file_path": "hyp_q7x42.md",
             },
             "chunk-2": {
-                "content": "phase_c1_lora_safe ran for 3000 steps without drift.",
-                "file_path": "exp_phase_c1_lora_safe.md",
+                "content": "phase_x1_adapter_safe ran for 3000 steps without drift.",
+                "file_path": "exp_phase_x1_adapter_safe.md",
             },
             "chunk-3": {
-                "content": "vea_native mode encodes video tokens at runtime.",
-                "file_path": "feedback_vea_native.md",
+                "content": "vma_native mode encodes video tokens at runtime.",
+                "file_path": "feedback_vma_native.md",
             },
         }
 
@@ -733,10 +733,10 @@ class TestBM25IndexCache:
 
         self._write_chunks(tmp_path, self._sample_chunks())
         index, _ = build_index(str(tmp_path))
-        hits = index.search("A2S32", top_k=3)
-        assert hits, "expected at least one hit for A2S32"
+        hits = index.search("Q7X42", top_k=3)
+        assert hits, "expected at least one hit for Q7X42"
         assert hits[0].chunk_id == "chunk-1"
-        assert "A2S32" in hits[0].content
+        assert "Q7X42" in hits[0].content
 
     def test_get_or_build_index_caches_on_disk(self, tmp_path: Path) -> None:
         from hars_memory.retrieval.bm25_index import get_or_build_index
@@ -795,11 +795,11 @@ class TestBM25IndexCache:
 
         index1, stats1 = get_or_build_index(str(working_dir), str(cache_dir))
         assert stats1.cache_hit is False
-        hits1 = index1.search("phase_c1_lora_safe", top_k=3)
+        hits1 = index1.search("phase_x1_adapter_safe", top_k=3)
 
         index2, stats2 = get_or_build_index(str(working_dir), str(cache_dir))
         assert stats2.cache_hit is True
-        hits2 = index2.search("phase_c1_lora_safe", top_k=3)
+        hits2 = index2.search("phase_x1_adapter_safe", top_k=3)
 
         assert [h.chunk_id for h in hits1] == [h.chunk_id for h in hits2]
         assert [h.score for h in hits1] == pytest.approx([h.score for h in hits2])

@@ -40,7 +40,7 @@ import yaml  # type: ignore[import-not-found]
 logger = logging.getLogger("memory.eval.gen_synthetic_queries")
 
 DEFAULT_INDEX = os.environ.get(
-    "HARS_MEMORY_INDEX_DIR", "/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported"
+    "HARS_MEMORY_INDEX_DIR", "/home/demo/.local/share/hars-graphrag/index_compact"
 )
 DEFAULT_MODEL = os.environ.get("HARS_MEMORY_OPENROUTER_MODEL", "openai/gpt-6-luna")
 FALLBACK_MODELS = ("openai/gpt-5.1-mini", "openai/gpt-4o-mini")
@@ -173,7 +173,7 @@ def load_api_key(explicit: str | None) -> str:
         return explicit
     key_file = os.environ.get("HARS_MEMORY_EXTRACTOR_API_KEY_FILE", "")
     candidates = [Path(key_file)] if key_file else []
-    candidates.extend([Path("/home/angkira/Project/software/cortex/.env.secrets"), Path(".env")])
+    candidates.extend([Path("/home/demo/Project/software/cortex/.env.secrets"), Path(".env")])
     for path in candidates:
         try:
             for line in path.read_text().splitlines():
