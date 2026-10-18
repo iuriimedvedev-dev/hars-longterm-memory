@@ -33,3 +33,6 @@ experiments/**/results/
 # Generated eval datasets (project-specific, not for commit)
 eval_agentic-data/
 eval_agentic/
+
+# local entity-alias overrides (deployment-specific spellings, never shipped)
+config/entity_aliases.local.yaml

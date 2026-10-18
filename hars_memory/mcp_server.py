@@ -746,15 +746,54 @@ CONTEXT_MIN_CHUNK_CHARS = 200  # headerless orphan fragments below this length a
 CONTEXT_DOCUMENT_HEADER_RE = re.compile(r"^\[Document:")
 CONTEXT_DESCRIPTION_SEP = "<SEP>"  # matches LightRAG's internal GRAPH_FIELD_SEP
 
-# Known duplicate-entity spellings in the current index (imperfect extraction produced
-# separate nodes for the same real-world thing). This only widens search-time recall by
-# querying every alias and merging results — it does NOT merge the underlying graph
-# nodes. True node merging requires reindexation.
+# Known duplicate-entity spellings seen in indexed corpora (imperfect extraction
+# produced separate nodes for the same real-world thing). This only widens
+# search-time recall by querying every alias and merging results — it does NOT
+# merge the underlying graph nodes. True node merging requires reindexation.
+#
+# Operators register their OWN duplicate-spelling aliases (without editing this
+# shipped file) via HARS_MEMORY_EXTRA_ENTITY_ALIASES: a YAML file mapping
+# canonical name -> list of alias spellings, merged into ENTITY_ALIASES at
+# import. A missing/invalid file is ignored with a warning so it can never
+# break server startup.
 ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "r9700": ("R9700", "R9700 32GB", "AMD R9700 32GB", "AMD Radeon AI Pro R9700 32GB"),
-    "zero_vea": ("zero_vea", "Zero_vea", "Zero VEA"),
-    "real_vea": ("real_vea", "vea_real"),
+    "demo-entity-a": ("demo-entity-a", "Demo Entity A", "Demo Entity A (legacy)"),
 }
+
+
+def _load_extra_entity_aliases() -> dict[str, tuple[str, ...]]:
+    """Load operator-supplied alias spellings (HARS_MEMORY_EXTRA_ENTITY_ALIASES).
+
+    The referenced file is operator-local configuration and is never shipped:
+    a YAML mapping ``canonical: [alias, ...]``. Returns ``{}`` for any unset
+    path, unreadable file, parse error, or shape violation (logged, never
+    raised — startup must not depend on optional local config).
+    """
+    path = os.environ.get("HARS_MEMORY_EXTRA_ENTITY_ALIASES", "")
+    if not path:
+        return {}
+    log = logging.getLogger("hars-longterm-memory-mcp")
+    try:
+        import yaml  # local import: keeps module import cheap if the var is unset
+
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("top level must be a mapping of canonical -> [aliases]")
+        extra: dict[str, tuple[str, ...]] = {}
+        for canonical, aliases in raw.items():
+            if not isinstance(canonical, str) or not isinstance(aliases, list) or not aliases:
+                raise ValueError(f"expected 'canonical: [aliases...]', got {canonical!r}: {aliases!r}")
+            # canonical first, de-duplicated, order-preserving
+            extra[canonical] = tuple(dict.fromkeys([canonical, *(str(a) for a in aliases)]))
+    except Exception as exc:  # noqa: BLE001 - optional config must never kill startup
+        log.warning("Ignoring HARS_MEMORY_EXTRA_ENTITY_ALIASES=%s: %s", path, exc)
+        return {}
+    log.info("Loaded %d extra entity alias group(s) from %s", len(extra), path)
+    return extra
+
+
+ENTITY_ALIASES.update(_load_extra_entity_aliases())
 
 # ---------------------------------------------------------------------------
 # App
@@ -1526,7 +1565,7 @@ async def _compute_hybrid_block(
     function that doesn't pass fetch_top_k gets byte-identical pool_size to
     before this parameter existed).
 
-    `ll_keywords` (caller-supplied, e.g. `['A2S32', 'qdrant_transplant']`) is
+    `ll_keywords` (caller-supplied, e.g. `['Q7X42', 'qdrant_transplant']`) is
     forwarded to the ripgrep channel (`ripgrep_channel.search`) alongside
     `question` — identifier-shaped entries feed `rg` exactly like an
     identifier mentioned in the question text itself would. Fixed
@@ -3287,7 +3326,7 @@ async def list_tools() -> list[Tool]:
             (
                 "Query the HARS knowledge graph. Retrieval runs as parallel channels: "
                 "vector + BM25 + ripgrep + graph. "
-                "IMPORTANT: supply ll_keywords (specific entities/codes, e.g. ['A2S32','Phase C','DINOv3']) "
+                "IMPORTANT: supply ll_keywords (specific entities/codes, e.g. ['Q7X42','Phase C','VisionX3']) "
                 "and hl_keywords (themes/concepts, e.g. ['hypothesis falsification','depth encoding']) — "
                 "you are the LLM, extract them from your question yourself; with keywords provided the "
                 "query runs with NO local LLM (CPU embeddings + graph only). "
@@ -3309,7 +3348,7 @@ async def list_tools() -> list[Tool]:
                 "hybrid (default, both) | naive (pure vector, also the automatic no-keyword fallback). "
                 "The response ALSO always includes a top-level `hybrid` field — NOT the same thing as "
                 "mode='hybrid' above. It is additive dense+BM25-sparse fusion: exact identifiers "
-                "(e.g. 'A2S32', 'phase_c1_lora_safe', 'hyp:7f62cfb4') are matched verbatim by the BM25 "
+                "(e.g. 'Q7X42', 'phase_x1_adapter_safe', 'hyp:1a2b3c4d') are matched verbatim by the BM25 "
                 "channel, which dense embeddings alone can miss. Check `hybrid.identifier_matches` first "
                 "when the question names a specific code/id; `hybrid.fused_chunks` is the general "
                 "alpha-weighted dense+sparse ranking (alpha via HARS_MEMORY_HYBRID_ALPHA, measured optimum "
@@ -3490,7 +3529,7 @@ async def list_tools() -> list[Tool]:
                 "title": {"type": "string", "description": "Short kebab-case slug for the note filename."},
                 "content": {"type": "string", "description": "The knowledge itself — self-contained markdown prose."},
                 "importance": {"type": "string", "enum": ["critical", "normal", "low"], "default": "normal"},
-                "tags": {"type": "array", "items": {"type": "string"}, "description": "Topic tags, e.g. ['vea','b1','rocm']."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Topic tags, e.g. ['vma','b1','rocm']."},
             },
             ["title", "content"],
         ),

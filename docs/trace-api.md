@@ -26,7 +26,7 @@ into `{"ok": true, "trace_id": ..., "events": [{"event": ..., "data": ...}]}`
 ### Transport — why a sibling port, not `/mcp`
 
 The service is a **stdio MCP server** wrapped by **supergateway**
-(`--stateful`, `10.66.66.99:8099/mcp`). supergateway is a Node process and
+(`--stateful`, `127.0.0.1:8099/mcp`). supergateway is a Node process and
 exposes no hook to add an extra HTTP route, so the draft's `GET /mcp/trace`
 cannot be hosted there. Instead the MCP process itself starts a small
 **read-only HTTP/1.1 + SSE listener** on a sibling port, on the **same event
@@ -41,7 +41,7 @@ in the stdio server would be a silent failure mode after `uv run` prunes extras.
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `HARS_MEMORY_TRACE_HTTP_PORT` | `8098` | Listener port. `0` or empty disables the listener entirely. |
-| `HARS_MEMORY_TRACE_HTTP_HOST` | `HARS_MEMORY_MCP_BIND_HOST`, else `127.0.0.1` | Bind address. In the systemd service `HARS_MEMORY_MCP_BIND_HOST=10.66.66.99`, so the trace endpoint is WireGuard-only like the MCP bridge. |
+| `HARS_MEMORY_TRACE_HTTP_HOST` | `HARS_MEMORY_MCP_BIND_HOST`, else `127.0.0.1` | Bind address. In the systemd service `HARS_MEMORY_MCP_BIND_HOST=127.0.0.1`, so the trace endpoint is WireGuard-only like the MCP bridge. |
 | `HARS_MEMORY_TRACE_KEEPALIVE_S` | `10` | `: ping` comment interval (rerank can take 7+ s). |
 | `HARS_MEMORY_TRACE_HITS_CAP` | `30` | Rows per `*_hits` event. Payload-size only; the full pool still travels in `result`. |
 
@@ -183,9 +183,9 @@ Notes:
 
 ```bash
 # after restarting hars-longterm-memory-mcp.service
-curl -N 'http://10.66.66.99:8098/trace?question=A2S32%20sidecar%20gate&ll_keywords=A2S32&top_k=3'
-curl -s 'http://10.66.66.99:8098/healthz'
-HARS_MEMORY_TRACE_URL=http://10.66.66.99:8098/trace uv run pytest -q tests/test_trace_endpoint.py::TestLiveTraceEndpoint
+curl -N 'http://127.0.0.1:8098/trace?question=Q7X42%20sidecar%20gate&ll_keywords=Q7X42&top_k=3'
+curl -s 'http://127.0.0.1:8098/healthz'
+HARS_MEMORY_TRACE_URL=http://127.0.0.1:8098/trace uv run pytest -q tests/test_trace_endpoint.py::TestLiveTraceEndpoint
 ```
 
 `memory-travel` v2 client: append events by name into the existing `TravelTrace`

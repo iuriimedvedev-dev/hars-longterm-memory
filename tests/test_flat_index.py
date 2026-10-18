@@ -102,7 +102,7 @@ def _sample_chunks() -> dict[str, dict]:
     return {
         "chunk-1": {"content": "alpha document about gate stabilization.", "file_path": "a.md"},
         "chunk-2": {"content": "beta document about lora training.", "file_path": "b.md"},
-        "chunk-3": {"content": "gamma document about vea native mode.", "file_path": "c.md"},
+        "chunk-3": {"content": "gamma document about vma native mode.", "file_path": "c.md"},
     }
 
 

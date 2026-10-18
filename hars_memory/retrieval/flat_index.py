@@ -103,7 +103,7 @@ anything queries this channel. This module itself takes `cache_dir` as a
 plain parameter (no default, no env var) and does not prescribe a location;
 whatever wires it into the running server should point it at
 persistent storage that survives reboots (e.g. a subdirectory next to
-`/home/angkira/.local/share/hars-graphrag/index_gemma_v4` itself, which is
+`/home/demo/.local/share/hars-graphrag/index_v4` itself, which is
 exactly the kind of location the source `kv_store_text_chunks.json` already
 lives in) — not `/tmp`.
 """

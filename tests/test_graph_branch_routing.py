@@ -56,19 +56,19 @@ class _RecordingRag:
 
 _SAMPLE_CONTEXT = (
     "\nKnowledge Graph Data (Entity):\n\n```json\n"
-    + json.dumps({"entity": "A2S32", "type": "experiment", "description": "gate"})
+    + json.dumps({"entity": "Q7X42", "type": "experiment", "description": "gate"})
     + "\n```\n\nKnowledge Graph Data (Relationship):\n\n```json\n```\n\n"
     "Document Chunks (Each entry has a reference_id refer to the `Reference Document List`):\n\n```json\n"
-    + json.dumps({"reference_id": "1", "content": "[Document: hyp_a2s32.md | Section: gate]\n\nbody"})
+    + json.dumps({"reference_id": "1", "content": "[Document: hyp_q7x42.md | Section: gate]\n\nbody"})
     + "\n```\n\nReference Document List (Each entry starts with a [reference_id] "
-    "that corresponds to entries in the Document Chunks):\n\n```\n[1] hyp_a2s32.md\n```\n\n"
+    "that corresponds to entries in the Document Chunks):\n\n```\n[1] hyp_q7x42.md\n```\n\n"
 )
 
 _FUSED = [
     {
         "chunk_id": "c1",
-        "file_path": "hyp_a2s32.md",
-        "content": "[Document: hyp_a2s32.md | Section: gate]\n\nA2S32 sidecar gate body.",
+        "file_path": "hyp_q7x42.md",
+        "content": "[Document: hyp_q7x42.md | Section: gate]\n\nQ7X42 sidecar gate body.",
         "fused_score": 1.0,
     }
 ]
@@ -113,7 +113,7 @@ class TestGraphBranchRouting:
         data = _recall(
             mod,
             rag,
-            {"question": "q", "ll_keywords": ["A2S32"], "context_only": True},
+            {"question": "q", "ll_keywords": ["Q7X42"], "context_only": True},
         )
         assert rag.calls == ["aquery"]
         assert data["lightrag_mode"] == "mix"
@@ -129,7 +129,7 @@ class TestGraphBranchRouting:
         data = _recall(
             mod,
             rag,
-            {"question": "q", "mode": "naive", "ll_keywords": ["A2S32"], "context_only": True},
+            {"question": "q", "mode": "naive", "ll_keywords": ["Q7X42"], "context_only": True},
         )
         assert rag.calls == []
         assert data["lightrag_mode"] == "skipped"
@@ -153,7 +153,7 @@ class TestGraphBranchRouting:
         })
         _fake_hybrid(mod, list(_FUSED))
         rag = _RecordingRag(_SAMPLE_CONTEXT)
-        data = _recall(mod, rag, {"question": "q", "ll_keywords": ["A2S32"], "context_only": True})
+        data = _recall(mod, rag, {"question": "q", "ll_keywords": ["Q7X42"], "context_only": True})
         assert rag.calls == []
         assert data["lightrag_mode"] == "skipped"
         assert data["graph_branch"]["setting"] == "off"
@@ -246,7 +246,7 @@ class TestGraphBranchTraceHonesty:
         events = [
             event
             async for event in trace.stream_recall_events({
-                "question": "q", "ll_keywords": ["A2S32"], "context_only": True,
+                "question": "q", "ll_keywords": ["Q7X42"], "context_only": True,
             })
         ]
         by_name = {name: payload for name, payload in events}

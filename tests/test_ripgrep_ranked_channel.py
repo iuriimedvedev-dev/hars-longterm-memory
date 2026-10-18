@@ -244,7 +244,7 @@ class TestFailSoftAndTimeout:
             "check_availability",
             lambda: rgc.RipgrepAvailability(available=False, reason="no rg", binary_path=None),
         )
-        result = rgc.search("A2S32", roots=[Path("/tmp")])
+        result = rgc.search("Q7X42", roots=[Path("/tmp")])
         assert result.available is False
         assert result.hits == []
         # ...and the ranked fusion therefore degrades to the plain pool.
@@ -258,12 +258,12 @@ class TestFailSoftAndTimeout:
             "check_availability",
             lambda: rgc.RipgrepAvailability(available=True, reason=None, binary_path="/usr/bin/rg"),
         )
-        (Path(tmp_path) / "f.md").write_text("A2S32 here\n", encoding="utf-8")
+        (Path(tmp_path) / "f.md").write_text("Q7X42 here\n", encoding="utf-8")
 
         def _timeout(cmd, *, timeout_seconds):  # noqa: ANN001
             return "", True
 
         monkeypatch.setattr(rgc, "_run_rg", _timeout)
-        result = rgc.search("A2S32", roots=[Path(tmp_path)])
+        result = rgc.search("Q7X42", roots=[Path(tmp_path)])
         assert result.timed_out is True
         assert result.hits == []

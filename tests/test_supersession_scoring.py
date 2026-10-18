@@ -2,7 +2,7 @@
 into tools/memory/retrieval/fusion.py behind HARS_MEMORY_SUPERSESSION_SCORING.
 
 Regression fixtures below are drawn from real chunk content read directly out
-of the live index (kv_store_text_chunks.json, index_gemma_v4 snapshot
+of the live index (kv_store_text_chunks.json, index_v4 snapshot
 2026-07-12) — see the module docstring of supersession.py for the full
 false-positive investigation these fixtures encode (project_droid_mapping_v3
 and project_b1_sidecar_family_falsified deliberately must NOT trigger the
@@ -141,7 +141,7 @@ class TestMarkerPenalty:
             "[Document: project_b1_sidecar_family_falsified.md | Section: memory | Date: unknown]\n\n"
             "---\n"
             "name: b1-sidecar-family-falsified\n"
-            "description: Layer-24 gated-residual VEA sidecar runtime-falsified 2026-07-09\n"
+            "description: Layer-24 gated-residual VMA sidecar runtime-falsified 2026-07-09\n"
             "---\n"
             "As of 2026-07-09, the B1/A2.5 gated-residual sidecar family is falsified at runtime."
         )

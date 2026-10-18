@@ -113,7 +113,7 @@ TOOL_VERSION: Final[str] = "1.0.0"
 # LightRAG graph-index artifacts — presence of EITHER means index_dir is a
 # live GraphRAG index, not a corpus-build target. Matches the exact filenames
 # server/index.py's LightRAG instance writes (verified against the deployed
-# index at /home/angkira/.local/share/hars-graphrag/index_gemma_v4).
+# index at /home/demo/.local/share/hars-graphrag/index_v4).
 _LIGHTRAG_GRAPH_ARTIFACT_FILENAMES: Final[tuple[str, ...]] = (
     "graph_chunk_entity_relation.graphml",
     "kv_store_full_entities.json",

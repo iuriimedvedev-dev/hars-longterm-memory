@@ -16,7 +16,7 @@ WHY tuned convex combination (`score = alpha*dense + (1-alpha)*sparse`), not RRF
 RRF is attractive because it needs no score normalization, but that is also
 its weakness here: it throws away exactly the magnitude information that lets
 a channel "win" decisively when it is confident (e.g. BM25 finding an exact
-`A2S32` match) rather than being diluted by rank alone.
+`Q7X42` match) rather than being diluted by rank alone.
 
 WHY min-max normalization (not z-score, not a fixed global scale):
 

@@ -1,7 +1,7 @@
 # LightRAG version pin (`lightrag-hku`) — the index-cutover blocker
 
 Status: **migrated and landed 2026-10-17** (channel-hygiene + index-cutover audit).
-Applies to the serving venv (`/home/angkira/Project/software/hars-longterm-memory/.venv`).
+Applies to the serving venv (`/home/demo/Project/software/hars-longterm-memory/.venv`).
 
 ## Decision
 
@@ -27,7 +27,7 @@ the exact call `JsonDocStatusStorage` makes):
 | Specimen | Rows | Status values | 1.4.16-constructible | Failure |
 | --- | ---: | --- | ---: | --- |
 | `index_full_mdstruct_20261014` (new, 1.5.7 Colab build) | 1340 | `processed 958, failed 290, pending 17, **parsing 75**` | 290 / 1340 | `TypeError: unexpected keyword argument 'content_hash'` on **1050** rows |
-| `index_compact_20260903_imported` (live) | 3158 | `processed 1604, failed 1554` | 2769 / 3158 | `content_hash` on **389** rows |
+| `index_compact` (live) | 3158 | `processed 1604, failed 1554` | 2769 / 3158 | `content_hash` on **389** rows |
 
 1.5.x `DocProcessingStatus` gained `content_hash` (`lightrag/base.py`); 1.4.16
 has no such field. 1.5.x `DocStatus` also added the enum values `parsing` and
@@ -160,7 +160,7 @@ CI stays green; override the location with
 ## Upgrade procedure (serving venv → 1.5.7) — DONE
 
 ```bash
-cd /home/angkira/Project/software/hars-longterm-memory
+cd /home/demo/Project/software/hars-longterm-memory
 cp pyproject.toml /tmp/pyproject.toml.bak && cp uv.lock /tmp/uv.lock.bak
 # import migration landed (chunker.py, md_structure.py, extractor_bench.py)
 $EDITOR pyproject.toml     # "lightrag-hku==1.5.7"
@@ -177,7 +177,7 @@ its **next restart** — no service restart is performed by this migration.
 ## Rollback procedure (back to 1.4.16)
 
 ```bash
-cd /home/angkira/Project/software/hars-longterm-memory
+cd /home/demo/Project/software/hars-longterm-memory
 cp /tmp/pyproject.toml.bak pyproject.toml
 cp /tmp/uv.lock.bak uv.lock
 uv lock && uv sync --all-extras --all-groups

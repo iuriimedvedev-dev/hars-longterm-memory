@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hars-longterm-memory"
-version = "0.7.0"
+version = "0.7.1"
 description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
 requires-python = ">=3.13"
 readme = "README.md"
@@ -122,7 +122,21 @@ hars-longterm-memory-grpc = "hars_memory.grpc.server:main"
 
 [tool.hatch.build.targets.sdist]
 # local working notes and experiment data must never ship in the source archive
-exclude = [".session", ".plans", "experiments", "docs/research"]
+# 0.7.1 sanitization: operator scripts, agent-instruction files and internal-ops
+# docs never belonged in the published source archive (they carried internal
+# hosts, index directory names and deployment paths).
+#  - cortex-scripts/: host-local operational scripts (consolidation, KB refresh)
+#  - AGENTS.md / CLAUDE.md / .claude/ / .junie/: coding-agent instructions
+#  - docs/OPERATIONS_HANDOFF.md / SWAP_CHECKLIST.md / VERSION_PIN.md: internal ops
+#  - verification_*: one-off local verification notes
+exclude = [
+  ".session", ".plans", "experiments", "docs/research",
+  "cortex-scripts",
+  ".claude", ".junie",
+  "AGENTS.md", "CLAUDE.md",
+  "docs/OPERATIONS_HANDOFF.md", "docs/SWAP_CHECKLIST.md", "docs/VERSION_PIN.md",
+  "verification_results.md", "verification_summary_short.txt",
+]
 
 [tool.hatch.build.targets.wheel]
 # This is an application, not a library.  Packages are declared explicitly to

@@ -24,7 +24,7 @@ Usage
 -----
     # Forward: JSON -> Qdrant (all three namespaces)
     uv run --project tools/memory python tools/memory/scripts/qdrant_transplant.py \\
-        --working-dir /home/angkira/.local/share/hars-graphrag/index_gemma_v4 \\
+        --working-dir /home/demo/.local/share/hars-graphrag/index_v4 \\
         --qdrant-url http://localhost:6335 \\
         --workspace hars_longterm_memory \\
         --collection-prefix hars_longterm_memory

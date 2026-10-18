@@ -1,5 +1,5 @@
 {
-  "index_dir": "/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported",
+  "index_dir": "/home/demo/.local/share/hars-graphrag/index_compact",
   "model_path": "hars_memory/ranking/artifacts/ranker.json",
   "ranker_loaded": true,
   "top_k": 10,

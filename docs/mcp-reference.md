@@ -60,12 +60,12 @@ candidate ranking, with the LightRAG graph pass as an independent second branch.
         "section": "## GKE Ingress"
       }
     ],
-    "identifier_matches": ["A2S32", "hyp:abc"],
+    "identifier_matches": ["Q7X42", "hyp:abc"],
     "ripgrep": {
       "enabled": true,
       "available": true,
       "hits_count": 3,
-      "query_terms": ["A2S32"]
+      "query_terms": ["Q7X42"]
     },
     "confidence": {
       "low_confidence": false
@@ -155,7 +155,7 @@ run. No LLM, no GPU — instant file write.
 | `title` | `string` | **required** | Short kebab-case slug for the note filename |
 | `content` | `string` | **required** | The knowledge itself — self-contained markdown prose |
 | `importance` | `enum` | `normal` | `critical`, `normal`, or `low` |
-| `tags` | `string[]` | `[]` | Topic tags, e.g. `['vea', 'b1', 'rocm']` |
+| `tags` | `string[]` | `[]` | Topic tags, e.g. `['vma', 'b1', 'rocm']` |
 
 ### Response shape
 

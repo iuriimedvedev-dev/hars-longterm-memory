@@ -90,9 +90,9 @@ CANONICAL_RELATIONS: frozenset[str] = frozenset(
 )
 
 DEFAULT_GOLD = Path("eval_agentic-data/relational_gold.yaml")
-DEFAULT_INDEX_DIR = Path("/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported")
-DEFAULT_TRACE_URL = "http://10.66.66.99:8098/trace"
-DEFAULT_MCP_URL = "http://10.66.66.99:8099/mcp"
+DEFAULT_INDEX_DIR = Path("/home/demo/.local/share/hars-graphrag/index_compact")
+DEFAULT_TRACE_URL = "http://127.0.0.1:8098/trace"
+DEFAULT_MCP_URL = "http://127.0.0.1:8099/mcp"
 
 # Fallback relation labels are stripped so a graph-expand pair can be matched
 # against the gold pair regardless of which surface form the extractor stored.

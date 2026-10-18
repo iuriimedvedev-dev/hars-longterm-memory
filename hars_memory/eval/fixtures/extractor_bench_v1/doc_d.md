@@ -3,14 +3,14 @@
 ## Цель
 Политика захвата, обобщающаяся на **незнакомые сцены**: обучена на DROID (1345 сегментов / 1236 эпизодов: front+wrist кадры + hindsight-метки grasp-point), объект выбирается собственными камерами робота, проверка — closed-loop в sim. Источник правды: `.plans/STATE_grasp.md`.
 
-## Схема архитектуры (линия Action Experts из HARS-спеки, НЕ VEA)
+## Схема архитектуры (линия Action Experts из HARS-спеки, НЕ VMA)
 
 ```
 DROID кадры (front+wrist MP4)            sim rollout'ы (scripted teacher)
         │                                          │
         ▼                                          ▼
 Realtime энкодеры (живут в рантайме на GPU, с диска не читаются):
-  DINOv3-large-336 : 441 патч-токен x 1024, front + wrist
+  VisionX3-large-336 : 441 патч-токен x 1024, front + wrist
   Depth-Anything-3 : 1369 токенов x 1536, front + wrist
         │
         ▼
@@ -31,7 +31,7 @@ Backbone latent + LoRA-эксперт (per-skill DiT, flow matching, chunk horiz
 
 Что это НЕ такое:
 - **Pack** (pos_base/lift/pose + proprio) — замороженный вход бейзлайна S34a (MLP **без** внимания). Именно его слепота и лечится.
-- **VEA abstractor** (queries поверх энкодеров для VLM) — другая линия, здесь не используется.
+- **VMA abstractor** (queries поверх энкодеров для VLM) — другая линия, здесь не используется.
 
 ## Бейзлайн S34a (точка отсчёта)
 - select 31/38, dev3 81/100, NOISE-1 80/100 на свежих сидах (шум калиброван: различия ≤3 эпизодов на n=40 **неразличимы**)
@@ -46,7 +46,7 @@ Backbone latent + LoRA-эксперт (per-skill DiT, flow matching, chunk horiz
 5. **A-REL** (убрать абсолютный TCP): G2c 0.64/0.08, хуже базы — фальсифицировано. Студент игнорирует пак не из-за proprio
 
 ## Сейчас и дальше
-- ~~**RUNNING**~~ CORRECTED 2026-10-13 (metareview): FAILED (ENOSPC at build_grasp_visual_tokens.py:511; 106 segments written; 1.34 TiB projected); abandoned by user decision and replaced by live DINOv3+DA3 tokens. Job id here (`ff7aec`) differs from the handoff's (`b779ae`); the registry could not resolve either. Stale entry: токен-кэш 1345 сегментов (HARS job `ff7aec`, монитор стоит, ~4.6 ч)
+- ~~**RUNNING**~~ CORRECTED 2026-10-13 (metareview): FAILED (ENOSPC at build_grasp_visual_tokens.py:511; 106 segments written; 1.34 TiB projected); abandoned by user decision and replaced by live VisionX3+DA3 tokens. Job id here (`ff7aec`) differs from the handoff's (`b779ae`); the registry could not resolve either. Stale entry: токен-кэш 1345 сегментов (HARS job `ff7aec`, монитор стоит, ~4.6 ч)
 - **NEXT**: smoke `cond_mlp` (slots=16 legacy) → чтение G2c. CORRECTED 2026-10-13 (metareview): the smoke must run on live tokens; the disk cache is abandoned. Сдвинул к гейту — открываем сетку slots {16,32} × arch {legacy,v2} × heads {4,8}
 - **Критерий победы** (пререгистрирован, STATE ATTN-GRASP): G2c PASS → select ≥26/38 → dev4 ≥27/40 → подтверждение n=100
 - **Правила**: запуски только через HARS API, один GPU-джоб, свежие output_dir, sealed `12980000-99` не трогать, одна переменная на арм

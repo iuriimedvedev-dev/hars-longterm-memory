@@ -671,7 +671,7 @@ class TestMemoryConsolidateGpuGuard:
         if raises:
             body = (
                 "def assert_gpu_free(api_base_url):\n"
-                "    raise RuntimeError('GPU is busy: workflow vea is running')\n"
+                "    raise RuntimeError('GPU is busy: workflow vma is running')\n"
             )
         else:
             body = "def assert_gpu_free(api_base_url):\n    return None\n"
@@ -841,7 +841,7 @@ class TestEmbedderIndexValidation:
         default embedder. Skips if the index isn't mounted in this environment."""
         from hars_memory.server.embedder import resolve_index_embedding_dim
 
-        real_index_dir = Path("/home/angkira/.local/share/hars-graphrag/index_gemma_v4")
+        real_index_dir = Path("/home/demo/.local/share/hars-graphrag/index_v4")
         if not (real_index_dir / "vdb_chunks.json").is_file():
             pytest.skip("real index not mounted in this environment")
         assert resolve_index_embedding_dim(str(real_index_dir)) == 768
@@ -1182,7 +1182,7 @@ class TestGraphmlNamespaceFix:
         """
         import shutil
 
-        real_index_dir = Path("/home/angkira/.local/share/hars-graphrag/index_gemma_v4")
+        real_index_dir = Path("/home/demo/.local/share/hars-graphrag/index_v4")
         real_graph_file = real_index_dir / "graph_chunk_entity_relation.graphml"
         if not real_graph_file.exists():
             pytest.skip("real production index not present on this machine")
@@ -1337,10 +1337,10 @@ class TestEntityMatching:
 
     def test_exact_match_ranks_above_substring_match(self) -> None:
         mod = _load_mcp_module_with_env({})
-        query_norm = mod._normalize_entity_text("vea_native")  # type: ignore[attr-defined]
+        query_norm = mod._normalize_entity_text("vma_native")  # type: ignore[attr-defined]
         tokens = query_norm.split(" ")
-        exact_tier = mod._entity_match_tier(query_norm, tokens, "vea_native", "")  # type: ignore[attr-defined]
-        substring_tier = mod._entity_match_tier(query_norm, tokens, "Qwen3.5 vea_native", "")  # type: ignore[attr-defined]
+        exact_tier = mod._entity_match_tier(query_norm, tokens, "vma_native", "")  # type: ignore[attr-defined]
+        substring_tier = mod._entity_match_tier(query_norm, tokens, "Qwen3.5 vma_native", "")  # type: ignore[attr-defined]
         assert mod._MATCH_TIER_RANK[exact_tier] < mod._MATCH_TIER_RANK[substring_tier]  # type: ignore[attr-defined]
 
     def test_alias_expansion_covers_known_duplicate_family(self) -> None:
@@ -1561,16 +1561,16 @@ class TestHybridRetrievalWiring:
 
         chunks = {
             "chunk-1": {
-                "content": "Experiment A2S32 stabilized the sidecar gate at step 80.",
-                "file_path": "hyp_a2s32.md",
+                "content": "Experiment Q7X42 stabilized the sidecar gate at step 80.",
+                "file_path": "hyp_q7x42.md",
             },
             "chunk-2": {
-                "content": "phase_c1_lora_safe ran for 3000 steps without drift.",
-                "file_path": "exp_phase_c1_lora_safe.md",
+                "content": "phase_x1_adapter_safe ran for 3000 steps without drift.",
+                "file_path": "exp_phase_x1_adapter_safe.md",
             },
             "chunk-3": {
-                "content": "vea_native mode encodes video tokens at runtime, not via zarr.",
-                "file_path": "feedback_vea_native.md",
+                "content": "vma_native mode encodes video tokens at runtime, not via zarr.",
+                "file_path": "feedback_vma_native.md",
             },
         }
         (working_dir / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
@@ -1584,7 +1584,7 @@ class TestHybridRetrievalWiring:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
             "HARS_MEMORY_HYBRID_ENABLED": "0",
         })
-        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "A2S32", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "Q7X42", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is False
         assert "HARS_MEMORY_HYBRID_ENABLED" in result["reason"]
 
@@ -1596,7 +1596,7 @@ class TestHybridRetrievalWiring:
             "HARS_MEMORY_INDEX_DIR": str(tmp_path),
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
-        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "A2S32", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "Q7X42", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is False
         assert "reason" in result
 
@@ -1615,14 +1615,14 @@ class TestHybridRetrievalWiring:
         fake_rag = _FakeRag([
             {"id": "chunk-3", "distance": 0.9, "content": "unrelated dense winner", "file_path": "x.md"},
         ])
-        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "Tell me about A2S32", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "Tell me about Q7X42", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is True
         assert result["identifier_query_detected"] is True
-        assert "A2S32" in result["identifiers"]
+        assert "Q7X42" in result["identifiers"]
         matches = result["identifier_matches"]
         assert matches is not None and len(matches) >= 1
         assert matches[0]["chunk_id"] == "chunk-1"
-        assert "A2S32" in matches[0]["snippet"]
+        assert "Q7X42" in matches[0]["snippet"]
 
     def test_fused_chunks_respects_top_k(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1650,9 +1650,9 @@ class TestHybridRetrievalWiring:
         # happens.
         monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "0")
         fake_rag = _FakeRag([
-            {"id": "chunk-2", "distance": 0.8, "content": "phase_c1_lora_safe ran", "file_path": "exp.md"},
+            {"id": "chunk-2", "distance": 0.8, "content": "phase_x1_adapter_safe ran", "file_path": "exp.md"},
         ])
-        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "phase_c1_lora_safe status", 1))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "phase_x1_adapter_safe status", 1))  # type: ignore[attr-defined]
         assert result["enabled"] is True
         assert len(result["fused_chunks"]) <= 1
 
@@ -1690,7 +1690,7 @@ class TestHybridRetrievalWiring:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
         monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "0")
-        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "A2S32 status", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "Q7X42 status", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is True  # the overall hybrid block is unaffected
         assert result["ripgrep"]["enabled"] is False
         assert "HARS_MEMORY_RIPGREP_CHANNEL" in result["ripgrep"]["reason"]
@@ -1736,19 +1736,19 @@ class TestHybridRetrievalWiring:
             return _FakeRgResult(
                 hits=[_FakeRgHit(
                     chunk_id="file:deadbeef0000", score=4.0,
-                    content="A2S32 mentioned in a file the index has never seen.",
+                    content="Q7X42 mentioned in a file the index has never seen.",
                     file_path="/repo/.session/2026-07-30_freshness_example.md",
                 )],
-                query_terms=("A2S32",),
+                query_terms=("Q7X42",),
             )
 
         from hars_memory.retrieval import ripgrep_channel
         monkeypatch.setattr(ripgrep_channel, "search", _fake_search)
 
         fake_rag = _FakeRag([
-            {"id": "chunk-1", "distance": 0.9, "content": "on-topic", "file_path": "hyp_a2s32.md"},
+            {"id": "chunk-1", "distance": 0.9, "content": "on-topic", "file_path": "hyp_q7x42.md"},
         ])
-        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "A2S32 status", 1))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "Q7X42 status", 1))  # type: ignore[attr-defined]
 
         assert result["ripgrep"]["enabled"] is True
         assert result["ripgrep"]["hits_count"] == 1
@@ -1758,7 +1758,7 @@ class TestHybridRetrievalWiring:
         chunks = result["fused_chunks"]
         # top_k=1 real slot, plus the injected off-index hit appended after it.
         assert len(chunks) == 2
-        assert chunks[0]["file_path"] == "hyp_a2s32.md"  # the real, already-indexed hit, unmoved
+        assert chunks[0]["file_path"] == "hyp_q7x42.md"  # the real, already-indexed hit, unmoved
         assert chunks[1]["chunk_id"] == "ripgrep:2026-07-30_freshness_example.md"
         assert chunks[1]["file_path"] == "/repo/.session/2026-07-30_freshness_example.md"
 
@@ -1785,12 +1785,12 @@ class TestHybridRetrievalWiring:
             timed_out: bool = False
 
         def _fake_search(question, *, roots, top_k, **kwargs):
-            return _FakeRgResult(hits=[], query_terms=("A2S32",))
+            return _FakeRgResult(hits=[], query_terms=("Q7X42",))
 
         from hars_memory.retrieval import ripgrep_channel
         monkeypatch.setattr(ripgrep_channel, "search", _fake_search)
 
-        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "A2S32 status", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(_FakeRag([]), "Q7X42 status", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is True
         assert result["ripgrep"]["enabled"] is True
         assert result["ripgrep"]["available"] is False
@@ -2083,7 +2083,7 @@ class TestNoAnswerConfidenceMarker:
         import json
 
         chunks = {
-            "chunk-1": {"content": "Experiment A2S32 stabilized the sidecar gate.", "file_path": "hyp_a2s32.md"},
+            "chunk-1": {"content": "Experiment Q7X42 stabilized the sidecar gate.", "file_path": "hyp_q7x42.md"},
         }
         (working_dir / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
 
@@ -2096,9 +2096,9 @@ class TestNoAnswerConfidenceMarker:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
         fake_rag = _FakeRag([
-            {"id": "chunk-1", "distance": 0.9, "content": "on-topic", "file_path": "hyp_a2s32.md"},
+            {"id": "chunk-1", "distance": 0.9, "content": "on-topic", "file_path": "hyp_q7x42.md"},
         ])
-        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "A2S32 status", 10))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(fake_rag, "Q7X42 status", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is True
         assert result["confidence"]["top_dense_score"] == 0.9
         assert result["confidence"]["low_confidence"] is False
@@ -2113,7 +2113,7 @@ class TestNoAnswerConfidenceMarker:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
         fake_rag = _FakeRag([
-            {"id": "chunk-1", "distance": 0.25, "content": "barely related", "file_path": "hyp_a2s32.md"},
+            {"id": "chunk-1", "distance": 0.25, "content": "barely related", "file_path": "hyp_q7x42.md"},
         ])
         result = asyncio.run(mod._compute_hybrid_block(fake_rag, "unrelated question", 10))  # type: ignore[attr-defined]
         assert result["enabled"] is True
@@ -2143,7 +2143,7 @@ class TestNoAnswerConfidenceMarker:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
         fake_rag = _FakeRag([
-            {"id": "chunk-1", "distance": mod.NO_ANSWER_DENSE_SCORE_THRESHOLD, "content": "x", "file_path": "hyp_a2s32.md"},
+            {"id": "chunk-1", "distance": mod.NO_ANSWER_DENSE_SCORE_THRESHOLD, "content": "x", "file_path": "hyp_q7x42.md"},
         ])
         result = asyncio.run(mod._compute_hybrid_block(fake_rag, "q", 10))  # type: ignore[attr-defined]
         assert result["confidence"]["low_confidence"] is False
@@ -2180,7 +2180,7 @@ def _write_fetch_knob_chunks(working_dir: Path) -> None:
     import json
 
     chunks = {
-        f"chunk-{i}": {"content": f"phase_c1_lora_safe note number {i}", "file_path": f"note{i}.md"}
+        f"chunk-{i}": {"content": f"phase_x1_adapter_safe note number {i}", "file_path": f"note{i}.md"}
         for i in range(1, 6)
     }
     (working_dir / "kv_store_text_chunks.json").write_text(json.dumps(chunks), encoding="utf-8")
@@ -2233,7 +2233,7 @@ class TestFetchTopKHybridPoolWiring:
             "HARS_MEMORY_BM25_CACHE_DIR": str(tmp_path / "bm25_cache"),
         })
         rag = _CapturingRag([{"id": "chunk-1", "distance": 0.9, "content": "x", "file_path": "note1.md"}])
-        result = asyncio.run(mod._compute_hybrid_block(rag, "phase_c1_lora_safe", 5))  # type: ignore[attr-defined]
+        result = asyncio.run(mod._compute_hybrid_block(rag, "phase_x1_adapter_safe", 5))  # type: ignore[attr-defined]
         assert result["candidate_pool_size"] == 5 * mod.HYBRID_CANDIDATE_POOL_MULTIPLIER
         assert result["fetch_top_k"] == 5
         assert rag.chunks_vdb.calls == [5 * mod.HYBRID_CANDIDATE_POOL_MULTIPLIER]
@@ -2255,7 +2255,7 @@ class TestFetchTopKHybridPoolWiring:
         })
         rag = _CapturingRag([{"id": "chunk-1", "distance": 0.9, "content": "x", "file_path": "note1.md"}])
         result = asyncio.run(
-            mod._compute_hybrid_block(rag, "phase_c1_lora_safe", 5, fetch_top_k=40)  # type: ignore[attr-defined]
+            mod._compute_hybrid_block(rag, "phase_x1_adapter_safe", 5, fetch_top_k=40)  # type: ignore[attr-defined]
         )
         assert result["fetch_top_k"] == 40
         assert result["candidate_pool_size"] == 40 * mod.HYBRID_CANDIDATE_POOL_MULTIPLIER

@@ -1,7 +1,7 @@
 """Unit tests for tools/memory/retrieval/ripgrep_channel.py.
 
 GPU-free, no LLM calls, no network, and — per this session's constraints —
-never touches `/home/angkira/.local/share/hars-graphrag/index_gemma_v4`
+never touches `/home/demo/.local/share/hars-graphrag/index_v4`
 (the live, actively-mutating LightRAG index): every test here either runs
 `rg` against synthetic `tmp_path` fixtures or, for the availability-gating
 tests, monkeypatches `shutil.which`/PATH rather than depending on whether
@@ -38,16 +38,16 @@ class TestExtractTerms:
 
     def test_extracts_identifiers_from_question(self) -> None:
         terms = extract_terms(
-            "What happened in phase_c1_lora_safe and does A2S32 relate to vea_native?"
+            "What happened in phase_x1_adapter_safe and does Q7X42 relate to vma_native?"
         )
-        assert terms == ["phase_c1_lora_safe", "A2S32", "vea_native"]
+        assert terms == ["phase_x1_adapter_safe", "Q7X42", "vma_native"]
 
     def test_plain_question_yields_no_terms(self) -> None:
         assert extract_terms("How is training going in general?") == []
 
     def test_ll_keywords_contribute_identifier_shaped_terms(self) -> None:
-        terms = extract_terms("How is training going?", ll_keywords=["A2S32"])
-        assert terms == ["A2S32"]
+        terms = extract_terms("How is training going?", ll_keywords=["Q7X42"])
+        assert terms == ["Q7X42"]
 
     def test_ll_keywords_plain_words_are_rejected(self) -> None:
         # A plain-English keyword must not sneak a noisy substring search in
@@ -58,9 +58,9 @@ class TestExtractTerms:
 
     def test_question_and_keywords_are_merged_and_deduped(self) -> None:
         terms = extract_terms(
-            "What about A2S32?", ll_keywords=["a2s32", "phase_c1_lora_safe"]
+            "What about Q7X42?", ll_keywords=["q7x42", "phase_x1_adapter_safe"]
         )
-        assert terms == ["A2S32", "phase_c1_lora_safe"]
+        assert terms == ["Q7X42", "phase_x1_adapter_safe"]
 
     def test_empty_question_no_keywords_yields_no_terms(self) -> None:
         assert extract_terms("") == []
@@ -89,8 +89,8 @@ class TestExtractTerms:
         # docstring), so when the combined list would exceed MAX_QUERY_TERMS,
         # the question's own identifier must never be the one truncated away.
         many_keywords = [f"identifier_{i}" for i in range(rgc.MAX_QUERY_TERMS + 5)]
-        terms = extract_terms("What about A2S32?", ll_keywords=many_keywords)
-        assert terms[0] == "A2S32"
+        terms = extract_terms("What about Q7X42?", ll_keywords=many_keywords)
+        assert terms[0] == "Q7X42"
         assert len(terms) == rgc.MAX_QUERY_TERMS
 
 
@@ -115,29 +115,29 @@ class TestAvailabilityFailSoft:
     def test_search_returns_unavailable_result_not_exception(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _write(tmp_path / "note.md", "Contains A2S32 somewhere.\n")
+        _write(tmp_path / "note.md", "Contains Q7X42 somewhere.\n")
         monkeypatch.setattr(rgc.shutil, "which", lambda _name: None)
 
-        result = search("What about A2S32?", roots=[tmp_path])
+        result = search("What about Q7X42?", roots=[tmp_path])
 
         assert result.available is False
         assert result.hits == []
         assert result.unavailable_reason is not None
-        assert result.query_terms == ("A2S32",)
+        assert result.query_terms == ("Q7X42",)
 
     def test_search_never_raises_on_binary_vanishing_mid_call(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Simulate the race: available at check_availability() time, but the
         # exec itself raises FileNotFoundError.
-        _write(tmp_path / "note.md", "A2S32 mentioned here.\n")
+        _write(tmp_path / "note.md", "Q7X42 mentioned here.\n")
 
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise FileNotFoundError("rg vanished")
 
         monkeypatch.setattr(rgc.subprocess, "run", _boom)
 
-        result = search("What about A2S32?", roots=[tmp_path])
+        result = search("What about Q7X42?", roots=[tmp_path])
 
         assert result.available is True  # binary WAS found at the gate check
         assert result.hits == []
@@ -195,13 +195,13 @@ class TestSearchAgainstSyntheticTree:
     def _corpus(self, tmp_path: Path) -> Path:
         _write(
             tmp_path / ".reports" / "report_a.md",
-            "# Report A\n\nExperiment A2S32 stabilized the gate at step 80.\n"
-            "A2S32 also appears again here for emphasis.\n",
+            "# Report A\n\nExperiment Q7X42 stabilized the gate at step 80.\n"
+            "Q7X42 also appears again here for emphasis.\n",
         )
         _write(
             tmp_path / ".session" / "session_b.md",
-            "# Session B\n\nWe discussed phase_c1_lora_safe briefly, "
-            "no relation to a2s32-suffix tokens.\n",
+            "# Session B\n\nWe discussed phase_x1_adapter_safe briefly, "
+            "no relation to q7x42-suffix tokens.\n",
         )
         _write(
             tmp_path / "docs" / "guide.md",
@@ -211,23 +211,23 @@ class TestSearchAgainstSyntheticTree:
 
     def test_finds_whole_token_identifier_hit(self, tmp_path: Path) -> None:
         corpus = self._corpus(tmp_path)
-        result = search("What happened with A2S32?", roots=[corpus], top_k=5)
+        result = search("What happened with Q7X42?", roots=[corpus], top_k=5)
 
         assert result.available is True
-        assert result.hits, "expected at least one hit for A2S32"
+        assert result.hits, "expected at least one hit for Q7X42"
         top = result.hits[0]
         assert top.file_path.endswith("report_a.md")
-        assert top.term_hits.get("A2S32", 0) >= 2
+        assert top.term_hits.get("Q7X42", 0) >= 2
 
     def test_substring_hit_scores_lower_than_whole_token_hit(self, tmp_path: Path) -> None:
         corpus = self._corpus(tmp_path)
-        result = search("Anything about A2S32?", roots=[corpus], top_k=10)
+        result = search("Anything about Q7X42?", roots=[corpus], top_k=10)
 
         by_file = {Path(h.file_path).name: h for h in result.hits}
         assert "report_a.md" in by_file
         assert "session_b.md" in by_file
-        # report_a.md has two WHOLE-TOKEN "A2S32" hits; session_b.md has one
-        # SUBSTRING hit ("a2s32-suffix"). Whole-token must outrank substring.
+        # report_a.md has two WHOLE-TOKEN "Q7X42" hits; session_b.md has one
+        # SUBSTRING hit ("q7x42-suffix"). Whole-token must outrank substring.
         assert by_file["report_a.md"].score > by_file["session_b.md"].score
 
     def test_no_match_returns_empty_hits_not_error(self, tmp_path: Path) -> None:
@@ -238,7 +238,7 @@ class TestSearchAgainstSyntheticTree:
 
     def test_result_hit_shape_mirrors_bm25_hit_fields(self, tmp_path: Path) -> None:
         corpus = self._corpus(tmp_path)
-        result = search("What happened with A2S32?", roots=[corpus], top_k=5)
+        result = search("What happened with Q7X42?", roots=[corpus], top_k=5)
         assert result.hits
         hit = result.hits[0]
         assert isinstance(hit, RipgrepSearchHit)
@@ -260,58 +260,58 @@ class TestSearchAgainstSyntheticTree:
 
         monkeypatch.setattr(rgc.subprocess, "run", _timeout)
 
-        result = search("What happened with A2S32?", roots=[corpus], timeout_seconds=0.001)
+        result = search("What happened with Q7X42?", roots=[corpus], timeout_seconds=0.001)
         assert result.hits == []
         assert result.timed_out is True
 
     def test_co_occurrence_of_multiple_terms_boosts_score(self, tmp_path: Path) -> None:
         _write(
             tmp_path / "single.md",
-            "A2S32 appears once here, nothing else related.\n",
+            "Q7X42 appears once here, nothing else related.\n",
         )
         _write(
             tmp_path / "both.md",
-            "A2S32 and vea_native both appear together in this note.\n",
+            "Q7X42 and vma_native both appear together in this note.\n",
         )
         result = search(
-            "How do A2S32 and vea_native relate?", roots=[tmp_path], top_k=5
+            "How do Q7X42 and vma_native relate?", roots=[tmp_path], top_k=5
         )
         by_name = {Path(h.file_path).name: h for h in result.hits}
         assert by_name["both.md"].score > by_name["single.md"].score
 
     def test_ignores_memoryignore_excluded_files(self, tmp_path: Path) -> None:
-        _write(tmp_path / "keep.md", "A2S32 lives here.\n")
-        _write(tmp_path / "secret_a2s32.md", "A2S32 also lives here, but secretly.\n")
+        _write(tmp_path / "keep.md", "Q7X42 lives here.\n")
+        _write(tmp_path / "secret_q7x42.md", "Q7X42 also lives here, but secretly.\n")
         _write(tmp_path / ".memoryignore", "secret_*\n")
 
-        result = search("What about A2S32?", roots=[tmp_path], top_k=10)
+        result = search("What about Q7X42?", roots=[tmp_path], top_k=10)
 
         matched_names = {Path(h.file_path).name for h in result.hits}
         assert "keep.md" in matched_names
-        assert "secret_a2s32.md" not in matched_names
+        assert "secret_q7x42.md" not in matched_names
 
     def test_legacy_graphragignore_warns_and_is_not_applied(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        _write(tmp_path / "keep.md", "A2S32 lives here.\n")
-        _write(tmp_path / "secret_a2s32.md", "A2S32 also lives here.\n")
+        _write(tmp_path / "keep.md", "Q7X42 lives here.\n")
+        _write(tmp_path / "secret_q7x42.md", "Q7X42 also lives here.\n")
         _write(tmp_path / ".graphragignore", "secret_*\n")
 
         with caplog.at_level("WARNING"):
-            result = search("What about A2S32?", roots=[tmp_path], top_k=10)
+            result = search("What about Q7X42?", roots=[tmp_path], top_k=10)
 
         matched_names = {Path(h.file_path).name for h in result.hits}
         # Legacy ignore file's pattern is NOT applied -> the "secret" file is
         # still found (loud warning, not a silent exclusion).
-        assert "secret_a2s32.md" in matched_names
+        assert "secret_q7x42.md" in matched_names
         assert any("legacy" in record.message.lower() for record in caplog.records)
 
     def test_excludes_venv_and_outputs_directories(self, tmp_path: Path) -> None:
-        _write(tmp_path / "real.md", "A2S32 in the real corpus.\n")
-        _write(tmp_path / ".venv" / "lib" / "site.md", "A2S32 in a venv artifact.\n")
-        _write(tmp_path / "outputs" / "run1" / "log.md", "A2S32 in build output.\n")
+        _write(tmp_path / "real.md", "Q7X42 in the real corpus.\n")
+        _write(tmp_path / ".venv" / "lib" / "site.md", "Q7X42 in a venv artifact.\n")
+        _write(tmp_path / "outputs" / "run1" / "log.md", "Q7X42 in build output.\n")
 
-        result = search("What about A2S32?", roots=[tmp_path], top_k=10)
+        result = search("What about Q7X42?", roots=[tmp_path], top_k=10)
 
         matched_names = {Path(h.file_path).name for h in result.hits}
         assert matched_names == {"real.md"}
@@ -343,7 +343,7 @@ class TestSearchAgainstSyntheticTree:
 
     def test_measured_latency_is_reported_and_reasonable(self, tmp_path: Path) -> None:
         corpus = self._corpus(tmp_path)
-        result = search("What happened with A2S32?", roots=[corpus], top_k=5)
+        result = search("What happened with Q7X42?", roots=[corpus], top_k=5)
         assert result.latency_seconds >= 0.0
         assert result.latency_seconds < 2.0  # generous upper bound for a tiny fixture
 
@@ -369,17 +369,17 @@ class TestScoreFormula:
         assert fresher > older
 
     def test_whole_token_match_detection(self) -> None:
-        line = "Experiment A2S32 stabilized the gate."
-        start = line.index("A2S32")
-        end = start + len("A2S32")
+        line = "Experiment Q7X42 stabilized the gate."
+        start = line.index("Q7X42")
+        end = start + len("Q7X42")
         assert rgc._is_whole_token_match(line, start, end) is True
 
     def test_substring_match_detection(self) -> None:
         # The match is embedded inside a longer word on both sides, so it is
         # a substring hit, not a whole-token hit.
-        line = "prefixa2s32suffix"
-        start = line.index("a2s32")
-        end = start + len("a2s32")
+        line = "prefixq7x42suffix"
+        start = line.index("q7x42")
+        end = start + len("q7x42")
         assert rgc._is_whole_token_match(line, start, end) is False
 
     def test_path_type_weight_prioritizes_curated_sections(self, tmp_path: Path) -> None:
@@ -523,7 +523,7 @@ class TestSearchUnavailableWithoutConfiguredRoots:
         monkeypatch.setattr(rgc, "check_availability", lambda: rgc.RipgrepAvailability(
             available=True, reason=None, binary_path="/usr/bin/rg"
         ))
-        result = search("what is A2S32?", roots=[])
+        result = search("what is Q7X42?", roots=[])
         assert result.available is False
         assert result.hits == []
         assert HARS_MEMORY_RIPGREP_ROOTS_ENV in (result.unavailable_reason or "")
@@ -532,10 +532,10 @@ class TestSearchUnavailableWithoutConfiguredRoots:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
-        _write(tmp_path / "docs" / "note.md", "A2S32 is the identifier under test.\n")
+        _write(tmp_path / "docs" / "note.md", "Q7X42 is the identifier under test.\n")
         monkeypatch.setenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, str(tmp_path))
         roots = default_roots()
-        result = search("A2S32", roots=roots)
+        result = search("Q7X42", roots=roots)
         assert result.available is True
         assert any("note.md" in hit.file_path for hit in result.hits)
 
@@ -574,7 +574,7 @@ class TestAsearchDoesNotBlockEventLoop:
                 return ticks
 
             ticker_task = asyncio.create_task(ticker())
-            result = await rgc.asearch("A2S32", roots=[tmp_path])
+            result = await rgc.asearch("Q7X42", roots=[tmp_path])
             done = True
             await ticker_task
             return ticks, result
@@ -586,7 +586,7 @@ class TestAsearchDoesNotBlockEventLoop:
 
     def test_asearch_matches_search_result(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(HARS_MEMORY_RIPGREP_ROOTS_ENV, raising=False)
-        _write(tmp_path / "docs" / "note.md", "A2S32 is the identifier under test.\n")
-        sync_result = search("A2S32", roots=[tmp_path])
-        async_result = asyncio.run(rgc.asearch("A2S32", roots=[tmp_path]))
+        _write(tmp_path / "docs" / "note.md", "Q7X42 is the identifier under test.\n")
+        sync_result = search("Q7X42", roots=[tmp_path])
+        async_result = asyncio.run(rgc.asearch("Q7X42", roots=[tmp_path]))
         assert [h.file_path for h in async_result.hits] == [h.file_path for h in sync_result.hits]
