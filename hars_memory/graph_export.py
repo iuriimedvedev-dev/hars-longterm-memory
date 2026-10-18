@@ -307,7 +307,6 @@ def graph_payload(params: dict[str, str]) -> dict[str, Any]:
 
     order = sorted(range(state.node_count), key=lambda i: (-state.deg[i], i))
     keep = order[:limit_nodes]
-    keep_set = set(keep)
     remap = {old: new for new, old in enumerate(keep)}
 
     edges: list[list[int]] = []
