@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-18
+
+### Security
+
+- **Sanitized the published artifacts.** The 0.7.0 wheel and sdist carried
+  confidential deployment data: internal experiment identifiers in
+  docstrings/example strings and package-data eval gold sets (real research
+  questions, internal run ids, internal corpus filenames), plus internal host
+  addresses and operator home paths in sdist-shipped operator scripts and ops
+  docs. The 0.7.0 release has been **deleted from the GitLab PyPI registry**
+  (project 14) — do not use it; pin `>=0.7.1`. Changes:
+  - Example identifiers in docstrings/tool descriptions are now generic
+    placeholders (`EXAMPLE-ID-1`, `demo-alignment-task`-style names, generic
+    model codenames) across `mcp_server.py`, `retrieval/*` and the docs.
+  - Eval gold sets no longer ship as package data: the old 46-query corpus
+    gold set is removed from the repo, and the in-package
+    `eval/retrieval_queries.yaml` / `eval/gold_questions.yaml` are now small
+    SYNTHETIC schema samples. Real gold sets are operator-local (gitignored
+    `eval_agentic-data/gold_sets/`), passed via the existing CLI arguments.
+  - The sdist no longer ships operator/local files: `cortex-scripts/`,
+    `AGENTS.md`, `CLAUDE.md`, `.claude/`, `.junie/`, `docs/OPERATIONS_HANDOFF.md`,
+    `docs/SWAP_CHECKLIST.md`, `docs/VERSION_PIN.md`, and one-off verification
+    notes. All stay in the repository.
+  - Internal host addresses and `/home/<user>` paths in shipped code, tests,
+    artifacts and docs are replaced by generic defaults (`127.0.0.1`,
+    `/home/demo`, generic index directory names); recorded provenance JSON in
+    `ranking/artifacts/` is scrubbed the same way (feature data untouched —
+    only the recorded `index_dir` provenance strings changed).
+  - Deployment-specific duplicate-entity alias spellings were removed from
+    `mcp_server.py`; operators now register their own via the new
+    `HARS_MEMORY_EXTRA_ENTITY_ALIASES` env var (YAML file mapping canonical
+    name -> alias list, merged into `ENTITY_ALIASES` at startup; missing or
+    invalid files are ignored with a warning and can never break startup).
+  - New regression guard `tests/test_package_hygiene.py` scans the shipped
+    package tree for the leaked identifier/host patterns.
+
+## [0.7.0] - 2026-10-17
+
 ### Added
 
 - Learned channel-fusion ranker (learning-to-rank) for the recall path,
