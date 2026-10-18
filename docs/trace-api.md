@@ -192,3 +192,23 @@ HARS_MEMORY_TRACE_URL=http://10.66.66.99:8098/trace uv run pytest -q tests/test_
 shape — stage panels consume `vector_hits`/`bm25_hits`/`fusion`/`rerank`/
 `graph_expand`/`context`, the answer/grounding panel consumes `result`. No
 component change is needed for the fixture schema itself.
+
+## Cosmos export endpoints (2026-10-18)
+
+Same listener, read-only, for the Memory Travel UI's data-integrity fix (the UI
+used to load baked fixtures unconditionally and could show OUR index on a
+FOREIGN deployment). Full consumer-facing contract + deployment recipes:
+`memory-travel/docs/CONNECTION.md`.
+
+| Route | Purpose | Notes |
+|---|---|---|
+| `GET /stats` | identity + counts | `{index_id, docs, chunks, entities, relations, nodes, edges, last_ingest, generated_at}`; `index_id` = basename of `HARS_MEMORY_INDEX_DIR` (source of truth for the UI badge); 503 `index_dir_unconfigured` without the env |
+| `GET /graph?limit_nodes=N&limit_edges=M` | sampled starfield | defaults 8000/16000, caps 50000/200000; top-N **by undirected degree** (ties in graphml order); `edges` are index pairs into the returned `nodes` array; `meta.sampled/full_nodes/full_edges` say exactly what was cut; `desc_head` truncated to 200 chars |
+| `GET /coords?dim=3` | UMAP projection over stored vectors | served from `<index_dir>/coords_cache.json` when fresh (stored `source_mtimes` == current `vdb_entities.json`/`vdb_chunks.json` mtimes, `dim` covered); otherwise computed inline if umap is importable (minutes; documented) else 503 `coords_not_cached` with the offline hint: `uv run --with numpy --with umap-learn python scripts/export_cosmos.py --index-dir <dir>` |
+
+- Read-only wrt the index: the ONLY file ever written is `coords_cache.json`
+  (a new file LightRAG ignores). The 325 MB `vdb_entities` matrix is never
+  serialised; graph/stats are cached in memory keyed by file mtime.
+- No new auth; same CORS posture as `/trace`. POST to these routes → 405.
+- Tests: `tests/test_graph_export.py` (hermetic synthetic index through the
+  real listener).
