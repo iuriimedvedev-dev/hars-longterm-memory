@@ -90,6 +90,23 @@ def _key_from_file(path: str, name: str) -> str:
     return ""
 
 
+def resolve_openrouter_credentials(env: Mapping[str, str]) -> tuple[str, str]:
+    """``(base_url, api_key)`` for OpenRouter; raises when the key is missing.
+
+    Shared by the sync extractor and the Batch API backend so both read the same
+    variables (and neither ever logs the key).
+    """
+    base_url = _clean(env, "HARS_MEMORY_OPENROUTER_BASE_URL") or OPENROUTER_BASE_URL
+    key_env = _clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_ENV") or DEFAULT_OPENROUTER_KEY_ENV
+    api_key = _clean(env, key_env) or _key_from_file(_clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_FILE"), key_env)
+    if not api_key:
+        raise ExtractorConfigError(
+            "OpenRouter needs an API key in the environment "
+            f"variable {key_env!r} (name configurable via HARS_MEMORY_EXTRACTOR_API_KEY_ENV); it is unset or empty"
+        )
+    return base_url, api_key
+
+
 def resolve_extractor_backend(
     env: Mapping[str, str],
     *,
@@ -115,14 +132,9 @@ def resolve_extractor_backend(
                 "HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter requires HARS_MEMORY_OPENROUTER_MODEL "
                 "(the OpenRouter model id); no default is baked in"
             )
-        resolved_url = base_url or _clean(env, "HARS_MEMORY_OPENROUTER_BASE_URL") or OPENROUTER_BASE_URL
-        key_env = _clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_ENV") or DEFAULT_OPENROUTER_KEY_ENV
-        api_key = _clean(env, key_env) or _key_from_file(_clean(env, "HARS_MEMORY_EXTRACTOR_API_KEY_FILE"), key_env)
-        if not api_key:
-            raise ExtractorConfigError(
-                f"HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter requires an API key in the environment "
-                f"variable {key_env!r} (name configurable via HARS_MEMORY_EXTRACTOR_API_KEY_ENV); it is unset or empty"
-            )
+        resolved_url, api_key = resolve_openrouter_credentials(env)
+        if base_url:
+            resolved_url = base_url
         default_effort = DEFAULT_OPENROUTER_REASONING_EFFORT
 
     extra_body: dict[str, Any] = {}
