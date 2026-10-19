@@ -1568,12 +1568,27 @@ def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None
     state = BatchState.load(index_dir)
     if not state.rounds:
         raise BatchError("nothing to apply: run collect/submit first")
+    current_model = configured_model()
+    if state.model and current_model and current_model != state.model:
+        raise BatchError(
+            f"cache identity mismatch: these answers were collected for model {state.model!r}, but the "
+            f"current configuration resolves to {current_model!r}, so every primed cache key would miss and "
+            "LightRAG would re-extract everything synchronously. Re-run apply with the same extractor env "
+            "(HARS_MEMORY_EXTRACTOR_PROVIDER / HARS_MEMORY_OPENROUTER_MODEL or HARS_MEMORY_EXTRACTOR_MODEL)."
+        )
     if next_round(state) is not None or not all(r.terminal() for r in state.rounds.values()):
         raise BatchError(
             "batches are not all finished (or the gleaning round is not collected yet); "
             "run `index-batch status` / `collect` / `submit` first"
         )
     answers, counts = load_answers(index_dir)
+    current_gleaning = int(os.environ.get("HARS_MEMORY_MAX_GLEANING", "1"))
+    if current_gleaning != state.gleaning:
+        logger.warning(
+            "gleaning mismatch: batches were collected with gleaning=%d but HARS_MEMORY_MAX_GLEANING=%d; "
+            "chunks whose primed answer lacks the completion delimiter would be sent to the synchronous LLM",
+            state.gleaning, current_gleaning,
+        )
     total_requests = sum(r.requests for r in state.rounds.values())
     plan = fallback_plan(index_dir, state, answers)
     abandoned = sum(1 for r in state.rounds.values() for p in r.parts if p.status == "abandoned")
