@@ -458,7 +458,7 @@ def _batch_documents(args: argparse.Namespace) -> list:
 _LIVE_INDEX_MARKER = "kv_store_doc_status.json"
 
 
-def _check_not_live_index(index_dir: Path) -> None:
+def _check_not_live_index(index_dir: Path, *, append: bool = False) -> None:
     """Refuse to build into an index that is (or looks like) a live one.
 
     Refused: the conventional live dir ``~/.local/share/hars-longterm-memory/index``,
@@ -466,6 +466,11 @@ def _check_not_live_index(index_dir: Path) -> None:
     holds a LightRAG index (``kv_store_doc_status.json``) but was not created by
     ``index-batch`` (no ``batch_state.json``).  A dir ``index-batch`` itself
     started is fine, so a build stays resumable.
+
+    ``append=True`` (``index-batch --append``) deliberately targets such an
+    existing index: documents it already holds are skipped by doc id *and* by
+    file key (``pending_documents``), so the run adds the remainder instead of
+    rebuilding. The live index is still refused.
     """
     import os
 
@@ -476,9 +481,11 @@ def _check_not_live_index(index_dir: Path) -> None:
     if index_dir in live:
         raise SystemExit(f"error: refusing to use the live index {index_dir} as an index-batch target")
     if (index_dir / _LIVE_INDEX_MARKER).exists() and not (index_dir / "batch_state.json").exists():
+        if append:
+            return
         raise SystemExit(
             f"error: {index_dir} already holds an index that index-batch did not create; "
-            "use a fresh --index-dir"
+            "use a fresh --index-dir (or pass --append to add to it)"
         )
 
 
@@ -499,8 +506,15 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
     from hars_memory.ingest import batch
 
     index_dir = _resolve_index_dir(args.index_dir).resolve()
+    append = bool(getattr(args, "append", False))
+    dry = bool(getattr(args, "dry_run", False))
     if args.batch_action not in ("status", "compare"):
-        _check_not_live_index(index_dir)
+        _check_not_live_index(index_dir, append=append)
+        if append and not dry and not (index_dir / batch.STATE_FILENAME).exists():
+            # Append mode: create an empty state so collect can record its plan
+            # against the existing index instead of rebuilding it.
+            batch.BatchState().save(index_dir)
+            print(f"append mode: writing batch state into the existing index {index_dir}", file=sys.stderr)
     os.environ["HARS_MEMORY_INDEX_DIR"] = str(index_dir)
     action = args.batch_action
     try:
@@ -523,13 +537,14 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
         if action in ("collect", "run"):
             print(
                 "build config: chunker={} chunk_tokens={} overlap={} min_chunk_tokens={} gleaning={} "
-                "extractor={} index_dir={}".format(
-                    os.environ.get("HARS_MEMORY_CHUNKER", "token") or "token",
+                "extractor={} batch_provider={} index_dir={}".format(
+                    batch.configured_chunker(),
                     os.environ.get("HARS_MEMORY_CHUNK_TOKEN_SIZE", "512"),
                     os.environ.get("HARS_MEMORY_CHUNK_OVERLAP_TOKENS", "64"),
                     os.environ.get("HARS_MEMORY_CHUNK_MIN_TOKENS", "200"),
                     os.environ.get("HARS_MEMORY_MAX_GLEANING", "1"),
-                    os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", "?"),
+                    batch.configured_model() or "?",
+                    os.environ.get("HARS_MEMORY_BATCH_PROVIDER", "openai"),
                     index_dir,
                 ),
                 file=sys.stderr,
@@ -1302,6 +1317,10 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="submit/run: keep at most this many estimated input tokens in unfinished batches "
                       "(provider enqueued-token quota; 0 = no limit)")
     ib_p.add_argument("--dry-run", action="store_true", help="collect: print the estimate, write nothing")
+    ib_p.add_argument("--append", action="store_true",
+                      help="Add to an existing LightRAG index (e.g. a restored build): documents it already "
+                      "holds are skipped by doc id and by file key, so only the remainder is collected. "
+                      "The live index is still refused.")
     ib_p.add_argument("--refresh", action="store_true", help="status: poll the provider first")
     ib_p.add_argument("--poll-seconds", type=float, default=30.0)
     ib_p.add_argument("--timeout-minutes", type=float, default=30.0,

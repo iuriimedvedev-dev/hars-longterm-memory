@@ -55,6 +55,8 @@ import logging
 import os
 import shutil
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Final, Protocol
@@ -65,6 +67,22 @@ STATE_FILENAME: Final[str] = "batch_state.json"
 BATCH_DIRNAME: Final[str] = "batch"
 STATE_VERSION: Final[int] = 1
 DEFAULT_ENDPOINT: Final[str] = "/v1/chat/completions"
+
+#: Batch backend selection. ``openai`` (default) is the file-upload Batch API
+#: shape; ``openrouter`` is OpenRouter's inline-JSON shape (no upload).
+BATCH_PROVIDER_ENV: Final[str] = "HARS_MEMORY_BATCH_PROVIDER"
+PROVIDER_OPENAI: Final[str] = "openai"
+PROVIDER_OPENROUTER: Final[str] = "openrouter"
+OPENROUTER_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
+#: Synthetic ``file_id`` prefix for the stashed JSONL of a batch part. The real
+#: part file already lives in ``<index>/batch/``; OpenRouter needs no upload, so
+#: the id is just a resolvable pointer that survives a process restart.
+_LOCAL_FILE_PREFIX: Final[str] = "local:"
+# Inline requests travel in ONE HTTP body (OpenRouter stream-parses it, but a
+# multi-hundred-MB POST is still a bad idea): cap the parts well below the
+# OpenAI file limits.
+OPENROUTER_MAX_REQUESTS_PER_BATCH: Final[int] = 10_000
+OPENROUTER_MAX_BYTES_PER_BATCH: Final[int] = 20 * 1024 * 1024
 # OpenAI Batch API hard limits are 50 000 requests / 200 MB per file; stay under.
 MAX_REQUESTS_PER_BATCH: Final[int] = 50_000
 MAX_BYTES_PER_BATCH: Final[int] = 150 * 1024 * 1024
@@ -175,15 +193,287 @@ def _batch_dict(batch: Any) -> dict[str, Any]:
     }
 
 
-def make_backend_from_env() -> OpenAIBatchBackend:
-    """Backend for the extractor endpoint (HARS_MEMORY_EXTRACTOR_BASE_URL / LLM_API_KEY)."""
-    base_url = os.environ.get("HARS_MEMORY_EXTRACTOR_BASE_URL", "")
-    api_key = os.environ.get("HARS_MEMORY_LLM_API_KEY", "")
-    if not base_url or not api_key:
-        raise BatchError(
-            "HARS_MEMORY_EXTRACTOR_BASE_URL and HARS_MEMORY_LLM_API_KEY must be set to submit batches"
+def make_backend_from_env() -> BatchBackend:
+    """Build the batch backend selected by ``HARS_MEMORY_BATCH_PROVIDER``.
+
+    ``openai`` (default) keeps the historical behaviour bit for bit: the
+    extractor endpoint (``HARS_MEMORY_EXTRACTOR_BASE_URL`` /
+    ``HARS_MEMORY_LLM_API_KEY``) doubles as the Batch API endpoint.
+
+    ``openrouter`` speaks OpenRouter's inline-JSON Batch API and reads its
+    credentials from the same place as the OpenRouter *sync* extractor:
+    ``OPENROUTER_API_KEY`` (name overridable via
+    ``HARS_MEMORY_EXTRACTOR_API_KEY_ENV``, with the optional
+    ``HARS_MEMORY_EXTRACTOR_API_KEY_FILE`` dotenv fallback) plus
+    ``HARS_MEMORY_OPENROUTER_BASE_URL``. The key is never logged.
+    """
+    provider = (os.environ.get(BATCH_PROVIDER_ENV, "") or PROVIDER_OPENAI).strip().lower()
+    if provider == PROVIDER_OPENAI:
+        base_url = os.environ.get("HARS_MEMORY_EXTRACTOR_BASE_URL", "")
+        api_key = os.environ.get("HARS_MEMORY_LLM_API_KEY", "")
+        if not base_url or not api_key:
+            raise BatchError(
+                "HARS_MEMORY_EXTRACTOR_BASE_URL and HARS_MEMORY_LLM_API_KEY must be set to submit batches"
+            )
+        return OpenAIBatchBackend(base_url, api_key)
+    if provider == PROVIDER_OPENROUTER:
+        return openrouter_backend_from_env()
+    raise BatchError(
+        f"{BATCH_PROVIDER_ENV}={provider!r} is invalid; expected one of "
+        f"{[PROVIDER_OPENAI, PROVIDER_OPENROUTER]}"
+    )
+
+
+def openrouter_backend_from_env() -> OpenRouterBatchBackend:
+    """OpenRouter backend from env (credentials + optional request extra body)."""
+    from hars_memory.server.extractor_config import (
+        PROVIDER_OPENROUTER as _SYNC_OPENROUTER,
+        resolve_extractor_backend,
+        resolve_openrouter_credentials,
+    )
+
+    base_url, api_key = resolve_openrouter_credentials(os.environ)
+    extra_body: dict[str, Any] = {}
+    # Reasoning controls are opt-in and inherit the sync extractor's documented
+    # config (OpenRouter default effort "low") when that provider is selected.
+    if (os.environ.get("HARS_MEMORY_EXTRACTOR_PROVIDER", "").strip().lower() == _SYNC_OPENROUTER):
+        extra_body = dict(resolve_extractor_backend(os.environ).extra_body)
+    return OpenRouterBatchBackend(api_key, base_url=base_url, extra_body=extra_body)
+
+
+def configured_model(env: dict[str, str] | None = None) -> str:
+    """The extraction model LightRAG's cache identity will be built from.
+
+    For the OpenRouter sync provider the model id lives in
+    ``HARS_MEMORY_OPENROUTER_MODEL`` (the generic ``_EXTRACTOR_MODEL`` points at
+    the local server), so the batch collector must read it from there or the
+    primed cache keys would never be looked up by ``apply``.
+    """
+    env = dict(os.environ) if env is None else env
+    if (env.get("HARS_MEMORY_EXTRACTOR_PROVIDER", "") or "").strip().lower() == PROVIDER_OPENROUTER:
+        return (env.get("HARS_MEMORY_OPENROUTER_MODEL", "") or "").strip()
+    return (env.get("HARS_MEMORY_EXTRACTOR_MODEL", "") or "").strip()
+
+
+def batch_model_for(identity_model: str, backend: BatchBackend | None = None) -> str:
+    """Model id to put in the batch requests (may differ from the cache identity).
+
+    OpenRouter runs batches on ``:batch`` endpoint variants, which the sync API
+    rejects. The cache identity, however, must be the *sync* model id (that is
+    what ``apply`` builds from the same env), so the two are kept separate:
+    ``HARS_MEMORY_BATCH_MODEL`` overrides, else ``<model>:batch`` for OpenRouter.
+    """
+    override = (os.environ.get("HARS_MEMORY_BATCH_MODEL", "") or "").strip()
+    if override:
+        return override
+    if getattr(backend, "provider", PROVIDER_OPENAI) == PROVIDER_OPENROUTER:
+        return identity_model if identity_model.endswith(":batch") else f"{identity_model}:batch"
+    return identity_model
+
+
+def _http_json(
+    method: str,
+    url: str,
+    api_key: str,
+    payload: Any = None,
+    *,
+    timeout: float = 180.0,
+    retries: int = 2,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """JSON over HTTP with a small retry window; errors never echo the key."""
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:600]
+            message = _api_error_message(body) or exc.reason or str(exc)
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
+                sleep(float(2**attempt))
+                continue
+            raise BatchError(f"OpenRouter {method} {url} -> HTTP {exc.code}: {message}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < retries:
+                sleep(float(2**attempt))
+                continue
+            raise BatchError(f"OpenRouter {method} {url} unreachable: {exc}") from exc
+    raise BatchError(f"OpenRouter {method} {url} failed after {retries + 1} attempts")
+
+
+def _api_error_message(body: str) -> str:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return body
+
+
+class OpenRouterBatchBackend:
+    """OpenRouter's inline-JSON Batch API behind the same protocol as OpenAI's.
+
+    Differences that matter here (verified against the live API and the
+    published OpenAPI document):
+
+    * no file upload: ``upload`` returns the part's existing path as a
+      synthetic ``local:<path>`` id, and ``create`` posts
+      ``{endpoint, model, requests: [{custom_id, body}]}`` in that key order
+      (OpenRouter stream-parses and rejects ``requests`` coming first);
+    * no separate output file: terminal ``GET /batches/{id}`` inlines
+      ``results``, which are re-serialized into the OpenAI batch output shape
+      (``{custom_id, response: {status_code, body}, error}``) the rest of this
+      module already understands;
+    * no cancellation endpoint (only deletion of a *terminal* batch), so the
+      stall/cancel machinery is disabled for this backend;
+    * the terminal response carries aggregate ``usage.cost`` in USD, which is
+      the actual charge and is recorded instead of the price estimate.
+    """
+
+    provider: str = PROVIDER_OPENROUTER
+    supports_cancel: bool = False
+    max_requests_per_batch: int = OPENROUTER_MAX_REQUESTS_PER_BATCH
+    max_bytes_per_batch: int = OPENROUTER_MAX_BYTES_PER_BATCH
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str = OPENROUTER_BASE_URL,
+        endpoint: str = DEFAULT_ENDPOINT,
+        timeout: float = 180.0,
+        extra_body: dict[str, Any] | None = None,
+        transport: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        if not api_key:
+            raise BatchError("OpenRouter batch backend needs an API key (OPENROUTER_API_KEY)")
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._endpoint = endpoint
+        self._timeout = timeout
+        self.extra_body = dict(extra_body or {})
+        self._transport = transport or _http_json
+        self._results_jsonl: dict[str, str] = {}
+
+    # -- protocol ---------------------------------------------------------
+    def model_for_request(self, model: str) -> str:
+        """OpenRouter ids keep their ``vendor/`` prefix (and their ``:batch``)."""
+        return model
+
+    def upload(self, path: Path) -> str:
+        resolved = Path(path).resolve()
+        if not resolved.is_file():
+            raise BatchError(f"batch part file not found: {path}")
+        return f"{_LOCAL_FILE_PREFIX}{resolved}"
+
+    def create(self, file_id: str, metadata: dict[str, str]) -> dict[str, Any]:
+        path = _local_file_path(file_id)
+        rows = _read_request_rows(path)
+        if not rows:
+            raise BatchError(f"batch part {path.name} has no requests")
+        requests = [{"custom_id": row["custom_id"], "body": dict(row["body"])} for row in rows]
+        model = str(requests[0]["body"].get("model") or "")
+        if not model:
+            raise BatchError(f"batch part {path.name} has no model in its request bodies")
+        # Order matters: OpenRouter stream-parses the body and rejects a
+        # payload whose `requests` array precedes `endpoint`/`model`.
+        payload: dict[str, Any] = {"endpoint": self._endpoint, "model": model, "requests": requests}
+        info = self._transport(
+            "POST", f"{self._base_url}/batches", self._api_key, payload, timeout=self._timeout
         )
-    return OpenAIBatchBackend(base_url, api_key)
+        return self._normalise(info)
+
+    def get(self, batch_id: str) -> dict[str, Any]:
+        info = self._transport(
+            "GET", f"{self._base_url}/batches/{batch_id}", self._api_key, None, timeout=self._timeout
+        )
+        return self._normalise(info)
+
+    def read(self, file_id: str) -> str:
+        if file_id in self._results_jsonl:
+            return self._results_jsonl[file_id]
+        # Results are inline: the "file id" is the batch id.
+        info = self._transport(
+            "GET", f"{self._base_url}/batches/{file_id}", self._api_key, None, timeout=self._timeout
+        )
+        normalised = self._normalise(info)
+        if not normalised.get("output_file_id"):
+            raise BatchError(f"batch {file_id} has no inline results to read")
+        return self._results_jsonl[file_id]
+
+    def cancel(self, batch_id: str) -> dict[str, Any]:
+        raise BatchError(
+            "OpenRouter's Batch API has no cancellation endpoint (DELETE only removes a "
+            f"terminal batch); cannot cancel {batch_id}"
+        )
+
+    # -- parsing ----------------------------------------------------------
+    def _normalise(self, info: dict[str, Any]) -> dict[str, Any]:
+        batch_id = str(info.get("id") or "")
+        status = str(info.get("status") or "unknown")
+        results = info.get("results")
+        output_file_id = None
+        if isinstance(results, list):
+            self._results_jsonl[batch_id] = _results_to_jsonl(results)
+            output_file_id = batch_id
+        counts = info.get("request_counts") or {}
+        usage = info.get("usage") or {}
+        error = info.get("error")
+        cost = usage.get("cost") if isinstance(usage, dict) else None
+        return {
+            "id": batch_id,
+            "status": status,
+            "output_file_id": output_file_id,
+            "error_file_id": None,
+            "counts": {
+                "total": counts.get("total"),
+                "completed": counts.get("completed"),
+                "failed": counts.get("failed"),
+            },
+            "errors": [str(error.get("message") or error)] if isinstance(error, dict) else ([str(error)] if error else []),
+            "cost_usd": float(cost) if isinstance(cost, (int, float)) else None,
+            "provider": info.get("provider"),
+        }
+
+
+def _local_file_path(file_id: str) -> Path:
+    if not file_id.startswith(_LOCAL_FILE_PREFIX):
+        raise BatchError(
+            f"unrecognised batch part id {file_id!r}: the OpenRouter backend expects "
+            f"the {_LOCAL_FILE_PREFIX!r} pointer returned by its upload()"
+        )
+    path = Path(file_id[len(_LOCAL_FILE_PREFIX):])
+    if not path.is_file():
+        raise BatchError(f"batch part file vanished: {path}")
+    return path
+
+
+def _read_request_rows(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _results_to_jsonl(results: list[dict[str, Any]]) -> str:
+    """Inlined OpenRouter results as OpenAI-batch output lines (what apply reads)."""
+    lines = []
+    for result in results:
+        row = {
+            "custom_id": result.get("custom_id"),
+            "response": result.get("response"),
+            "error": result.get("error"),
+        }
+        lines.append(json.dumps(row, ensure_ascii=False))
+    return "".join(line + "\n" for line in lines)
+
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +645,7 @@ async def _collect_async(
     meta = {
         "chunks": len(chunks),
         "gleaning": int(global_config.get("entity_extract_max_gleaning", 0)),
-        "model": os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", ""),
+        "model": configured_model(),
     }
     return requests, meta
 
@@ -381,6 +671,9 @@ class Part:
     completed_at: float | None = None
     downloaded: bool = False
     usage: dict[str, int] = field(default_factory=dict)
+    #: Provider-reported charge for the batch (OpenRouter ``usage.cost``); 0 when
+    #: the backend reports none, in which case the price table is used.
+    reported_cost_usd: float = 0.0
     errors: list[str] = field(default_factory=list)
     # progress / stall bookkeeping (persisted so a restarted `run` keeps the stall clock)
     last_done: int = 0  # completed + failed at the last observed increase
@@ -410,7 +703,13 @@ class RoundState:
 @dataclass
 class BatchState:
     version: int = STATE_VERSION
+    #: Model whose cache identity the collected prompts were built for — the
+    #: id ``apply`` must run with, NOT necessarily the batch endpoint model.
     model: str = ""
+    #: Batch backend (``openai`` | ``openrouter``) and the model id actually
+    #: submitted (OpenRouter uses a ``:batch`` variant of ``model``).
+    provider: str = ""
+    batch_model: str = ""
     endpoint: str = DEFAULT_ENDPOINT
     chunker: str = "token"
     gleaning: int = 0
@@ -443,8 +742,17 @@ def batch_dir(index_dir: Path) -> Path:
     return index_dir / BATCH_DIRNAME
 
 
-def estimate_cost(
-    requests: int,
+def configured_chunker() -> str:
+    """Chunker name actually in use (``HARS_MEMORY_CHUNKER_MODE`` wins over ``_CHUNKER``)."""
+    try:
+        from hars_memory.server.lightrag_init import resolve_chunker
+
+        return resolve_chunker()
+    except Exception:  # pragma: no cover - config errors surface in collect anyway
+        return (os.environ.get("HARS_MEMORY_CHUNKER", "") or "token").strip().lower()
+
+
+def estimate_cost(    requests: int,
     input_tokens: int,
     *,
     input_price: float,
@@ -507,6 +815,106 @@ def _processed_doc_ids(index_dir: Path) -> set[str]:
     return {k for k, v in data.items() if str(v.get("status", "")).lower().endswith("processed")}
 
 
+#: When the same file is reachable through several corpus roots (the recovered
+#: baseline copy and the staging archive are byte-identical for 248 documents),
+#: keep the FIRST match in this order. Content is the same; the recovered copy
+#: is the one whose presence in the production baseline made it matter.
+FILE_KEY_PRIORITY: Final[tuple[str, ...]] = (
+    "recovered_baseline",
+    "staging/ingested",
+    "cortex/docs",
+    "cortex/.plans",
+    "docs",
+    ".plans",
+)
+
+
+def _priority(doc: Any) -> int:
+    source = str(getattr(doc, "source_path", ""))
+    for rank, needle in enumerate(FILE_KEY_PRIORITY):
+        if needle in source:
+            return rank
+    return len(FILE_KEY_PRIORITY)
+
+
+def dedupe_documents(docs: list[Any]) -> list[Any]:
+    """One document per unique LightRAG *file key* (``_unique_file_key``).
+
+    The corpus roots overlap (the recovered baseline dir and the staging archive
+    share 248 file names); without this a single document would be extracted and
+    inserted twice under two different path-derived doc ids.
+    """
+    from hars_memory.server.index import _unique_file_key
+
+    chosen: dict[str, Any] = {}
+    for doc in sorted(docs, key=lambda d: (_priority(d), str(d.source_path))):
+        chosen.setdefault(_unique_file_key(doc), doc)
+    return sorted(chosen.values(), key=lambda d: str(d.source_path))
+
+
+def indexed_file_keys(index_dir: Path, *, processed_only: bool = True) -> set[str]:
+    """The ``file_path`` keys already recorded in the target index.
+
+    This is the only identity that survives machines: ``doc_id`` is a hash of
+    the *absolute* path, so a restored index built elsewhere has doc ids no
+    local walk can ever reproduce. ``processed_only`` mirrors LightRAG's own
+    dedupe rule — a row left ``pending`` by an interrupted run is retried.
+    """
+    path = index_dir / "kv_store_doc_status.json"
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    keys = set()
+    for value in data.values():
+        if not value.get("file_path"):
+            continue
+        if processed_only and not str(value.get("status", "")).lower().endswith("processed"):
+            continue
+        keys.add(str(value["file_path"]))
+    return keys
+
+
+def _key_matches_index(key: str, index_keys: set[str]) -> bool:
+    """Is *key* already indexed, allowing for a differently-rooted walk?
+
+    The index stores ``relative_path`` with ``/`` flattened to ``-``. A run
+    rooted at ``cortex/`` recorded ``docs-guides-X.md``; the same file walked
+    from ``cortex/docs`` yields ``guides-X.md``. Compare on the flattened
+    suffix so both resolve to the same document.
+    """
+    if not key:
+        return False
+    if key in index_keys:
+        return True
+    suffix = "-" + key
+    return any(candidate.endswith(suffix) for candidate in index_keys)
+
+
+def pending_documents(index_dir: Path, docs: list[Any]) -> list[Any]:
+    """Documents still to extract: deduped, not processed, not already indexed.
+
+    Change detection in LightRAG keys on ``doc_id`` (absolute-path hash), which
+    cannot match a restored index from another machine, so the file-key check is
+    what actually prevents re-extracting the 990 documents already there.
+    """
+    from hars_memory.server.index import _unique_file_key
+
+    processed = _processed_doc_ids(index_dir)
+    keys = indexed_file_keys(index_dir)
+    pending = []
+    for doc in dedupe_documents(docs):
+        if doc.doc_id in processed:
+            continue
+        if _key_matches_index(_unique_file_key(doc), keys):
+            continue
+        pending.append(doc)
+    return pending
+
+
+
 def next_round(state: BatchState) -> int | None:
     """Next round to collect, or None when nothing is left to collect."""
     if "1" not in state.rounds:
@@ -532,7 +940,8 @@ def collect(
     Returns None when there is nothing to collect.
     """
     state = BatchState.load(index_dir)
-    doc_ids = sorted(d.doc_id for d in docs)
+    all_docs = dedupe_documents(docs)
+    doc_ids = sorted(d.doc_id for d in all_docs)
     if state.doc_ids and state.doc_ids != doc_ids:
         raise BatchError(
             "the document set differs from the one this index's batch_state.json was collected for; "
@@ -541,7 +950,10 @@ def collect(
     rnd = next_round(state)
     if rnd is None:
         return None
-    todo = [d for d in docs if d.doc_id not in _processed_doc_ids(index_dir)]
+    todo = pending_documents(index_dir, docs)
+    skipped = len(all_docs) - len(todo)
+    if skipped:
+        logger.info("skipping %d document(s) already in %s (doc id or file key)", skipped, index_dir)
     answers, _ = load_answers(index_dir)
     scratch = batch_dir(index_dir) / "_collect"
     shutil.rmtree(scratch, ignore_errors=True)
@@ -578,7 +990,7 @@ def collect(
     with (bdir / result.requests_file).open("w", encoding="utf-8") as fh:
         for r in requests:
             fh.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
-    state.chunker = os.environ.get("HARS_MEMORY_CHUNKER", "token").strip().lower() or "token"
+    state.chunker = configured_chunker()
     state.gleaning = int(meta["gleaning"])
     state.model = meta["model"] or state.model
     state.doc_ids = doc_ids
@@ -599,13 +1011,38 @@ def provider_model(model: str) -> str:
     A LiteLLM proxy routes ``openai/gpt-6-luna`` for chat calls, but its batch
     endpoints hand the uploaded file to the provider as is, which rejects the
     ``openai/`` routing prefix ("model is not supported by the Batch API").
+    OpenRouter is the opposite (ids keep their ``vendor/`` prefix), so it
+    overrides this through :meth:`OpenRouterBatchBackend.model_for_request`.
     """
     return model.split("/", 1)[1] if model.startswith("openai/") else model
 
 
-def _body(model: str, messages: list[dict[str, str]], temperature: float, max_tokens: int,
-          max_tokens_param: str) -> dict[str, Any]:
-    return {"model": provider_model(model), "messages": messages, "temperature": temperature, max_tokens_param: max_tokens}
+def _model_transform(backend: BatchBackend) -> Callable[[str], str]:
+    transform = getattr(backend, "model_for_request", None)
+    return transform if callable(transform) else provider_model
+
+
+def _body(
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    max_tokens_param: str,
+    *,
+    transform: Callable[[str], str] = provider_model,
+    extra_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": transform(model),
+        "messages": messages,
+        "temperature": temperature,
+        max_tokens_param: max_tokens,
+    }
+    # Provider-specific knobs (e.g. OpenRouter ``reasoning``); merged last so an
+    # explicit extra body always wins, exactly like the sync extractor.
+    body.update(extra_body or {})
+    return body
+
 
 
 def submit(
@@ -632,21 +1069,36 @@ def submit(
     state = BatchState.load(index_dir)
     if not state.rounds:
         raise BatchError("nothing collected yet: run `index-batch collect` first")
-    model = model or state.model or os.environ.get("HARS_MEMORY_EXTRACTOR_MODEL", "")
-    if not model:
-        raise BatchError("no model: set HARS_MEMORY_EXTRACTOR_MODEL")
+    identity_model = model or state.model or configured_model()
+    if not identity_model:
+        raise BatchError("no model: set HARS_MEMORY_EXTRACTOR_MODEL (or HARS_MEMORY_OPENROUTER_MODEL)")
+    provider = getattr(backend, "provider", PROVIDER_OPENAI)
+    batch_model = model or batch_model_for(identity_model, backend)
     temperature = (
         temperature if temperature is not None
         else float(os.environ.get("HARS_MEMORY_EXTRACTOR_TEMPERATURE", "0.1"))
     )
     max_tokens = max_tokens or int(os.environ.get("HARS_MEMORY_EXTRACTOR_MAX_TOKENS", "8192"))
+    transform = _model_transform(backend)
+    extra_body = dict(getattr(backend, "extra_body", None) or {})
+    # A backend can impose its own (smaller) part limits: OpenRouter takes the
+    # requests inline in one POST, so the OpenAI file limits do not apply.
+    max_requests_per_batch = min(
+        max_requests_per_batch, int(getattr(backend, "max_requests_per_batch", max_requests_per_batch))
+    )
+    max_bytes_per_batch = min(
+        max_bytes_per_batch, int(getattr(backend, "max_bytes_per_batch", max_bytes_per_batch))
+    )
+    state.provider = provider
+    state.batch_model = batch_model
     bdir = batch_dir(index_dir)
     created: list[Part] = []
     for name in sorted(state.rounds):
         rnd = state.rounds[name]
         if not rnd.parts and rnd.requests:
-            _split_parts(bdir, rnd, model, temperature, max_tokens, max_tokens_param,
-                         max_requests_per_batch, max_bytes_per_batch, max_tokens_per_batch)
+            _split_parts(bdir, rnd, batch_model, temperature, max_tokens, max_tokens_param,
+                         max_requests_per_batch, max_bytes_per_batch, max_tokens_per_batch,
+                         transform=transform, extra_body=extra_body)
             state.save(index_dir)
         for part in rnd.parts:
             if part.batch_id:
@@ -673,6 +1125,9 @@ def submit(
 def _split_parts(
     bdir: Path, rnd: RoundState, model: str, temperature: float, max_tokens: int,
     max_tokens_param: str, max_requests: int, max_bytes: int, max_tokens_in: int = 0,
+    *,
+    transform: Callable[[str], str] = provider_model,
+    extra_body: dict[str, Any] | None = None,
 ) -> None:
     """Write the upload JSONL(s) for *rnd*, split to stay under the API limits."""
     rows = [json.loads(line) for line in (bdir / rnd.requests_file).read_text(encoding="utf-8").splitlines() if line]
@@ -695,7 +1150,10 @@ def _split_parts(
                 "custom_id": row["key"],
                 "method": "POST",
                 "url": DEFAULT_ENDPOINT,
-                "body": _body(model, row["messages"], temperature, max_tokens, max_tokens_param),
+                "body": _body(
+                    model, row["messages"], temperature, max_tokens, max_tokens_param,
+                    transform=transform, extra_body=extra_body,
+                ),
             },
             ensure_ascii=False,
         ) + "\n"
@@ -736,6 +1194,8 @@ def refresh(
                 part.error_file_id = info.get("error_file_id")
                 part.counts = info.get("counts") or {}
                 part.errors = info.get("errors") or []
+                if info.get("cost_usd") is not None:
+                    part.reported_cost_usd = float(info["cost_usd"])
                 done = _done(part.counts)
                 if part.last_progress_at is None or done > part.last_done:
                     part.last_done = done
@@ -791,6 +1251,8 @@ def cancel_parts(
                 continue
             if part.cancel_requested_at is not None:
                 continue
+            if not getattr(backend, "supports_cancel", True):
+                continue
             if _request_cancel(part, backend, name, clock()):
                 logger.warning("round %s part %d: cancel requested for batch %s (manual)", name, part.part, part.batch_id)
                 cancelled.append(part)
@@ -811,6 +1273,8 @@ def _handle_stalls(
     state = BatchState.load(index_dir)
     now = clock()
     changed = False
+    if not getattr(backend, "supports_cancel", True):
+        return state  # OpenRouter: no cancellation endpoint, nothing to do
     for name, rnd in state.rounds.items():
         for part in rnd.parts:
             if not part.batch_id or part.downloaded or part.status in TERMINAL_STATUSES:
@@ -867,18 +1331,23 @@ def _sum_usage(output_text: str) -> dict[str, int]:
 
 def actual_cost(state: BatchState) -> dict[str, float]:
     """Measured token usage across all downloaded batches and its cost at batch prices."""
-    prompt = completion = 0
+    prompt = completion = reported = 0
     for rnd in state.rounds.values():
         for part in rnd.parts:
             prompt += part.usage.get("prompt_tokens", 0)
             completion += part.usage.get("completion_tokens", 0)
+            reported += part.reported_cost_usd
     ip = state.prices.get("input", DEFAULT_INPUT_PRICE)
     op = state.prices.get("output", DEFAULT_OUTPUT_PRICE)
+    estimated = (prompt * ip + completion * op) / 1_000_000
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "batch_cost_usd": (prompt * ip + completion * op) / 1_000_000,
-        "sync_equivalent_usd": 2 * (prompt * ip + completion * op) / 1_000_000,
+        # Provider-reported charge when available (OpenRouter batches report
+        # usage.cost); otherwise the token prices recorded at collect time.
+        "batch_cost_usd": reported or estimated,
+        "batch_cost_source": "provider_reported" if reported else "price_table",
+        "sync_equivalent_usd": 2 * estimated,
     }
 
 
@@ -903,6 +1372,8 @@ def format_status(state: BatchState, *, now: float | None = None, stall_seconds:
     now = time.time() if now is None else now
     lines = [
         f"model={state.model or '?'} chunker={state.chunker} gleaning={state.gleaning} docs={len(state.doc_ids)}"
+        + (f" provider={state.provider}" if state.provider else "")
+        + (f" batch_model={state.batch_model}" if state.batch_model and state.batch_model != state.model else "")
     ]
     for name in sorted(state.rounds):
         rnd = state.rounds[name]
@@ -993,13 +1464,15 @@ def _load_requests(index_dir: Path) -> dict[str, BatchRequest]:
 
 
 def spent_cost(state: BatchState) -> float:
-    """USD spent on batches so far: measured usage where known, else the estimate share."""
+    """USD spent on batches so far: reported charge first, else the estimate share."""
     ip = state.prices.get("input", DEFAULT_INPUT_PRICE)
     op = state.prices.get("output", DEFAULT_OUTPUT_PRICE)
     total = 0.0
     for rnd in state.rounds.values():
         for p in rnd.parts:
-            if p.usage:
+            if p.reported_cost_usd:
+                total += p.reported_cost_usd
+            elif p.usage:
                 total += (p.usage.get("prompt_tokens", 0) * ip + p.usage.get("completion_tokens", 0) * op) / 1_000_000
             elif p.batch_id and rnd.requests:
                 total += rnd.est_cost_usd * p.requests / rnd.requests
@@ -1118,7 +1591,7 @@ def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None
                 f"${cumulative:.4f} (batch ${plan['spent_usd']:.4f} + sync ${plan['sync_cost_estimated_usd']:.4f}), "
                 f"over --max-cost ${max_cost_usd:.2f}; nothing indexed (state is resumable: raise --max-cost and re-run)"
             )
-    stats = asyncio.run(_prime_and_index(index_dir, docs, answers))
+    stats = asyncio.run(_prime_and_index(index_dir, pending_documents(index_dir, docs), answers))
     stats.update(
         total_requests=total_requests,
         answered=counts["ok"],

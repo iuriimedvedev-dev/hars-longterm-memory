@@ -82,6 +82,52 @@ This uses change detection, so the 990 already-processed docs are skipped; only
 new content is extracted. Extractor is selected only by env
 (`HARS_MEMORY_EXTRACTOR_BASE_URL/_MODEL/_PROVIDER=local`) — no code changes.
 
+### 4b. Alternative: extract the remainder through OpenRouter's Batch API (no GPU)
+
+`memory index-batch` builds the exact prompts LightRAG would send, runs them
+through a provider Batch API at ~50 % price, writes the answers into
+LightRAG's own LLM cache, and only then indexes. Selecting the backend is one
+env var:
+
+| Env | Meaning |
+|---|---|
+| `HARS_MEMORY_BATCH_PROVIDER=openrouter` | inline-JSON Batch API (`POST /api/v1/batches`); default `openai` keeps the file-upload shape |
+| `HARS_MEMORY_OPENROUTER_MODEL` | the **sync** model id; this is the cache identity `apply` must run with |
+| `HARS_MEMORY_BATCH_MODEL` | optional; defaults to `<model>:batch` (OpenRouter's batch-only variant) |
+| `OPENROUTER_API_KEY` | read via `HARS_MEMORY_EXTRACTOR_API_KEY_ENV` / `..._API_KEY_FILE` like the sync extractor |
+
+Appending to an existing index needs `--append`: ``doc_id`` is a hash of the
+*absolute* path, so a restored index from another machine can never match a
+local walk by id. `--append` skips documents already present by **file key**
+(the flattened `file_path` stored in `kv_store_doc_status.json`, matched as a
+suffix so `docs-guides-X.md` and `guides-X.md` are the same document) and
+dedupes overlapping corpus roots (the recovered baseline copy wins over the
+staging archive).
+
+```bash
+export HARS_MEMORY_CHUNKER_MODE=md_struct
+export HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter
+export HARS_MEMORY_OPENROUTER_MODEL=openai/gpt-6-luna
+export HARS_MEMORY_BATCH_PROVIDER=openrouter
+export HARS_MEMORY_MAX_GLEANING=0          # measured: first pass already ends with <|COMPLETE|>
+export HARS_MEMORY_INDEX_DIR=/mnt/datasets/ft/index_local/index_full_mdstruct_20261014
+PATHS=(/mnt/datasets/graphrag/recovered_baseline /mnt/datasets/graphrag/staging/ingested \
+       /home/angkira/Project/software/cortex/docs /home/angkira/Project/software/cortex/.plans)
+
+.venv/bin/memory index-batch collect --append --paths $PATHS --max-cost 5 \
+  --input-price 0.05 --output-price 0.25 --est-output-tokens 900 --dry-run   # estimate only
+.venv/bin/memory index-batch submit  --append --max-tokens-param max_tokens
+.venv/bin/memory index-batch status  --refresh            # repeat; downloads results when terminal
+# only once every part is terminal AND the GPU is free:
+.venv/bin/memory index-batch apply   --append --paths $PATHS --max-cost 5
+```
+
+State lives in `<index>/batch_state.json`; requests and downloaded answers in
+`<index>/batch/round-*`. Every phase is resumable and idempotent. Do **not** run
+`apply` while something else owns the GPU: it performs the real (CPU/GPU)
+indexing, even though every extraction call is already a cache hit.
+
+
 ## Corpus coverage caveat
 
 The Colab corpus was 1624 files -> 990 unique docs. Locally available roots
