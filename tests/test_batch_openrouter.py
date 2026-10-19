@@ -320,6 +320,16 @@ def test_dedupe_prefers_the_recovered_baseline_copy() -> None:
     assert [d.source_path for d in kept] == [recovered.source_path, other.source_path]
 
 
+def test_apply_refuses_a_cache_identity_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    idx = tmp_path / "idx"
+    _state_with_requests(idx, ["key-0"])
+    # collected for openai/gpt-6-luna, but the env now resolves to another model
+    monkeypatch.setenv("HARS_MEMORY_EXTRACTOR_PROVIDER", "openrouter")
+    monkeypatch.setenv("HARS_MEMORY_OPENROUTER_MODEL", "openai/gpt-5.6-luna")
+    with pytest.raises(batch.BatchError, match="cache identity mismatch"):
+        batch.apply(idx, [])
+
+
 def test_pending_documents_skips_processed_ids_and_indexed_file_keys(tmp_path: Path) -> None:
     idx = tmp_path / "idx"
     idx.mkdir()
