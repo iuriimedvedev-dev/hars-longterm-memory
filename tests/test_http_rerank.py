@@ -166,6 +166,9 @@ def _hybrid_module(tmp_path: Any, monkeypatch: Any, env: dict[str, str]) -> Any:
     mod = _load_mcp_module_with_env({
         "HARS_MEMORY_INDEX_DIR": str(index_dir),
         "HARS_MEMORY_BM25_CACHE_DIR": str(index_dir / "bm25"),
+        # pin the fusion blend: the shipped default is now 0.15, this helper's
+        # fixtures assert a ranking computed at the neutral 0.5.
+        "HARS_MEMORY_HYBRID_ALPHA": "0.5",
         **env,
     })
     monkeypatch.setenv("HARS_MEMORY_RIPGREP_CHANNEL", "0")
