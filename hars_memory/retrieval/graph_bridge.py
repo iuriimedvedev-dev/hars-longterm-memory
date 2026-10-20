@@ -28,6 +28,26 @@ are the ones the review in `antigravity_tuning_review_v1.md` §2 Rank 1 proposed
 they are documented here as *chosen* constants, and the report under
 `eval_agentic/rca/graph_bridge/` measures what they actually buy.
 
+2026-10-20 fixes (measured in the 2026-10-20 retrieval-fixes artifact)
+-----------------------------------------------------------------
+1. **Seeds are per CHUNK, not per document.** Anchor-side seeds now come from
+   inverting `kv_store_entity_chunks.json` (the anchor chunk's own provenance),
+   capped at `MAX_ANCHOR_SEEDS = 25`. The document roster produced a measured
+   185-505 seeds/query on these indexes; the chunk roster produces ~24.
+2. **Every hop is degree/fan-out damped.** `weight *= hop_decay *
+   min(1, 1/(ln(2+deg(u)) * ln(2+fanout(v))))`. Without it a degree-400 seed
+   broadcast a full hop's weight through the nodes that co-occur with
+   everything.
+3. **Question-side entities are gated by corpus fan-out** (`<= 15`), not by
+   capitalization. There never was an uppercase-only filter in this module —
+   the matcher already matched lowercase single tokens; the noise was generic
+   *matched* words, which fan-out is the right property to filter.
+4. **The pool merge is additive**, not `max(score, 0.20)` (which could not lift
+   any in-pool chunk because every fused score is >= ~0.18):
+   `S_fused + lambda_bridge * S_bridge` in-pool, `tau_inject + lambda_bridge *
+   S_bridge` for injected candidates. The sweep put `tau_inject = 0`: a
+   non-zero floor evicted gold documents faster than it admitted new ones.
+
 WHY the citation/rare-identifier bonus is separate from the entity score
 -----------------------------------------------------------------------
 Two of the eight `hard_1k` strata (`multi_hop`, `disambiguation`) are built on
@@ -65,7 +85,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -129,6 +149,26 @@ MAX_HOP2_BRIDGES = 200
 #: cannot consume the whole 20-candidate budget (the merge into the pool then
 #: competes on score like every other channel).
 MAX_CHUNKS_PER_DOC = 2
+#: Maximum number of anchor-side entity seeds after the per-CHUNK provenance
+#: inversion. The document roster produced 185-505 seeds/query (mean) across
+#: these indexes, of which most belong to other sections of a long document and
+#: only dilute the traversal; the chunk's own extraction is the signal the
+#: 1-hop reachability measurement actually used.
+MAX_ANCHOR_SEEDS = 25
+#: Question-side entity gate: an entity whose chunk fan-out exceeds this is a
+#: corpus-wide word ("training", "before"), not a link. Replaces the (nonexistent
+#: in this codebase) "single-token must be uppercase" filter — that rule cannot
+#: work for lowercase user questions, and fan-out is the property that actually
+#: separates a name from a schema word.
+DEFAULT_ENTITY_FANOUT_MAX = 15
+#: Merge floor for a bridge candidate NOT already in the fused pool. Added to
+#: ``lambda_bridge * S_bridge``; see `augment_fused_pool`. Measured 0.0 on the
+#: 2026-10-20 sweep: every non-zero floor displaced a gold document from the
+#: 20-document window faster than the injected bridge chunk added one
+#: (hard_1k r@10 fell monotonically for tau in 0.1/0.2/0.3, both indexes).
+DEFAULT_TAU_INJECT = 0.0
+HARS_MEMORY_GRAPH_BRIDGE_TAU_ENV = "HARS_MEMORY_GRAPH_BRIDGE_TAU_INJECT"
+HARS_MEMORY_ENTITY_FANOUT_MAX_ENV = "HARS_MEMORY_ENTITY_FANOUT_MAX"
 
 _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
@@ -165,6 +205,30 @@ def graph_bridge_weight() -> float:
             DEFAULT_BRIDGE_WEIGHT,
         )
         return DEFAULT_BRIDGE_WEIGHT
+    return min(max(value, 0.0), 1.0)
+
+
+def entity_fanout_max() -> int:
+    """Effective question-seed fan-out gate (``HARS_MEMORY_ENTITY_FANOUT_MAX``)."""
+    raw = os.environ.get(HARS_MEMORY_ENTITY_FANOUT_MAX_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ENTITY_FANOUT_MAX
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_ENTITY_FANOUT_MAX
+    return max(value, 1)
+
+
+def graph_bridge_tau_inject() -> float:
+    """Effective injection floor (``HARS_MEMORY_GRAPH_BRIDGE_TAU_INJECT``)."""
+    raw = os.environ.get(HARS_MEMORY_GRAPH_BRIDGE_TAU_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_TAU_INJECT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TAU_INJECT
     return min(max(value, 0.0), 1.0)
 
 
@@ -320,41 +384,62 @@ class GraphBridgeStore:
     uuid_chunks: dict[str, tuple[str, ...]]
     entity_cf: dict[str, str]
     matcher: EntityMatcher
+    #: Inverted `entity_chunks`: chunk_id -> entities whose extraction
+    #: provenance includes that chunk. This is the per-CHUNK roster the anchor
+    #: seeding uses (the document roster belongs to the whole file, which on a
+    # 24-section markdown document is a different, much noisier signal).
+    chunk_entity: dict[str, tuple[str, ...]] = field(default_factory=dict)
     _degrees: dict[str, int] = field(default_factory=dict)
 
     # -- seeding ---------------------------------------------------------
 
-    def entity_seeds(self, text: str) -> list[str]:
-        """Entities named verbatim in `text` (case-folded, word-boundary)."""
-        return self.matcher.match(text)
+    def entity_seeds(self, text: str, *, fanout_max: int | None = None) -> list[str]:
+        """Entities named verbatim in `text`, gated by corpus fan-out.
+
+        The matcher itself is case-folded and accepts lowercase single tokens
+        (it always did — there is no uppercase-only filter in this codebase),
+        so the gate that matters is fan-out: an entity attached to more than
+        ``fanout_max`` chunks is a corpus-wide word, not a link. Read fresh
+        from ``HARS_MEMORY_ENTITY_FANOUT_MAX`` (default 15) unless overridden.
+        """
+        if not text:
+            return []
+        limit = entity_fanout_max() if fanout_max is None else max(fanout_max, 1)
+        out: list[str] = []
+        for name in self.matcher.match(text):
+            fanout = self.fanout(name)
+            if 0 < fanout <= limit:
+                out.append(name)
+        return out
 
     def anchor_seeds(
-        self, question: str, anchors: Sequence[Any], *, include_anchor_text_entities: bool = False
+        self,
+        question: str,
+        anchors: Sequence[Any],
+        *,
+        include_anchor_text_entities: bool = False,
+        chunk_provenance: bool = True,
+        max_anchor_seeds: int = MAX_ANCHOR_SEEDS,
+        entity_fanout_max: int | None = None,
     ) -> "AnchorSeeds":
         """Seeds from the question + the top-N already-fused anchor chunks.
 
         `anchors` are `FusedChunk`/`GraphBridgeChunk` objects (anything with
         `.content`, `.file_path` and optionally `.chunk_id`).
 
-        Entity seeds on the anchor side are the anchor DOCUMENT's extracted
-        entity roster from `kv_store_full_entities.json` — the exact seeding the
-        headroom measurement used (`root_cause/REPORT.md` §9: 85.7 % answer
-        reachability at 1 hop). Extraction is document-level, so the roster is
-        the union of the document's per-chunk extractions.
-
-        `include_anchor_text_entities=True` additionally matches every globally
-        known entity name in the anchor chunk text. On this corpus that is
-        measurably harmful rather than merely slow: a long anchor chunk matches
-        ~200 globally known names, and on 30 randomly sampled chunks **84 % of
-        those text matches are not entities of that document** — common English
-        words that happen to be *some* document's extracted entity ("before",
-        "Action", "staging"), and because they are one-off names their
-        `1/ln(1+fanout)` damping is maximal. It stays available as an escape
-        hatch for a partially-extracted index (where a document has no roster)
-        and is used automatically as the fallback in exactly that case.
+        Anchor-side seeds are the entities PROVENANCED TO THE ANCHOR CHUNK
+        (the inverted `kv_store_entity_chunks.json` map), capped at
+        ``max_anchor_seeds`` (25). Using the whole anchor DOCUMENT's roster
+        instead was measured to produce ~212 seeds/query on this corpus: on a
+        24-section markdown document most of those entities belong to other
+        sections, so the traversal starts from the wrong neighbourhood and
+        every generic one adds its own 1-hop fan-out. The document roster is
+        still the fallback for indexes/chunks without provenance, as is the
+        anchor text itself (see `include_anchor_text_entities`).
         """
-        question_entities = self.entity_seeds(question)
+        question_entities = self.entity_seeds(question, fanout_max=entity_fanout_max)
         anchor_entities: list[str] = []
+        priority_entities: list[str] = []
         seen: set[str] = set()
         cited_files: list[str] = []
         rare_ids: list[str] = []
@@ -363,7 +448,9 @@ class GraphBridgeStore:
             path = str(getattr(anchor, "file_path", "") or "")
             chunk_id = str(getattr(anchor, "chunk_id", "") or "")
             roster: tuple[str, ...] = ()
-            if chunk_id:
+            if chunk_provenance and chunk_id:
+                roster = self.entities_for_chunk(chunk_id)
+            if not roster and chunk_id:
                 roster = self.doc_entities_for_chunk(chunk_id)
             if not roster and path:
                 names: list[str] = []
@@ -372,7 +459,7 @@ class GraphBridgeStore:
                 roster = tuple(names)
             if roster:
                 if include_anchor_text_entities:
-                    for name in self.entity_seeds(text):
+                    for name in self.entity_seeds(text, fanout_max=entity_fanout_max):
                         if name not in seen:
                             seen.add(name)
                             anchor_entities.append(name)
@@ -381,9 +468,9 @@ class GraphBridgeStore:
                         seen.add(name)
                         anchor_entities.append(name)
             else:
-                # Partial index: this document has no extraction roster, so the
-                # chunk text is the only anchor-side signal available.
-                for name in self.entity_seeds(text):
+                # Partial index: this chunk has no provenance and its document
+                # no roster, so the chunk text is the only anchor-side signal.
+                for name in self.entity_seeds(text, fanout_max=entity_fanout_max):
                     if name not in seen:
                         seen.add(name)
                         anchor_entities.append(name)
@@ -400,11 +487,17 @@ class GraphBridgeStore:
                 canonical = self.entity_cf.get(run_id.casefold())
                 if canonical and canonical not in seen:
                     seen.add(canonical)
-                    anchor_entities.append(canonical)
-        # De-duplicate while preserving order.
+                    # Run ids are rare literal pointers (fan-out ~1): keep them
+                    # ahead of the roster when the cap truncates.
+                    priority_entities.append(canonical)
+        # De-duplicate while preserving order; run ids first so the cap cannot
+        # silently drop the most specific anchor evidence.
+        ordered = list(dict.fromkeys(priority_entities + anchor_entities))
+        if max_anchor_seeds > 0:
+            ordered = ordered[:max_anchor_seeds]
         return AnchorSeeds(
             question_entities=tuple(dict.fromkeys(question_entities)),
-            anchor_entities=tuple(anchor_entities),
+            anchor_entities=tuple(ordered),
             cited_files=tuple(cited_files),
             rare_ids=tuple(rare_ids),
         )
@@ -441,6 +534,15 @@ class GraphBridgeStore:
 
     def chunks_for_uuid(self, uuid_cf: str) -> tuple[str, ...]:
         return self.uuid_chunks.get(uuid_cf, ())
+
+    def entities_for_chunk(self, chunk_id: str) -> tuple[str, ...]:
+        """Entities whose extraction provenance includes ``chunk_id``.
+
+        Ordered most-specific-first (ascending chunk fan-out, then name) so
+        the ``MAX_ANCHOR_SEEDS`` cap keeps the names that actually identify
+        this chunk rather than the schema words that co-occur with everything.
+        """
+        return self.chunk_entity.get(chunk_id, ())
 
     def chunk_path(self, chunk_id: str) -> str:
         return self.chunk_file_path.get(chunk_id, "")
@@ -559,6 +661,17 @@ def _load_uncached(index_dir: Path) -> GraphBridgeStore:
         if chunk_ids:
             entity_chunks[str(name)] = tuple(str(cid) for cid in chunk_ids)
 
+    chunk_entity_lists: dict[str, list[str]] = {}
+    for name, chunk_ids in entity_chunks.items():
+        for chunk_id in chunk_ids:
+            chunk_entity_lists.setdefault(chunk_id, []).append(str(name))
+    chunk_entity = {
+        chunk_id: tuple(
+            sorted(names, key=lambda name: (len(entity_chunks.get(name, ())), name))
+        )
+        for chunk_id, names in chunk_entity_lists.items()
+    }
+
     chunk_file_path: dict[str, str] = {}
     chunk_content: dict[str, str] = {}
     chunk_doc_id: dict[str, str] = {}
@@ -629,6 +742,7 @@ def _load_uncached(index_dir: Path) -> GraphBridgeStore:
         uuid_chunks=uuid_chunks,
         entity_cf=entity_cf,
         matcher=EntityMatcher(vocabulary),
+        chunk_entity=chunk_entity,
     )
     logger.info(
         "graph_bridge: loaded %s in %.0f ms (entities=%d chunks=%d edges=%d)",
@@ -656,6 +770,7 @@ class BridgeScore:
 
 
 _DAMPING_CACHE: dict[int, float] = {}
+_EDGE_DAMPING_CACHE: dict[tuple[int, int], float] = {}
 
 
 def _damping(fanout: int) -> float:
@@ -669,6 +784,33 @@ def _damping(fanout: int) -> float:
     return value
 
 
+def _edge_damping(degree: int, fanout: int) -> float:
+    """`1 / (ln(2+deg(u)) * ln(2+fanout(v)))`, memoised by the pair.
+
+    The traversal previously multiplied only by ``HOP_DECAY``, so a seed with
+    graph degree 400 and a neighbour appearing in 70 chunks broadcast a full
+    weight through exactly the nodes most likely to co-occur with everything.
+    The two log terms damp BOTH ends of the hop. ``ln(2+·)`` (not ``ln(1+·)``)
+    keeps the factor finite and ≤1 at degree/fan-out 0, so isolated nodes are
+    not accidentally promoted.
+    """
+    key = (degree, fanout)
+    value = _EDGE_DAMPING_CACHE.get(key)
+    if value is None:
+        import math
+
+        # "Damped by ln(2+deg(u)) * ln(2+fanout(v))" is applied as a DIVISOR:
+        # a hub seed's full weight must be reduced (deg 400, fanout 70 -> 0.04),
+        # not multiplied (which would amplify it 25x). Capped at 1.0 so a
+        # degree-0/fan-out-0 node is merely un-damped, never promoted above the
+        # seed weight.
+        value = min(
+            1.0, 1.0 / (math.log(2.0 + degree) * math.log(2.0 + fanout))
+        )
+        _EDGE_DAMPING_CACHE[key] = value
+    return value
+
+
 def _traverse(
     store: GraphBridgeStore,
     seeds: AnchorSeeds,
@@ -677,6 +819,7 @@ def _traverse(
     hub_fanout_cap: int,
     hop_decay: float,
     bridge_degree_cap: int,
+    degree_damped: bool = True,
 ) -> dict[str, tuple[float, int]]:
     """Reached entities -> (weight, hop). Weights are max-merged across paths."""
 
@@ -726,6 +869,10 @@ def _traverse(
                 if neighbour_chunks is not None and len(neighbour_chunks) > hub_fanout_cap:
                     continue
                 neighbour_weight = weight * hop_decay
+                if degree_damped:
+                    neighbour_weight *= _edge_damping(
+                        store.degree(entity), len(neighbour_chunks or ())
+                    )
                 previous = reached.get(neighbour)
                 if previous is not None and previous[0] >= neighbour_weight:
                     continue
@@ -749,6 +896,7 @@ def score_candidates(
     citation_bonus: float = CITATION_BONUS,
     exclude_files: Sequence[str] = (),
     limit: int | None = None,
+    degree_damped: bool = True,
 ) -> list[BridgeScore]:
     """Score every reachable provenance chunk for one query (materialised).
 
@@ -768,6 +916,7 @@ def score_candidates(
         citation_bonus=citation_bonus,
         anchor_paths=anchor_paths,
         limit=limit,
+        degree_damped=degree_damped,
     )
     return scored
 
@@ -783,6 +932,7 @@ def _score_with_total(
     citation_bonus: float,
     anchor_paths: Sequence[str],
     limit: int | None,
+    degree_damped: bool = True,
 ) -> tuple[list[BridgeScore], int]:
     """The channel's scoring pass; returns the ranked head plus the total count."""
     reached = _traverse(
@@ -792,6 +942,7 @@ def _score_with_total(
         hub_fanout_cap=hub_fanout_cap,
         hop_decay=hop_decay,
         bridge_degree_cap=bridge_degree_cap,
+        degree_damped=degree_damped,
     )
 
     raw: dict[str, float] = {}
@@ -906,6 +1057,10 @@ def bridge_candidates(
     bridge_degree_cap: int = BRIDGE_DEGREE_CAP,
     citation_bonus: float = CITATION_BONUS,
     weight: float | None = None,
+    degree_damped: bool = True,
+    chunk_provenance: bool = True,
+    max_anchor_seeds: int = MAX_ANCHOR_SEEDS,
+    entity_fanout_max: int | None = None,
 ) -> tuple[list[GraphBridgeChunk], dict[str, Any]]:
     """The channel's contribution for one query: up to ``limit`` scored chunks.
 
@@ -914,7 +1069,13 @@ def bridge_candidates(
     into a fused pool whose scores live in [0, 1].
     """
     effective_weight = graph_bridge_weight() if weight is None else weight
-    seeds = store.anchor_seeds(question, anchors)
+    seeds = store.anchor_seeds(
+        question,
+        anchors,
+        chunk_provenance=chunk_provenance,
+        max_anchor_seeds=max_anchor_seeds,
+        entity_fanout_max=entity_fanout_max,
+    )
     report: dict[str, Any] = {
         "seed_question_entities": len(seeds.question_entities),
         "seed_anchor_entities": len(seeds.anchor_entities),
@@ -939,6 +1100,7 @@ def bridge_candidates(
         citation_bonus=citation_bonus,
         anchor_paths=anchor_paths,
         limit=max(limit * 10, limit),
+        degree_damped=degree_damped,
     )
     report["scored"] = scored_total
     if not scored:
@@ -1001,23 +1163,51 @@ def augment_fused_pool(
     anchor_window: int = ANCHOR_WINDOW,
     candidates: Sequence[FusedChunk] | None = None,
     max_hops: int = MAX_HOPS,
+    additive: bool = True,
+    tau_inject: float | None = None,
+    degree_damped: bool = True,
+    chunk_provenance: bool = True,
+    max_anchor_seeds: int = MAX_ANCHOR_SEEDS,
+    entity_fanout_max: int | None = None,
 ) -> tuple[list[FusedChunk], dict[str, Any]]:
     """Merge the channel's candidates into an already-fused pool.
 
-    Contract (the brief's wording): existing entries are never REPLACED — their
-    dense/sparse provenance fields and identity are preserved — only their
-    ``fused_score`` is raised when the bridge score is higher. New entries are
-    appended. The result is re-sorted with the same key `fuse()` uses
-    (``(-fused_score, chunk_id)``) so downstream code sees one ordered pool.
+    Contract: existing entries are never REMOVED or REPLACED — their
+    dense/sparse provenance fields and identity are preserved.
 
-    ``candidates`` lets a caller reuse one candidate set across several weights
-    (the offline weight sweep), rather than re-traversing the graph per weight.
+    ``additive=True`` (default, the measured fix) merges as::
+
+        in-pool  : S_fused(c) + lambda_bridge * S_bridge(c)
+        injected : tau_inject + lambda_bridge * S_bridge(c)
+
+    where ``lambda_bridge`` is ``weight`` (0.2) and ``S_bridge`` is the
+    channel's normalised score in [0, 1]. The previous rule
+    ``max(S_fused, 0.20)`` was a no-op for every in-pool chunk — all fused
+    scores are >= ~0.18 and the bridge candidate's max was exactly 0.20 — so
+    the channel could only ever ADD chunks, never reorder the pool it was
+    seeded from. ``tau_inject`` raises genuinely new (out-of-pool) documents
+    into the window; it defaults to 0 because the sweep measured every
+    non-zero floor as net-negative (it evicts gold documents faster than it
+    admits new ones).
+
+    ``additive=False`` reproduces the legacy max/skip merge for measurement.
+    ``candidates`` lets a caller reuse one candidate set across several
+    weights/lambdas rather than re-traversing per weight.
     """
     started = time.perf_counter()
     if candidates is None:
         anchors = list(pool[:anchor_window])
         candidates, report = bridge_candidates(
-            store, question, anchors, limit=limit, weight=weight, max_hops=max_hops
+            store,
+            question,
+            anchors,
+            limit=limit,
+            weight=weight,
+            max_hops=max_hops,
+            degree_damped=degree_damped,
+            chunk_provenance=chunk_provenance,
+            max_anchor_seeds=max_anchor_seeds,
+            entity_fanout_max=entity_fanout_max,
         )
     else:
         report = {"reused_candidates": len(candidates), "scored": len(candidates)}
@@ -1026,6 +1216,7 @@ def augment_fused_pool(
         report["applied"] = False
         return list(pool), report
 
+    floor = graph_bridge_tau_inject() if tau_inject is None else max(tau_inject, 0.0)
     by_id = {chunk.chunk_id: chunk for chunk in pool}
     candidate_by_id = {item.chunk_id: item for item in candidates}
     boosted = 0
@@ -1033,27 +1224,32 @@ def augment_fused_pool(
     merged: list[FusedChunk] = []
     for chunk in pool:
         candidate = candidate_by_id.get(chunk.chunk_id)
-        if candidate is not None and candidate.fused_score > chunk.fused_score:
-            from dataclasses import replace
-
+        if candidate is None:
+            merged.append(chunk)
+            continue
+        if additive:
+            merged.append(
+                replace(chunk, fused_score=chunk.fused_score + candidate.fused_score)
+            )
+            boosted += 1
+        elif candidate.fused_score > chunk.fused_score:
             merged.append(replace(chunk, fused_score=candidate.fused_score))
-            by_id[chunk.chunk_id] = merged[-1]
             boosted += 1
         else:
             merged.append(chunk)
     for candidate in candidates:
         if candidate.chunk_id not in by_id:
-            merged.append(candidate)
+            merged.append(
+                replace(candidate, fused_score=floor + candidate.fused_score)
+                if additive
+                else candidate
+            )
             by_id[candidate.chunk_id] = candidate
             added += 1
-    # STABLE sort on score only. `fuse()` already ordered the pool with its own
-    # deterministic tie-break; re-sorting on `(-score, chunk_id)` would silently
-    # swap equal-scored chunks (measured: two 0.85-scored duplicate documents on
-    # the 48q set flipped, costing 2 rank-1 queries — a merge artefact, not a
-    # bridge effect). Stability keeps the existing order for ties; new bridge
-    # candidates land after an equal-scored incumbent.
     merged.sort(key=lambda chunk: -chunk.fused_score)
     report["applied"] = True
+    report["merge_mode"] = "additive" if additive else "legacy_max"
+    report["tau_inject"] = floor
     report["boosted_existing"] = boosted
     report["added_new"] = added
     report["weight"] = graph_bridge_weight() if weight is None else weight

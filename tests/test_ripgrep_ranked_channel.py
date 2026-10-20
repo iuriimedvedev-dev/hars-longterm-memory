@@ -70,7 +70,9 @@ class TestDefaults:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv(HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV, raising=False)
-        assert ripgrep_channel_weight() == pytest.approx(0.25)
+        # 0.10 since the 2026-10-20 chunk-local rework (was 0.25 for the
+        # file-level scorer; see fusion.py's constant comment).
+        assert ripgrep_channel_weight() == pytest.approx(0.10)
 
         monkeypatch.setenv(HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT_ENV, "0.5")
         assert ripgrep_channel_weight() == pytest.approx(0.5)
