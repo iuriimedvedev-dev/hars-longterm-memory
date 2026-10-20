@@ -259,7 +259,7 @@ class TestCoords:
         assert "xyz" not in body["entities"]
         assert len(body["entities"]["xy"]) == 5
 
-    async def test_missing_cache_without_umap_is_503_with_offline_hint(
+    async def test_missing_cache_without_umap_serves_fallback(
         self, index_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Deterministically force the "umap not importable" branch (this venv
@@ -272,14 +272,15 @@ class TestCoords:
         finally:
             server.close()
             await server.wait_closed()
-        assert r.status_code == 503
+        assert r.status_code == 200
         body = r.json()
-        assert body["ok"] is False and body["error"] == "coords_not_cached"
-        assert "export_cosmos.py" in body["hint"]
+        assert body["ok"] is True
+        assert len(body["entities"]["ids"]) == 5
+        assert len(body["entities"]["xyz"]) == 5
 
-    async def test_stale_cache_is_not_served(self, index_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_stale_cache_is_served(self, index_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         _write_fresh_cache(index_dir)
-        # bump a vdb mtime past the cached fingerprint -> must not serve it
+        # bump a vdb mtime past the cached fingerprint -> must still serve cached projection
         monkeypatch.setitem(sys.modules, "umap", None)
         import os as _os
 
@@ -292,8 +293,36 @@ class TestCoords:
         finally:
             server.close()
             await server.wait_closed()
-        assert r.status_code == 503
-        assert r.json()["error"] == "coords_not_cached"
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert r.json()["entities"]["ids"] == ["hub", "a", "b", "c", "lonely"]
+
+    async def test_head_coords_returns_200(self, index_dir: Path) -> None:
+        _write_fresh_cache(index_dir)
+        server = await _server()
+        port = server.sockets[0].getsockname()[1]
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.head(f"http://127.0.0.1:{port}/coords?dim=3")
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/json; charset=utf-8"
+        assert int(r.headers["content-length"]) > 0
+        assert r.content == b""
+
+    async def test_graph_stats_prefix_handled(self, index_dir: Path) -> None:
+        _write_fresh_cache(index_dir)
+        server = await _server()
+        port = server.sockets[0].getsockname()[1]
+        try:
+            r = await _get(f"http://127.0.0.1:{port}/graph-stats/coords?dim=3")
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
 
     async def test_post_is_405(self, index_dir: Path) -> None:
         server = await _server()
