@@ -15,6 +15,28 @@ touches multiple modules at once (e.g. a retrieval-fusion change that spans
 `retrieval/fusion.py` + `mcp_server.py` + tests) — verify every such change
 with `uv run pytest -q` before considering it done.
 
+## Run artifacts — never lose a run
+
+Every benchmark, eval, sweep, indexing apply, training run or model bake-off must
+persist its **complete** artifacts, not just a summary. Write to:
+
+```
+/mnt/datasets/ft/artifacts/<UTC-timestamp>-<name>/
+```
+
+with, at minimum:
+
+- `samples.jsonl` — per item: input id/path, raw model output, reasoning text
+  (if the model emits any), usage/cost, metrics, latency;
+- `summary.json` — aggregate metrics;
+- `run.log` — stdout/stderr;
+- `inputs/` — the exact inputs used (a copy, or a hash + canonical path);
+- `scripts/` — the scripts that produced the run plus the exact command line;
+- `MANIFEST.json` — machine, model ids, parameters, start/end time, cost.
+
+A summary without per-sample outputs is **not** an artifact. Never write run
+outputs only to `/tmp` (it is swept); `/tmp` is for scratch work in progress.
+
 ## `.session/` and `.plans/` protocol
 
 - Before starting non-trivial work, check `.session/` (most recent files
