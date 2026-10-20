@@ -45,6 +45,23 @@ export interface GraphNode {
   seed: boolean;
 }
 
+/** Optional traversal counters. Older/synthetic traces omit this block; the
+ *  explainer then says "not recorded" instead of drawing an invented number. */
+export interface GraphWalkStats {
+  /** Distinct 1-hop neighbours of the seeds in the FULL graph. */
+  full_neighbour_count?: number | null;
+  /** Node cap applied when the display subgraph was compiled. */
+  node_cap?: number | null;
+  /** True when the cap actually cut the display subgraph. */
+  truncated?: boolean | null;
+  /** Server-side hub pruning: entity degree above this was not walked through. */
+  hub_cutoff_degree?: number | null;
+  /** Server-side hub pruning: chunk fan-out above this was not walked through. */
+  hub_cutoff_fanout?: number | null;
+  /** How many entities hub pruning removed, when measured by the producer. */
+  pruned_hubs?: number | null;
+}
+
 export interface TraceMeta {
   id: string;
   question: string;
@@ -57,10 +74,17 @@ export interface TraceMeta {
   fetch_top_k: number | null;
   candidate_pool: number | null;
   alpha: number | null;
-  latency_ms: { dense: number | null; sparse: number | null; rerank: number | null };
+  latency_ms: { dense: number | null; sparse: number | null; rerank: number | null; graph?: number | null };
   confidence: { low: boolean | null; threshold: number | null; top_dense: number | null };
   bm25_chunks: number | null;
   client_latency_s: number | null;
+  /** Channel counters the bridge reported; null/absent when the trace has none. */
+  channels?: {
+    dense: number | null;
+    bm25: number | null;
+    ripgrep: { matched: number | null; injected: number | null; hits: number | null; enabled: boolean | null } | null;
+    graphBridge: { enabled: boolean | null; reason: string | null; entities: number | null } | null;
+  };
 }
 
 export interface TravelTrace {
@@ -70,7 +94,7 @@ export interface TravelTrace {
   bm25_hits: ChunkHit[];
   fusion: ChunkHit[];
   rerank: RerankInfo;
-  graph: { nodes: GraphNode[]; edges: [number, number][] };
+  graph: { nodes: GraphNode[]; edges: [number, number][]; stats?: GraphWalkStats };
   context_blocks: {
     entities: { entity: string; type?: string; description?: string }[];
     relations: { entity1: string; entity2: string; description?: string }[];

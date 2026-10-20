@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useI18n } from "../i18n/useI18n";
+import { fmt } from "../i18n/strings";
+import GraphWalkExplainer from "./GraphWalkExplainer";
 import {
   CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   MaximizeIcon,
   MinimizeIcon,
-  NodesIcon,
   SparkIcon,
   XIcon,
 } from "./icons";
@@ -70,8 +71,8 @@ const STAGES_DEF: StageInfo[] = [
     num: 4,
     titleEn: "Graph walk",
     titleRu: "Обход графа",
-    subEn: "LightRAG 1-hop BFS traversal",
-    subRu: "Связи графа знаний · BFS",
+    subEn: "Question tokens, seeds, neighbours, chunks",
+    subRu: "Токены, seeds, соседи, чанки",
     color: "#ffd166",
   },
   {
@@ -116,7 +117,7 @@ export default function PipelineWidget({
   onClose,
   elapsedS,
 }: PipelineWidgetProps) {
-  const { lang } = useI18n();
+  const { t, lang } = useI18n();
   const [minimized, setMinimized] = useState(false);
   const [expandedStage, setExpandedStage] = useState<number | null>(currentStage);
 
@@ -166,24 +167,37 @@ export default function PipelineWidget({
           ms: trace.meta.latency_ms.sparse ?? 34,
           detail: `${trace.bm25_hits.length} hits · ${trace.meta.bm25_chunks ?? 2800} chunks`,
         };
-      case 3:
+      case 3: {
+        const seedCount = trace.graph.nodes.filter((n) => n.seed).length;
+        const neighbourCount = trace.graph.nodes.length - seedCount;
+        const k = Math.min(trace.meta.top_k ?? trace.fusion.length, trace.fusion.length);
         return {
           status: "done",
-          ms: 140,
-          detail: `${trace.graph.nodes.length} nodes · ${trace.graph.edges.length} edges`,
+          ms: trace.meta.latency_ms.graph ?? null,
+          detail: fmt(t.hiwStageDetail, { seeds: seedCount, neighbors: neighbourCount, kept: k }),
         };
+      }
       case 4:
         return {
           status: "done",
           ms: trace.meta.latency_ms.rerank ?? 110,
           detail: `α=${trace.meta.alpha ?? 0.5} · top ${trace.fusion.length}`,
         };
-      case 5:
+      case 5: {
+        const cb = trace.context_blocks;
+        const docs = new Set(
+          (cb.sources ?? []).map((s) => s.doc).filter((d) => d && d !== "unknown"),
+        ).size;
         return {
           status: "done",
           ms: 65,
-          detail: `${trace.context_blocks.entities.length} facts · ${trace.context_blocks.source_count} docs`,
+          detail: fmt(t.hiwStageContextDetail, {
+            facts: cb.entities.length,
+            docs,
+            sources: cb.source_count ?? cb.sources.length,
+          }),
         };
+      }
       case 6:
         return {
           status: "done",
@@ -344,6 +358,7 @@ export default function PipelineWidget({
                       onFocusChunk={onFocusChunk}
                       onFocusNode={onFocusNode}
                       lang={lang}
+                      t={t}
                     />
                   </div>
                 )}
@@ -383,6 +398,7 @@ function StageDetailView({
   onFocusChunk,
   onFocusNode,
   lang,
+  t,
 }: {
   stageIdx: number;
   trace: TravelTrace | null;
@@ -390,6 +406,7 @@ function StageDetailView({
   onFocusChunk: (chunk: ChunkHit) => void;
   onFocusNode: (nodeIndex: number) => void;
   lang: "en" | "ru";
+  t: ReturnType<typeof useI18n>["t"];
 }) {
   if (!trace) {
     return (
@@ -514,57 +531,16 @@ function StageDetailView({
     );
   }
 
-  // 4: Graph walk
+  // 4: Graph walk — the five-step explainer (found, expanded, provenance, ranked, context)
   if (stageIdx === 3) {
-    const seeds = trace.graph.nodes.filter((n) => n.seed);
-    const neighbors = trace.graph.nodes.filter((n) => !n.seed);
     return (
       <div className="pw-stage-pane">
-        <div className="pw-pane-header-info">
-          <span>
-            {seeds.length} seeds · {neighbors.length} neighbors
-          </span>
-          <span className="dim">{trace.graph.edges.length} edges</span>
-        </div>
-        <div className="pw-entities-section">
-          <span className="pw-section-title gold">
-            {lang === "ru" ? "Исходные сущности (seeds):" : "Seed Entities:"}
-          </span>
-          <div className="pw-entity-buttons">
-            {seeds.slice(0, 8).map((n) => (
-              <button
-                key={n.name}
-                className="pw-entity-btn seed"
-                onClick={() => onFocusNode(n.i)}
-                title={`Type: ${n.type} · Degree: ${n.deg}`}
-              >
-                <NodesIcon size={11} />
-                <span className="pw-ent-name">{n.name}</span>
-                <span className="pw-ent-deg">{n.deg}</span>
-              </button>
-            ))}
-          </div>
-
-          {neighbors.length > 0 && (
-            <>
-              <span className="pw-section-title magenta" style={{ marginTop: 8 }}>
-                {lang === "ru" ? "1-hop соседи:" : "1-hop Neighbors:"}
-              </span>
-              <div className="pw-entity-buttons">
-                {neighbors.slice(0, 8).map((n) => (
-                  <button
-                    key={n.name}
-                    className="pw-entity-btn neighbor"
-                    onClick={() => onFocusNode(n.i)}
-                  >
-                    <span className="pw-ent-name">{n.name}</span>
-                    <span className="pw-ent-deg">{n.deg}</span>
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
+        <GraphWalkExplainer
+          trace={trace}
+          t={t}
+          onFocusNode={onFocusNode}
+          onFocusChunk={onFocusChunk}
+        />
       </div>
     );
   }
