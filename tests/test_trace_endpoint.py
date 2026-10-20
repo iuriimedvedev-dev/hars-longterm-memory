@@ -309,7 +309,7 @@ class TestRealPipelineTrace:
         assert by_name["vector_hits"]["latency_ms"] >= 0
         assert by_name["vector_hits"]["embedder"]
         assert any(h["chunk_id"] == "chunk-1" for h in by_name["vector_hits"]["hits"])
-        assert by_name["fusion"]["alpha"] == 0.5
+        assert by_name["fusion"]["alpha"] == mod.HARS_MEMORY_HYBRID_ALPHA
         assert by_name["fusion"]["order"]  # true pre-rerank order, measured
         assert by_name["rerank"]["before"] == by_name["fusion"]["order"]
         assert by_name["graph_expand"]["entity_count"] == 1
