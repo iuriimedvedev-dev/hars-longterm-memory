@@ -169,16 +169,16 @@ class TestEntityMatcher:
     def test_word_boundary_not_substring(self):
         from hars_memory.retrieval.graph_bridge import EntityMatcher
 
-        matcher = EntityMatcher(["VEA", "Alpha"])
-        assert matcher.match("the VEA report") == ["VEA"]
-        # "VEAR" must NOT match "VEA"; "Alphabet" must NOT match "Alpha".
-        assert matcher.match("VEAR and Alphabet") == []
+        matcher = EntityMatcher(["ACME", "Alpha"])
+        assert matcher.match("the ACME report") == ["ACME"]
+        # "ACMER" must NOT match "ACME"; "Alphabet" must NOT match "Alpha".
+        assert matcher.match("ACMER and Alphabet") == []
 
     def test_case_folded(self):
         from hars_memory.retrieval.graph_bridge import EntityMatcher
 
-        matcher = EntityMatcher(["VEA Annotation Factory"])
-        assert matcher.match("vea annotation factory report") == ["VEA Annotation Factory"]
+        matcher = EntityMatcher(["ACME Annotation Factory"])
+        assert matcher.match("acme annotation factory report") == ["ACME Annotation Factory"]
 
     def test_multiword_must_be_contiguous(self):
         from hars_memory.retrieval.graph_bridge import EntityMatcher
