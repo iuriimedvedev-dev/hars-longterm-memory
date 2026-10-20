@@ -77,7 +77,7 @@ Fixed, almost full-height panel with large padding. Content order:
 `buildChain()` in `lib/presChain.ts` derives one row per hop from the trace:
 
 ```
-question      How does quota claim work?      keywords: 4
+question      How does the memory combine dense and graph retrieval?   keywords: 6
 candidates    17                              dense 12 · BM25 12 · pool 18
 graph walk    10 seeds                        14 neighbours · 50 edges
 fusion        6 in the fused top              top_k 6 · α 0.5

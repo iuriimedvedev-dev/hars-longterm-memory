@@ -8,25 +8,22 @@ import CosmosCanvas from "./CosmosCanvas";
 import { INK, toWorld3, type RGBA, type SelectedNode, type XYZ } from "../lib/cosmos";
 import type { AnyCosmos } from "../lib/cosmos2d";
 import { asJourney3D, type Journey3D } from "../lib/cosmos3d";
-import { loadIngestFixture, loadTrace } from "../lib/data";
-import { compileLiveTrace } from "../lib/compileLive";
-import { fetchLiveTraceJson, CANONICAL_QUESTION, CANONICAL_KEYWORDS } from "../lib/live";
 import type { LoadedCosmos, SourcePhase } from "../lib/cosmosSource";
+import { runLiveRecall } from "../lib/liveRecall";
+import { emptySteps, type RecallStep, type StepId } from "../lib/live";
 import { makeTimeline, type Timeline } from "../lib/reveal";
 import { CHAPTERS, type PresCtx } from "../lib/presentation";
 import { buildChain, type AnswerPart } from "../lib/presChain";
 import { getUiScale } from "../lib/uiScale";
-import type { ChunkHit, CosmosGraph, IngestFixture, TravelTrace } from "../lib/types";
+import { prefersReducedMotion } from "../lib/motion";
+import type { ChunkHit, CosmosGraph, TravelTrace } from "../lib/types";
 import type { Dict } from "../i18n/strings";
+import { fmt } from "../i18n/strings";
 import { useI18n } from "../i18n/useI18n";
-import { IngestPanel } from "./IngestPanel";
 import { PresDataPanel } from "./PresDataPanel";
 import { PresNarrationPanel } from "./PresNarrationPanel";
 import { XIcon } from "./icons";
 import { Inspector, type Inspection } from "./Inspector";
-
-/** Chapters whose data is owed the trace-driven left column. */
-const TRACE_CHAPTERS = new Set(["embed", "channels", "graph", "fusion", "context", "answer"]);
 
 interface BadgePin {
   rank?: number;
@@ -90,55 +87,38 @@ function flyCameraToPoints(
     cz + dist * zOffset,
   ];
   const target: XYZ = [cx, cy, cz];
-  j3d.cameraFly(pos, target, options?.duration ?? 1300, "inout");
+  j3d.cameraFly(pos, target, prefersReducedMotion() ? 1 : (options?.duration ?? 1300), "inout");
 }
 
 interface PresProps {
   onExit: () => void;
-  /** The app-level cosmos data (live or demo) — the SAME source the main
-   *  views render; the presentation never loads its own graph. */
+  /** The connected memory's cosmos (live). The deck refuses to run on the
+   *  synthetic snapshot: it always recalls against the live index. */
   data: LoadedCosmos | null;
-  /** App-level source phase; unreachable shows the honest gate, demo gates
-   *  the fixture-only chapters (ingest note, trace_01). */
   source: SourcePhase;
-  /** Latest live recall (chapters 3-8 replay it in live mode when present). */
-  liveTrace: TravelTrace | null;
-  onOpenDemo: () => void;
+  /** Only used to pre-fill the question input (e.g. the last query-bar ask). */
+  preferredQuestion: string | null;
   onRetryLive: () => void;
 }
 
-/** Fixture-only chapters (ingest, demo trace replay) in live/unreachable
- *  mode: an honest gate instead of silently showing another index's data. */
-function PresGate({ source, onOpenDemo, onRetryLive, what }: {
-  source: SourcePhase;
-  onOpenDemo: () => void;
-  onRetryLive: () => void;
-  what: "ingest" | "trace";
-}) {
-  const { t } = useI18n();
-  return (
-    <div className="presgate" role="status">
-      <b>{what === "ingest" ? t.presGateIngestTitle : t.presGateTraceTitle}</b>
-      <p className="dim">{what === "ingest" ? t.presGateIngestBody : t.presGateTraceBody}</p>
-      <div className="overlay-actions">
-        {source.phase !== "demo" && <button className="primary" onClick={onOpenDemo}>{t.openDemo}</button>}
-        {(source.phase === "unreachable" || source.phase === "demo") && (
-          <button onClick={onRetryLive}>{source.phase === "demo" ? t.backToLive : t.retryConnection}</button>
-        )}
-      </div>
-    </div>
-  );
-}
+/** One streamed stage row, lit as its SSE frame arrives. */
+const STEP_LABEL: Record<StepId, { en: string; ru: string }> = {
+  keywords: { en: "keywords", ru: "ключевые слова" },
+  dense: { en: "dense (vector)", ru: "dense (вектор)" },
+  sparse: { en: "BM25 (sparse)", ru: "BM25 (sparse)" },
+  graph: { en: "graph walk", ru: "обход графа" },
+  fusion: { en: "fusion", ru: "фьюжн" },
+  rerank: { en: "rerank", ru: "реранк" },
+  context: { en: "context assembly", ru: "сборка контекста" },
+  total: { en: "total", ru: "итого" },
+};
 
-export default function PresentationView({ onExit, data, source, liveTrace, onOpenDemo, onRetryLive }: PresProps) {
+export default function PresentationView({ onExit, data, source, preferredQuestion, onRetryLive }: PresProps) {
   const { t, lang, setLangL10n } = useI18n();
   const [chapter, setChapter] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [insp, setInsp] = useState<Inspection | null>(null);
   const [progress, setProgress] = useState<string | null>(t.presLoading);
-  const [fixture, setFixture] = useState<IngestFixture | null>(null);
-  /** true while the full-note overlay is open (Esc closes it first). */
-  const [detailOpen, setDetailOpen] = useState(false);
   /** left data column: collapsible below the three-column breakpoint. */
   const [dataOpen, setDataOpen] = useState(false);
   /** citation focused from the final-answer panel (1-based). */
@@ -159,13 +139,23 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
   const jTrace = cosmosTrace ? asJourney3D(cosmosTrace) : null;
 
   const ch = CHAPTERS[chapter];
+  const isLive = data?.source === "live";
   const ctx: PresCtx = useMemo(
     () => ({
       trace,
+      // demo numbers come from the fixture-derived identity, never /api/stats
       nodes: data?.identity?.nodes ?? graph?.nodes.length ?? 0,
       edges: data?.identity?.edges ?? graph?.edges.length ?? 0,
+      source:
+        source.phase === "live"
+          ? "live"
+          : source.phase === "demo"
+            ? "demo"
+            : source.phase === "unreachable"
+              ? "offline"
+              : "pending",
     }),
-    [trace, graph, data],
+    [trace, graph, data, source.phase],
   );
 
   /** The derivation chain, rebuilt from the same trace on every chapter/lang switch. */
@@ -210,96 +200,76 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
     );
   }, [dataKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ---- Chapter 2: Ingest panel fixture (real SRE note with extraction records)
-  useEffect(() => {
-    let dead = false;
-    loadIngestFixture()
-      .then((fx) => !dead && setFixture(fx as IngestFixture))
-      .catch(() => undefined);
-    return () => {
-      dead = true;
-    };
+  // ---- The deck is query-driven: NOTHING is replayed until the presenter
+  // types a question. Each submission runs a real `memory_recall` on the
+  // connected index and consumes its trace SSE, so every stage/chapter value
+  // comes from that query. There is no fixture path and no default question.
+  const liveReady = source.phase === "live" && data?.source === "live";
+  const [draft, setDraft] = useState<string>(preferredQuestion ?? "");
+  /** The submitted question; null = the ask screen is showing. */
+  const [question, setQuestion] = useState<string | null>(null);
+  const [recall, setRecall] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [recallError, setRecallError] = useState<string | null>(null);
+  const [steps, setSteps] = useState<RecallStep[]>(emptySteps);
+  const [attempt, setAttempt] = useState(0);
+  const recallKeyRef = useRef<string | null>(null);
+
+  const submitQuestion = useCallback(() => {
+    const q = draft.trim().slice(0, 500);
+    if (!q) return;
+    setDraft(q);
+    setQuestion(q);
+    setChapter(0);
+    setActiveCite(null);
+    setAttempt((a) => a + 1);
+  }, [draft]);
+
+  const askAgain = useCallback(() => {
+    recallKeyRef.current = null;
+    setQuestion(null);
+    setTrace(null);
+    setRecall("idle");
+    setRecallError(null);
+    setSteps(emptySteps());
   }, []);
 
-  // ---- Chapters 3-8 trace:
-  // Live mode: fetch REAL trace from the live HARS memory trace API (/travel/api/trace/trace)
-  // compiled on the real live index; fallback to real production trace snapshot.
-  const demoMode = source.phase === "demo";
   useEffect(() => {
-    let dead = false;
-
-    // 1. If liveTrace was already provided by caller (e.g. from query bar), use it
-    if (liveTrace) {
-      setTrace(liveTrace);
-      return;
-    }
-
-    // 2. Explicit demo mode: load baked real trace
-    if (demoMode) {
-      loadTrace("traces/trace_01.json")
-        .then((tr) => !dead && setTrace(tr))
-        .catch(() => undefined);
-      return;
-    }
-
-    // 3. Live mode: fetch real trace from the live HARS memory trace API!
-    let cancelled = false;
-    async function loadRealTrace() {
-      try {
-        const { result, events, clientLatencyS } = await fetchLiveTraceJson(CANONICAL_QUESTION, {
-          keywords: CANONICAL_KEYWORDS,
-          timeoutMs: 15_000,
-        });
-        if (cancelled || dead) return;
-
-        if (data) {
-          const idxOf = new Map(data.names.map((n, i) => [n, i] as const));
-          const entityXy = new Map<string, [number, number]>();
-          const entityXyz = new Map<string, XYZ>();
-          data.graph.nodes.forEach((n, i) => {
-            const v = posByIdx ? posByIdx[i] : null;
-            if (v) {
-              entityXyz.set(n.id, v);
-              entityXy.set(n.id, [v[0], v[1]]);
-            }
-          });
-          const compiled = compileLiveTrace(
-            CANONICAL_QUESTION,
-            result,
-            clientLatencyS,
-            {
-              graph: data.graph,
-              idxOf,
-              entityXy,
-              entityXyz,
-              chunkXyz: data.chunkCoords ?? {},
-            },
-            events,
-          );
-          if (!cancelled && !dead) {
-            setTrace(compiled);
-            return;
-          }
-        }
-      } catch (e) {
-        console.warn("Live trace API fetch failed, falling back to canonical trace:", e);
-      }
-
-      // Offline fallback: load real canonical production trace from trace_01.json
-      if (!cancelled && !dead) {
-        loadTrace("traces/trace_01.json")
-          .then((tr) => !cancelled && !dead && setTrace(tr))
-          .catch(() => undefined);
-      }
-    }
-
-    loadRealTrace();
-
+    if (!question || !liveReady || !data) return;
+    const key = `${data.identity?.index_id ?? "-"}::${question}::${attempt}`;
+    if (recallKeyRef.current === key) return;
+    recallKeyRef.current = key;
+    const ctrl = new AbortController();
+    setRecall("running");
+    setRecallError(null);
+    setTrace(null);
+    setSteps(emptySteps());
+    const startedAt = performance.now();
+    runLiveRecall(question, data, { signal: ctrl.signal, onSteps: setSteps })
+      .then(async (run) => {
+        // Keep the streamed rows on screen long enough to read: a ~1s recall
+        // otherwise flashes the progress panel away before a frame is legible.
+        const rest = prefersReducedMotion() ? 0 : 1100 - (performance.now() - startedAt);
+        if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+        if (ctrl.signal.aborted) return;
+        setTrace(run.trace);
+        setSteps(run.steps);
+        setRecall("done");
+      })
+      .catch((e: unknown) => {
+        if (ctrl.signal.aborted) return;
+        setRecallError(e instanceof Error ? e.message : String(e));
+        setRecall("error");
+      });
     return () => {
-      cancelled = true;
-      dead = true;
+      ctrl.abort();
+      if (recallKeyRef.current === key) recallKeyRef.current = null;
     };
-  }, [demoMode, liveTrace, dataKey, posByIdx]);
+  }, [liveReady, data, question, attempt]);
+
+  const retryRecall = useCallback(() => {
+    recallKeyRef.current = null;
+    setAttempt((a) => a + 1);
+  }, []);
 
   // honest progress when there is no data yet (probing / not connected)
   useEffect(() => {
@@ -535,47 +505,67 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
         trace.graph.nodes.forEach((n, li) => g2g.set(n.i, li));
 
         const seedIndices = new Set<number>();
-        const neighborIndices = new Set<number>();
-        const walkEdges: { from: XYZ; to: XYZ; color?: RGBA }[] = [];
+        const neighbours: number[] = [];
+        const seenNeighbour = new Set<number>();
         const activePts: XYZ[] = [];
 
         trace.graph.nodes.forEach((n, idx) => {
           if (n.seed) seedIndices.add(idx);
         });
 
+        // A live recall can return hundreds of neighbours. Lighting all of them
+        // saturates the additive canvas into one white blob, so the walk draws a
+        // readable slice: every seed, the first MAX_NEIGH neighbours, and only
+        // the edges that touch that slice. The counters in the left column still
+        // report the FULL 1-hop count from the trace.
+        const MAX_NEIGH = 36;
+        const edgePairs: [number, number][] = [];
         trace.graph.edges.forEach(([si, ti]) => {
           const sIdx = g2g.get(si);
           const tIdx = g2g.get(ti);
           if (sIdx === undefined || tIdx === undefined) return;
           const sNode = trace.graph.nodes[sIdx];
           const tNode = trace.graph.nodes[tIdx];
-          if (sNode.seed || tNode.seed) {
-            const p1 = nodeW(sNode);
-            const p2 = nodeW(tNode);
-            if (p1 && p2) {
-              const from = sNode.seed ? p1 : p2;
-              const to = sNode.seed ? p2 : p1;
-              walkEdges.push({ from, to, color: INK.gold });
-              if (!sNode.seed) neighborIndices.add(sIdx);
-              if (!tNode.seed) neighborIndices.add(tIdx);
+          if (!(sNode.seed || tNode.seed)) return;
+          for (const [a, b] of [[sIdx, tIdx], [tIdx, sIdx]]) {
+            if (!trace.graph.nodes[a].seed && !seenNeighbour.has(a) && neighbours.length < MAX_NEIGH) {
+              seenNeighbour.add(a);
+              neighbours.push(a);
             }
+            void b;
           }
+          if (sNode.seed || tNode.seed) edgePairs.push([sIdx, tIdx]);
+        });
+
+        const walkEdges: { from: XYZ; to: XYZ; color?: RGBA }[] = [];
+        edgePairs.forEach(([a, b]) => {
+          const isSeedA = trace.graph.nodes[a].seed;
+          const isSeedB = trace.graph.nodes[b].seed;
+          if (!isSeedA && !seenNeighbour.has(a)) return;
+          if (!isSeedB && !seenNeighbour.has(b)) return;
+          const p1 = nodeW(trace.graph.nodes[a]);
+          const p2 = nodeW(trace.graph.nodes[b]);
+          if (p1 && p2) walkEdges.push({ from: p1, to: p2, color: INK.gold });
         });
 
         const paints = new Map<number, { color: RGBA; size?: number }>();
         const halos: { idx: number; color?: RGBA; size?: number }[] = [];
-        const allWalk = new Set([...seedIndices, ...neighborIndices]);
+        const allWalk = new Set<number>([...seedIndices, ...neighbours]);
 
+        // Halo the first few seeds only: 30+ overlapping rings still read as a
+        // white core even when the neighbours are capped.
+        let seedHaloCount = 0;
         seedIndices.forEach((idx) => {
-          paints.set(idx, { color: INK.gold, size: 4.4 });
-          halos.push({ idx, color: INK.gold, size: 2.4 });
+          paints.set(idx, { color: INK.gold, size: 3.8 });
+          if (seedHaloCount < 14) halos.push({ idx, color: INK.gold, size: 1.25 });
+          seedHaloCount++;
           const p = nodeW(trace.graph.nodes[idx]);
           if (p) activePts.push(p);
         });
 
-        neighborIndices.forEach((idx) => {
-          paints.set(idx, { color: INK.violet, size: 3.2 });
-          halos.push({ idx, color: INK.violet, size: 1.7 });
+        neighbours.forEach((idx, i) => {
+          paints.set(idx, { color: INK.violet, size: 3.0 });
+          if (i < 26) halos.push({ idx, color: INK.violet, size: 0.95 });
           const p = nodeW(trace.graph.nodes[idx]);
           if (p) activePts.push(p);
         });
@@ -584,9 +574,9 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
           cosmos.spotlight(allWalk);
           cosmos.paint(paints);
           cosmos.setHalos(halos);
-          j3d?.setGraphWalkEdges(walkEdges, { intensity: 1.0 });
-          j3d?.setEdgeOpacity(0.35);
-          flyCameraToPoints(j3d, activePts, { minDist: 25, padFactor: 1.8, duration: 1400 });
+          j3d?.setGraphWalkEdges(walkEdges.slice(0, 140), { intensity: 1.0 });
+          j3d?.setEdgeOpacity(0.3);
+          flyCameraToPoints(j3d, activePts, { minDist: 42, padFactor: 2.1, duration: 1400 });
         });
       }
 
@@ -836,17 +826,15 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
         if (document.fullscreenElement) void document.exitFullscreen();
         else void document.documentElement.requestFullscreen();
       } else if (e.key === "Escape") {
-        if (detailOpen) setDetailOpen(false);
-        else onExit();
+        onExit();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [detailOpen, onExit]);
+  }, [onExit]);
 
   const goto = (i: number) => {
     setInsp(null);
-    setDetailOpen(false);
     setPlaying(true);
     setChapter((c) => {
       void c;
@@ -857,6 +845,7 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
 
   const uiScale = getUiScale();
   const legend = legendFor(ch.id, t);
+  const onCanvasError = useCallback((e: Error) => setProgress(String(e)), []);
 
   return (
     <div className="pres">
@@ -868,6 +857,28 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
 
       <div className="pres-top">
         <span className="pres-brand">MEMORY TRAVEL · {t.presLaunch}</span>
+        <span
+          className={`pres-src ${source.phase === "live" ? "live" : source.phase === "demo" ? "demo" : "probing"}`}
+          title={isLive ? t.presSrcLiveTitle : t.presSrcDemoTitle}
+        >
+          <i aria-hidden="true" />
+          {source.phase === "live" && data
+            ? fmt(t.presSrcLive, { id: data.identity?.index_id ?? "?" })
+            : source.phase === "demo"
+              ? t.presSrcDemo
+              : source.phase === "unreachable"
+                ? t.srcOfflineBadge
+                : t.srcProbing}
+          {isLive && trace?.meta.client_latency_s != null && (
+            <b className="pres-src-lat">{trace.meta.client_latency_s.toFixed(2)}s</b>
+          )}
+        </span>
+        {question !== null && (
+          <button className="ghostbtn" onClick={askAgain}>{t.presAskNew}</button>
+        )}
+        {source.phase !== "live" && (
+          <button className="ghostbtn" onClick={onRetryLive}>{t.retryConnection}</button>
+        )}
         <a className="doclink" href="/travel/presentation.html" target="_blank" rel="noopener">{t.tabPresentation}</a>
         <a className="doclink" href="/evals/" target="_blank" rel="noopener" title={t.evalsTitle}>{t.tabEvals}</a>
         <button onClick={onExit} title={t.presExit}>
@@ -875,16 +886,14 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
         </button>
       </div>
 
-      <div className="pres-grid">
+      <div className={`pres-grid${recall === "running" ? " is-busy" : ""}${question === null ? " is-asking" : ""}`}>
         <PresDataPanel
           chapterId={ch.id}
           trace={trace}
-          fixture={fixture}
           identity={data?.identity ?? null}
           graph={graph}
           nodes={ctx.nodes}
           edges={ctx.edges}
-          demo={data?.source === "demo"}
           chapterIndex={chapter}
           chapterTotal={CHAPTERS.length}
           open={dataOpen}
@@ -893,16 +902,15 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
           activeCite={activeCite}
           onFocusAnswer={focusAnswerPart}
           onFocusChunk={focusChunk}
-          onOpenNote={() => setDetailOpen(true)}
         />
 
         <main className="pres-stage">
           <div className="pres-canvas-cell">
             <div className={traceCanvasActive ? "canvaswrap" : "canvaswrap hidden"}>
-              <CosmosCanvas label="pres-trace" onCosmos={setCosmosTrace} onSelect={setPickedNode} onHover={setHoverNode} onError={(e) => setProgress(String(e))} />
+              <CosmosCanvas label="pres-trace" onCosmos={setCosmosTrace} onSelect={setPickedNode} onHover={setHoverNode} onError={onCanvasError} />
             </div>
             <div className={traceCanvasActive ? "canvaswrap hidden" : "canvaswrap"}>
-              <CosmosCanvas label="pres-full" onCosmos={setCosmosFull} onSelect={setPickedNode} onHover={setHoverNode} onError={(e) => setProgress(String(e))} />
+              <CosmosCanvas label="pres-full" onCosmos={setCosmosFull} onSelect={setPickedNode} onHover={setHoverNode} onError={onCanvasError} />
             </div>
 
             {/* Floating 3D badge pins (ranked winners, grounded citations).
@@ -984,11 +992,51 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
               )}
             </div>
 
-            {TRACE_CHAPTERS.has(ch.id) && !trace && (
-              <PresGate source={source} onOpenDemo={onOpenDemo} onRetryLive={onRetryLive} what="trace" />
+            {recall === "running" && (
+              <div className="pres-live-status" role="status" aria-live="polite">
+                <div className="pres-live-head">
+                  <span className="pres-live-dot" aria-hidden="true" />
+                  {fmt(t.presLiveRunning, { id: data?.identity?.index_id ?? "?" })}
+                </div>
+                <p className="pres-live-q">“{question}”</p>
+                <ol className="pres-live-steps">
+                  {steps.map((r) => (
+                    <li key={r.id} className={r.status}>
+                      <i aria-hidden="true" />
+                      <span className="pres-live-step">{STEP_LABEL[r.id][lang]}</span>
+                      <span className="pres-live-detail">{r.detail || "—"}</span>
+                      <span className="pres-live-ms">
+                        {r.ms != null ? `${r.ms} ms` : r.status === "active" ? "…" : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+                <p className="pres-live-note dim">{t.presLiveNote}</p>
+              </div>
             )}
-            {ch.id === "ingest" && !fixture && (
-              <PresGate source={source} onOpenDemo={onOpenDemo} onRetryLive={onRetryLive} what="ingest" />
+            {!liveReady && (
+              <div className="presgate" role="status">
+                <b>{source.phase === "unreachable" ? t.notConnectedTitle : t.srcProbing}</b>
+                <p className="dim">{t.presAskNeedsLive}</p>
+                {source.phase === "unreachable" && (
+                  <div className="overlay-actions">
+                    <button className="primary" onClick={onRetryLive}>{t.retryConnection}</button>
+                  </div>
+                )}
+              </div>
+            )}
+            {liveReady && !trace && recall !== "running" && recall !== "idle" && (
+              <div className="presgate" role="status">
+                <b>{t.presGateTraceTitle}</b>
+                <p className="dim">{t.presGateTraceBody}</p>
+                <div className="overlay-actions">
+                  <button className="primary" onClick={retryRecall}>{t.presRetryRecall}</button>
+                  <button onClick={askAgain}>{t.presAskNew}</button>
+                </div>
+              </div>
+            )}
+            {recall === "error" && recallError && (
+              <p className="pres-live-err" role="alert">{recallError}</p>
             )}
             {progress && <p className="loading pres-loading">{progress}</p>}
           </div>
@@ -1014,13 +1062,41 @@ export default function PresentationView({ onExit, data, source, liveTrace, onOp
         />
       </div>
 
-      {detailOpen && ch.id === "ingest" && fixture && (
-        <div className="pres-note-modal" role="dialog" aria-modal="true" aria-label={t.presNoteTitle}>
-          <div className="pres-note-shell">
-            <button type="button" className="pres-note-close" onClick={() => setDetailOpen(false)}>
-              <XIcon size={11} /> {t.presCloseNote}
-            </button>
-            <IngestPanel fixture={fixture} lang={lang} t={t} initialDocOpen />
+      {question === null && (
+        <div className="pres-ask">
+          <div className="pres-ask-card">
+            <p className="pres-ask-kicker">{t.presAskKicker}</p>
+            <h1 className="pres-ask-title">{t.presAskTitle}</h1>
+            <p className="pres-ask-sub">{t.presAskSub}</p>
+            <form
+              className="pres-ask-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitQuestion();
+              }}
+            >
+              <input
+                className="pres-ask-input"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder={t.presAskPlaceholder}
+                aria-label={t.presAskAria}
+                maxLength={500}
+                autoFocus
+                onFocus={(e) => e.currentTarget.select()}
+                spellCheck={false}
+              />
+              <button className="primary pres-ask-go" type="submit" disabled={!draft.trim() || !liveReady}>
+                {t.presAskGo}
+              </button>
+            </form>
+            <p className="dim pres-ask-hint">
+              {!liveReady
+                ? source.phase === "unreachable"
+                  ? t.notConnectedBody
+                  : t.srcProbing
+                : t.presAskHint}
+            </p>
           </div>
         </div>
       )}

@@ -244,6 +244,10 @@ export default function App() {
   const [cosmosData, setCosmosData] = useState<LoadedCosmos | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [demoNoteDismissed, setDemoNoteDismissed] = useState(false);
+  /** Monotonic load generation: a slow LIVE probe must never overwrite a newer
+   *  demo selection (and vice versa), otherwise the deck could swap datasets
+   *  under the presenter. */
+  const loadGenRef = useRef(0);
 
   /** Fill the render state from one LoadedCosmos (live or demo). */
   const applyCosmosData = useCallback((data: LoadedCosmos) => {
@@ -276,23 +280,24 @@ export default function App() {
 
   const loadLive = useCallback(() => {
     let dead = false;
+    const gen = ++loadGenRef.current;
     setSource({ phase: "probing" });
     setSourceError(null);
     setProgress(t.srcProbing);
     setManifest(null); // fixture traces are demo-only
     probeGraphStats()
       .then((stats) => {
-        if (dead) return;
+        if (dead || gen !== loadGenRef.current) return;
         setProgress(t.loadingIndex);
         return loadLiveCosmos(stats);
       })
       .then((data) => {
-        if (dead || !data) return;
+        if (dead || !data || gen !== loadGenRef.current) return;
         applyCosmosData(data);
         setSource({ phase: "live" });
       })
       .catch((e: unknown) => {
-        if (dead) return;
+        if (dead || gen !== loadGenRef.current) return;
         const msg = e instanceof Error ? e.message : String(e);
         setSourceError(msg);
         setSource({ phase: "unreachable", error: msg });
@@ -304,31 +309,35 @@ export default function App() {
   }, [applyCosmosData, t]);
 
   const openDemo = useCallback(() => {
+    const gen = ++loadGenRef.current;
     setProgress(t.loadingIndex);
     setSourceError(null);
     Promise.all([loadDemoCosmos(), loadManifest()])
       .then(([data, man]) => {
+        if (gen !== loadGenRef.current) return;
         applyCosmosData(data);
         setManifest(man);
         setSource({ phase: "demo" });
       })
       .catch((e: unknown) => {
+        if (gen !== loadGenRef.current) return;
         const msg = e instanceof Error ? e.message : String(e);
         setDataError(msg);
         setProgress(fmt(t.dataLoadFailed, { e: msg }));
       });
   }, [applyCosmosData, t]);
 
-  // Presentation chapters 3-8 replay a recall trace. A fresh viewer has no
-  // live trace yet, and the honest gate ("this chapter needs a recall trace")
-  // is a dead end during a demo. Entering the presentation therefore opens the
-  // explicit demo snapshot automatically; the DEMO badge and the "back to live"
-  // button stay visible, so it is never mistaken for live data.
-  useEffect(() => {
-    if (presenting && source.phase !== "demo" && liveTrace === null) {
-      openDemo();
-    }
-  }, [presenting, source.phase, liveTrace, openDemo]);
+  /** Enter the how-it-works deck. The deck is live-first: it runs a real recall
+   *  on the connected index, so make sure that index is loaded (the synthetic
+   *  snapshot stays behind the deck's explicit DEMO button). */
+  const enterPresentation = useCallback(() => {
+    setPresenting(true);
+    if (source.phase !== "live") loadLive();
+  }, [source.phase, loadLive]);
+
+  // The how-it-works deck runs its own live recall on the connected index (see
+  // PresentationView). The baked fixtures are reachable only through the deck's
+  // explicit DEMO button, which calls openDemo().
 
   useEffect(() => {
     const cleanup = loadLive();
@@ -559,8 +568,7 @@ export default function App() {
           onExit={() => setPresenting(false)}
           data={cosmosData}
           source={source}
-          liveTrace={liveTrace}
-          onOpenDemo={openDemo}
+          preferredQuestion={activeQuestion ?? history[0]?.q ?? null}
           onRetryLive={loadLive}
         />
       ) : (
@@ -579,7 +587,7 @@ export default function App() {
             <nav>
               <button className={tab === "cosmos" && !presenting ? "on" : ""} onClick={() => { setPresenting(false); setTab("cosmos"); }}>{t.tabCosmos}</button>
               <button className={tab === "travel" && !presenting ? "on" : ""} onClick={() => { setPresenting(false); setTab("travel"); }}>{t.tabTravel}</button>
-              <button className={presenting ? "on" : ""} onClick={() => setPresenting(true)} title={t.howItWorksTitle}>{t.tabHowItWorks}</button>
+              <button className={presenting ? "on" : ""} onClick={enterPresentation} title={t.howItWorksTitle}>{t.tabHowItWorks}</button>
               <a className="doclink" href="/travel/presentation.html" target="_blank" rel="noopener">{t.tabPresentation}</a>
               <a className="doclink" href="/evals/" target="_blank" rel="noopener" title={t.evalsTitle}>{t.tabEvals}</a>
               <UiScaleSlider />
@@ -656,7 +664,7 @@ export default function App() {
               graph={graph}
               names={names}
               loading={progress}
-              onTour={() => setPresenting(true)}
+              onTour={enterPresentation}
               focusNode={focusNode}
               mode={renderMode}
               conn={conn}

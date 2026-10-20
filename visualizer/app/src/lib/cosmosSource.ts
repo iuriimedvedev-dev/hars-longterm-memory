@@ -35,7 +35,8 @@ export interface LoadedCosmos {
   names: string[];
   coords: { ids: string[]; xy: [number, number][]; xyz?: [number, number, number][] };
   chunkCoords: Record<string, [number, number, number]>;
-  /** /api/stats payload when source==="live", null for the demo snapshot. */
+  /** Identity shown to the user: the /api/stats payload when source==="live",
+   *  a fixture-derived synthetic identity when source==="demo" (never live). */
   identity: GraphStats | null;
   /** present when the live /graph response was sampled (meta.sampled). */
   sampled: { nodes: number; fullNodes: number; edges: number; fullEdges: number } | null;
@@ -147,7 +148,24 @@ export async function loadLiveCosmos(identity: GraphStats, timeoutMs = GRAPH_LOA
   };
 }
 
-/** The explicit demo dataset: the baked offline snapshot in public/data. */
+/** Identity of the synthetic demo dataset. NEVER read from /api/stats: the
+ *  demo is not the connected index, so its numbers come from its own files. */
+export const DEMO_INDEX_ID = "demo-hars-snapshot (synthetic)";
+
+function demoIdentity(g: CosmosGraph, chunks: number): GraphStats {
+  return {
+    index_id: DEMO_INDEX_ID,
+    docs: null,
+    chunks,
+    entities: g.nodes.length,
+    relations: g.edges.length,
+    nodes: g.nodes.length,
+    edges: g.edges.length,
+    last_ingest: "synthetic fixture — no live data",
+  };
+}
+
+/** The explicit demo dataset: the baked SYNTHETIC snapshot in public/data. */
 export async function loadDemoCosmos(): Promise<LoadedCosmos> {
   const base = import.meta.env.BASE_URL ?? "/";
   const prefix = base.endsWith("/") ? base : `${base}/`;
@@ -165,7 +183,8 @@ export async function loadDemoCosmos(): Promise<LoadedCosmos> {
     names: idx,
     coords,
     chunkCoords: cxyz,
-    identity: null,
+    // demo identity comes from the fixture itself, never from the live /api/stats
+    identity: demoIdentity(g, Object.keys(cxyz).length),
     sampled: null,
   };
 }
