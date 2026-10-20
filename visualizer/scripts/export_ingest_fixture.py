@@ -1,37 +1,49 @@
 #!/usr/bin/env python3
-"""Export real ingest fixture from index into app/public/data/ingest_fixture.json.
+"""Export one note of a live index as an ingest fixture (diagnostic tool).
 
-Exports real note text, real chunks, and real teacher extractions (entities/relations)
-from the live index at ~/.local/share/hars-longterm-memory/index.
+This is NOT the demo generator: the shipped demo fixtures are synthetic
+(`scripts/gen_demo_fixtures.py`). Run this only to inspect a specific note of a
+real index, and always write OUTSIDE app/public/data so no corpus data can be
+published by accident.
+
+    python scripts/export_ingest_fixture.py --note <substring> --out /tmp/note.json
 """
+import argparse
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INDEX = Path.home() / ".local" / "share" / "hars-longterm-memory" / "index"
-OUT = ROOT / "app" / "public" / "data" / "ingest_fixture.json"
+DATA = ROOT / "app" / "public" / "data"
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--note", required=True, help="substring of the note file_path to export")
+    ap.add_argument("--out", required=True, help="output path (must be outside app/public/data)")
+    ap.add_argument("--index", default=str(INDEX))
+    args = ap.parse_args()
+    index = Path(args.index)
+    out = Path(args.out).resolve()
+    if DATA.resolve() in out.parents:
+        raise SystemExit("refusing to write into app/public/data: the demo fixtures are synthetic")
     print("Loading docs and chunks from index...", flush=True)
-    with open(INDEX / "kv_store_full_docs.json") as f:
+    with open(index / "kv_store_full_docs.json") as f:
         docs = json.load(f)
-    with open(INDEX / "kv_store_text_chunks.json") as f:
+    with open(index / "kv_store_text_chunks.json") as f:
         chunks = json.load(f)
 
-    # Use k8s-jip-controller-quota.md as canonical SRE note
-    doc_id = "file:42034d35bec2"
-    doc_entry = docs.get(doc_id)
+    doc_id, doc_entry = None, None
+    for k, v in docs.items():
+        if args.note in v.get("file_path", ""):
+            doc_id, doc_entry = k, v
+            break
     if not doc_entry:
-        for k, v in docs.items():
-            if "k8s-jip-controller-quota.md" in v.get("file_path", ""):
-                doc_id = k
-                doc_entry = v
-                break
+        raise SystemExit(f"no note matching {args.note!r} in {index}")
 
     text = doc_entry["content"]
-    file_path = doc_entry.get("file_path", "k8s-jip-controller-quota.md")
+    file_path = doc_entry.get("file_path", args.note)
     lines = text.splitlines()
 
     doc_chunks = [v for v in chunks.values() if v.get("full_doc_id") == doc_id]
@@ -41,7 +53,7 @@ def main():
     print(f"Doc {file_path}: {len(text)} chars, {len(lines)} lines, {len(doc_chunks)} chunks")
 
     print("Parsing entities and relations from graphml...", flush=True)
-    tree = ET.parse(INDEX / "graph_chunk_entity_relation.graphml")
+    tree = ET.parse(index / "graph_chunk_entity_relation.graphml")
     root = tree.getroot()
     ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
 
@@ -99,11 +111,11 @@ def main():
         "relations": relations,
     }
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUT, "w") as f:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
         json.dump(fixture, f, indent=2)
 
-    print(f"Wrote {OUT} ({OUT.stat().st_size // 1024} KB)")
+    print(f"Wrote {out} ({out.stat().st_size // 1024} KB)")
 
 
 if __name__ == "__main__":

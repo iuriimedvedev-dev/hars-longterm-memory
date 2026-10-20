@@ -1,8 +1,12 @@
 # Presentation mode — «Презентация: как работает память»
 
 A guided **eight-chapter** walkthrough of how the HARS long-term memory works,
-driven entirely by real data (the connected graph + one real `memory_recall`
-trace). Launched from the "how it works" tab; `Esc` exits.
+driven entirely by ONE live recall: the deck opens on a query input, runs
+`memory_recall` (context_only) on the connected index for the question the
+presenter types, streams the trace service's stage frames, and replays that
+trace through the chapters. There is no baked question and no fixture trace —
+a different question is a different run. Launched from the "how it works" tab;
+`Esc` exits.
 
 The stage is split into three columns — step data, the interactive graph, and
 the presenter's script. The layout spec, the derivation chain and the final
@@ -52,23 +56,14 @@ Every control glyph is a monochrome inline SVG (`components/icons.tsx`): the
 presentation ships **zero emoji**, enforced by `npm run lint:no-emoji`
 (also wired as `prebuild`, so `npm run build` fails on a pasted emoji).
 
-## Chapter 2 (ingest) — data column + full-note overlay
+## Chapter 2 (ingest) — the chunk this recall actually used
 
-The left column shows the real note record (file, size, lines, sections), the
-chunker records (section, line range, tokens) and the teacher's extraction
-counts/entities — all from `app/public/data/ingest_fixture.json`. **Open the
-note** opens the existing `components/IngestPanel.tsx` in a full-screen
-overlay: the parameterised split preview with both window lanes, the tinted
-note text, overlap stripes and the teacher's extraction records. The overlay is
-closed by its own button or `Esc` (a second `Esc` exits the presentation).
-
-Data: `scripts/export_ingest_fixture.py` (read-only) — the note's full
-`doc.text` + `doc.line_count` (16 500 chars / 137 lines), its ten index windows
-(512 / 512 / … / 290 tokens with real line overlaps at 34–38, 51–53, 60–64,
-68–76, 100–105, 109–113, 125–130, 130–135) and the teacher's 199 entity +
-226 relation records. The chunker parameter table in the overlay is editable;
-the "md_struct, re-split from the parameters above" lane re-derives live from
-`lib/chunkingParams.ts`.
+The left column shows a REAL chunk of the connected index that the recall on
+screen pulled: its document, section, chunk id, dense/BM25 scores and the
+verbatim text, plus the entity facts and relations from that same recall's
+context. Nothing is substituted; a field the recall did not report renders as
+"not recorded". The chapter needs no fixture file: with a different question it
+shows a different chunk of the same live index.
 
 ## Chapters 3–7 (transformations) — data column + graph
 
@@ -113,13 +108,25 @@ shown as "document not recorded", never as a document name.
 
 ## Data provenance
 
-- Full graph: `app/public/data/graph.json` (+3D UMAP coords) — exported from
-  the connected index, see `docs/SETUP.md` §3.
-- Trace: `app/public/data/traces/trace_01.json` — compiled from a captured
-  `memory_recall` fixture.
-- Ingest fixture: `app/public/data/ingest_fixture.json` — verbatim index
-  records (no synthesis): the note text, its index chunk windows and the
-  teacher's extraction records.
+**Everything comes from the submitted question.** The deck loads the connected
+index (`/stats`, `/graph`, `/coords`), then for the typed question it runs a
+real `memory_recall` (context_only) and consumes the trace service's SSE stage
+frames (`GET /trace?question=...`). Stage rows light up as their frames arrive;
+chapters 3-8 and the answer quotes are compiled from that same result by
+`lib/compileLive.ts` (the query bar's compiler). The badge shows
+`LIVE DATA · <index_id>` plus the client latency. Submitting another question
+aborts the previous run and starts a new one.
+
+**No fixture path.** The presentation imports no fixture loader; a build-time
+guard (`scripts/check-deck-is-live.mjs`, wired into `prebuild`) fails if
+`PresentationView`, `PresDataPanel`, `PresNarrationPanel`, `liveRecall` or
+`presentation.ts` ever reference `lib/data`, `loadTrace`, `ingest_fixture` or
+`data/traces`. The synthetic snapshot in `app/public/data/` still exists for
+the Cosmos/Travel views and their explicit demo button, but the deck never
+reads it.
+
+If the bridge or the trace service is unreachable the deck shows the honest
+gate with a retry — never a recorded trace.
 
 ## Verification
 
@@ -133,7 +140,7 @@ node ../scripts/verify-ui.mjs --base http://127.0.0.1:5175
 Headless captures at 1920x1080 and 2560x1440 for the first chapter, a trace
 chapter and the final answer (EN/RU, citation focused) are stored outside the
 repository under `/tmp/opencode/presentation-layout/`. `verify-ui.mjs` is a
-backend-dependent suite: without the live bridge (:8098) its four live-index
+backend-dependent suite: without the live bridge/trace service its live-index
 checks fail by design; the offline/demo checks pass, including the explicit
 demo snapshot load.
 

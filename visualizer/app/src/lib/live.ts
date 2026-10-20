@@ -203,7 +203,7 @@ export async function memoryRecallLive(
 export interface BridgeInfo {
   /** Which endpoint actually answered: the dev proxy path or the direct URL. */
   endpoint: string | null;
-  /** Basename of the index working_dir, e.g. "index_compact_20260903_imported". */
+  /** Basename of the index working_dir, e.g. "my-index-20260101". */
   indexId: string | null;
   /** Full index directory as reported by the bridge. */
   indexDir: string | null;
@@ -604,8 +604,8 @@ export function traceBases(): string[] {
   return [...new Set(bases)];
 }
 
-export const CANONICAL_QUESTION = "How does quota claim work?";
-export const CANONICAL_KEYWORDS = ["quota", "claim", "jip", "namespace"];
+export const CANONICAL_QUESTION = "How does HARS memory combine vector and graph retrieval?";
+export const CANONICAL_KEYWORDS = ["hars", "memory", "vector", "graph", "retrieval"];
 
 /**
  * Fetch a complete JSON trace for a question via GET /trace?format=json.

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { Cosmos3D, type SelectedNode } from "../lib/cosmos3d";
 import { Cosmos2D, type AnyCosmos } from "../lib/cosmos2d";
 
@@ -21,7 +21,7 @@ interface Props {
  * fails, the same canvas falls back to the Canvas2D renderer. onError fires
  * only when NEITHER backend works (ancient browser — nearly unreachable).
  */
-export default function CosmosCanvas({ onCosmos, onSelect, onHover, onError, onMode, label }: Props) {
+function CosmosCanvas({ onCosmos, onSelect, onHover, onError, onMode, label }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const selectRef = useRef(onSelect);
   const hoverRef = useRef(onHover);
@@ -91,3 +91,8 @@ export default function CosmosCanvas({ onCosmos, onSelect, onHover, onError, onM
 
   return <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />;
 }
+
+// The canvas owns a WebGL scene: never re-render it for parent state (SSE
+// frames, chapter counters). All callbacks are read through refs above, so a
+// memoised component stays mounted for the whole deck.
+export default memo(CosmosCanvas);
