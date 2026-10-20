@@ -157,7 +157,7 @@ async function verifyLive() {
     expression: `(() => {
       const input = document.querySelector('.querybar input[type=text]');
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(input, 'How does quota claim work?');
+      setter.call(input, 'How does the memory combine dense and graph retrieval?');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       const btn = document.querySelector('.querybar button.primary');
       if (btn) btn.click();

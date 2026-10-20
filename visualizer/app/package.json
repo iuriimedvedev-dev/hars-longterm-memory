@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node ../scripts/no-emoji-check.mjs",
+    "prebuild": "node ../scripts/no-emoji-check.mjs && node ../scripts/check-deck-is-live.mjs",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "lint:no-emoji": "node ../scripts/no-emoji-check.mjs",
+    "lint:deck-live": "node ../scripts/check-deck-is-live.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
