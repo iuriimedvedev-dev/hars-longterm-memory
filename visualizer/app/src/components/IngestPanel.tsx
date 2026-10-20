@@ -35,16 +35,19 @@ export function IngestPanel({
   lang,
   t,
   onDetailOpen,
+  initialDocOpen = false,
 }: {
   fixture: IngestFixture;
   lang: Lang;
   t: Dict;
   onDetailOpen?: (open: boolean) => void;
+  /** open the full document lane on mount (presentation note overlay). */
+  initialDocOpen?: boolean;
 }) {
   const text = fixture.doc.text || fixture.doc.preview;
   const lines = useMemo(() => text.replace(/\s+$/, "").split("\n"), [text]);
   const [params, setParams] = useState<ChunkingParams>(CHUNKING_PARAMS);
-  const [docOpen, setDocOpen] = useState(false);
+  const [docOpen, setDocOpen] = useState(initialDocOpen);
   const [recsOpen, setRecsOpen] = useState(false);
   const [hover, setHover] = useState<Hover>(null);
   const [pinned, setPinned] = useState<Hover>(null);
