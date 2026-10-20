@@ -1467,27 +1467,29 @@ def _fuse_routing_channels(
 
 
 def _select_diverse_fused_chunks(
-    fused: list[Any], limit: int, *, max_per_source: int = MAX_CHUNKS_PER_SOURCE
+    fused: list[Any], limit: int, *, max_per_source: int | None = None
 ) -> list[Any]:
-    """Select the highest-scoring chunks while bounding per-file repetition."""
-    if limit <= 0:
-        return []
-    ranked = sorted(fused, key=lambda chunk: (-chunk.fused_score, chunk.chunk_id))
-    selected: list[Any] = []
-    deferred: list[Any] = []
-    source_counts: dict[str, int] = {}
-    for chunk in ranked:
-        source = chunk.file_path
-        if len(selected) < limit and source_counts.get(source, 0) < max_per_source:
-            selected.append(chunk)
-            source_counts[source] = source_counts.get(source, 0) + 1
-        else:
-            deferred.append(chunk)
-    if len(selected) < limit:
-        # Backfill capped sources only after the greedy diverse pass.
-        selected.extend(deferred[: limit - len(selected)])
-    selected.sort(key=lambda chunk: (-chunk.fused_score, chunk.chunk_id))
-    return selected[:limit]
+    """Source-diversity selection over the FULL pool, then slice to ``limit``.
+
+    Delegates to :func:`hars_memory.retrieval.diversity.select_diverse_fused_chunks`,
+    which applies the position-decayed per-file penalty
+    ``S_div(c) = S_fused(c) - lambda_dup * r(c)`` and the hard
+    ``max_per_source`` cap BEFORE truncation.
+
+    Historical note (the bug this replaces): the body used to rank, cap and
+    then ``selected.sort(key=lambda c: (-c.fused_score, c.chunk_id))`` — which
+    restored the input order — and was called on an already ``top_k``-sliced
+    list with ``limit=len(fused)``. All three made the cap a no-op.
+    """
+    from hars_memory.retrieval.diversity import select_diverse_fused_chunks
+
+    return select_diverse_fused_chunks(
+        fused,
+        limit,
+        max_per_source=(
+            MAX_CHUNKS_PER_SOURCE if max_per_source is None else max_per_source
+        ),
+    )
 
 
 def _margin_guarded_rerank_blend(
@@ -1892,6 +1894,12 @@ async def _compute_hybrid_block(
         # contract of this function (ripgrep is not given its own separate
         # failure path since it shares this function's one try/except).
         ripgrep_report: dict[str, Any] = {"enabled": False, "reason": f"{HARS_MEMORY_RIPGREP_CHANNEL_ENV}=0 (default)"}
+        #: Candidates contributed by additive channels that are deliberately
+        #: NOT part of the dense+sparse pool (ripgrep:/flat: ids). They are
+        #: kept OUTSIDE the diversity selection's `top_k` competition and
+        #: re-appended after it, preserving the "never evicts, only appends"
+        #: presence guarantee these channels were built with.
+        additive_tail: list[Any] = []
         # Live trace (SSE) — a `ripgrep_hits` frame mirroring `bm25_hits`
         # (latency, matched chunk ids, scores) so the UI can show ripgrep as a
         # real ranked channel rather than a footnote in the final result. The
@@ -1912,7 +1920,7 @@ async def _compute_hybrid_block(
                 hits=[],
                 matched_chunk_ids=[],
             )
-            fused = fused_pool[:top_k]
+            fused = list(fused_pool)
         else:
             from hars_memory.retrieval import ripgrep_channel
 
@@ -1938,9 +1946,24 @@ async def _compute_hybrid_block(
                 ripgrep_scores_by_chunk_id(fused_pool, _rg_hits_by_basename)
             )
             if rg_result.available and rg_result.hits:
-                fused = apply_ripgrep_gate(fused_pool, _rg_hits_by_basename, top_k=top_k)
+                # Keep the FULL pool through the ranked gate: the diversity
+                # selection below must see pre-truncation candidates, and the
+                # gate's own exclusive tail is re-appended after it so the
+                # presence guarantee is unchanged.
+                _pool_ids = {chunk.chunk_id for chunk in fused_pool}
+                _gated = apply_ripgrep_gate(
+                    fused_pool,
+                    _rg_hits_by_basename,
+                    top_k=len(fused_pool),
+                    question=question,
+                    ll_keywords=_ripgrep_keywords(ll_keywords),
+                )
+                additive_tail.extend(
+                    chunk for chunk in _gated if chunk.chunk_id not in _pool_ids
+                )
+                fused = _gated
             else:
-                fused = fused_pool[:top_k]
+                fused = list(fused_pool)
             ripgrep_report = {
                 "enabled": True,
                 "available": rg_result.available,
@@ -2022,6 +2045,7 @@ async def _compute_hybrid_block(
                 if c.chunk_id not in fused_pool_ids and c.chunk_id not in existing_ids
             ]
             fused = fused + flat_injected
+            additive_tail.extend(flat_injected)
             flat_report = {
                 "enabled": True,
                 "cache_status": flat_cache_status,
@@ -2072,15 +2096,15 @@ async def _compute_hybrid_block(
             top_dense_score = None
             low_confidence = not strong_sparse_evidence and not ripgrep_evidence
 
-        # Apply diversity after both additive gates so the public result is the
-        # actual bounded, source-diverse fused selection.
-        if rerank_backend == "http":
-            # HTTP reranking needs the full pre-truncation dense/sparse pool;
-            # retain only exclusive additive-channel entries after that pool.
-            fused_pool_ids = {chunk.chunk_id for chunk in fused_pool}
-            additive_tail = [chunk for chunk in fused if chunk.chunk_id not in fused_pool_ids]
-            fused = list(fused_pool) + additive_tail
-        fused = _select_diverse_fused_chunks(fused, len(fused))
+        # Source-diversity selection over the FULL pre-truncation pool, then
+        # slice to top_k. Additive-channel exclusives (ripgrep:/flat:) are not
+        # part of that competition; they are re-appended afterwards, preserving
+        # their "never evicts, only appends" presence guarantee.
+        fused = _select_diverse_fused_chunks(fused, top_k)
+        selected_ids = {chunk.chunk_id for chunk in fused}
+        fused.extend(
+            chunk for chunk in additive_tail if chunk.chunk_id not in selected_ids
+        )
 
         # Pre-rerank order — the TRUE fusion order v1 could only approximate
         # (compile_trace reconstructed "before" from dense scores). Captured
@@ -2099,6 +2123,10 @@ async def _compute_hybrid_block(
 
         # Cross-encoder reranking is opt-in for HTTP and remains compatible
         # with the historical local LightRAG callback when backend is unset.
+        # It now reranks the ALREADY source-diversified top-k window (the
+        # selection above is the one pool truncation point); the previous
+        # http-only rebuild from `fused_pool` would have discarded both the
+        # diversity cap and the ripgrep reordering.
         rerank_elapsed_ms = None
         if rerank_backend == "http":
             pool_to_rerank = fused[:HARS_MEMORY_RERANK_POOL]
