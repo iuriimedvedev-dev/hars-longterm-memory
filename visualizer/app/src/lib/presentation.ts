@@ -4,6 +4,7 @@
 // All numbers shown come from real trace/graph telemetry — never invented.
 import type { L10n } from "../i18n/strings";
 import type { TravelTrace } from "./types";
+import { contextDocCount } from "./presChain";
 
 export type VizMode = "cosmos" | "trace";
 
@@ -62,8 +63,8 @@ export const CHAPTERS: PresentationChapter[] = [
     viz: "cosmos",
     title: { ru: "Как знание попадает в память", en: "How knowledge enters memory" },
     narration: () => ({
-      ru: `Заметка разрезается md_struct-чанкером по секциям (заголовки → секции → чанки с номерами строк). Учитель — локальная 27B модель — извлекает из каждого чанка сущности и связи; мердж идёт в общий граф. Справа в карточке — настоящая заметка и её настоящие extraction-записи из кэша учителя.`,
-      en: `A note is split by the md_struct chunker along its sections (headings → sections → chunks with line ranges). A teacher — a local 27B model — extracts entities and relations from every chunk; everything merges into one graph. The card shows a real note with its real extraction records from the teacher's cache.`,
+      ru: `Заметка разрезается md_struct-чанкером по секциям (заголовки → секции → чанки с номерами строк). Учитель — локальная 27B модель — извлекает из каждого чанка сущности и связи; мердж идёт в общий граф. В левой колонке — настоящая заметка, её настоящие чанки и записи учителя из кэша.`,
+      en: `A note is split by the md_struct chunker along its sections (headings → sections → chunks with line ranges). A teacher — a local 27B model — extracts entities and relations from every chunk; everything merges into one graph. The left column shows a real note with its real chunks and teacher records from the cache.`,
     }),
     fact: () => ({
       ru: `Факт: каждая заметка нарезается на окна индекса; каждая запись учителя сохранена в kv-кэше — воспроизводимо.`,
@@ -144,27 +145,14 @@ export const CHAPTERS: PresentationChapter[] = [
     id: "answer",
     viz: "trace",
     stage: 7,
-    title: { ru: "Синтез", en: "Synthesis" },
-    narration: () => ({
-      ru: `Сервис возвращает собранный контекст (context_only) — финальный ответ пишет LLM вызывающей стороны, с цитатами на источники. Розовый след на карте — весь путь запроса: от эмбеддинга до узлов-доказательств. Каждая цитата кликабельна и ведёт к своим узлам.`,
-      en: `The service returns the assembled context (context_only) — the caller's LLM writes the final answer, citing sources. The pink trail on the map is the whole journey: from the embedding to the evidence nodes. Every citation is clickable and leads back to its nodes.`,
+    title: { ru: "Финальный ответ", en: "The final answer" },
+    narration: ({ trace }) => ({
+      ru: `«${trace?.meta.question ?? "—"}» → ${trace?.context_blocks.source_count ?? "—"} источников из ${contextDocCount(trace)} документов. Ниже — дословные extractive-цитаты собранного контекста; каждая ссылка [n] подсвечивает свой чанк на графе, а цепочка показывает все шаги с настоящими числами.`,
+      en: `“${trace?.meta.question ?? "—"}” → ${trace?.context_blocks.source_count ?? "—"} sources from ${contextDocCount(trace)} documents. Below are the verbatim extractive quotes of that assembled context; every citation [n] lights up its chunk on the graph, and the chain carries the real count at every hop.`,
     }),
     fact: ({ trace }) => ({
-      ru: `Факт: клиент получил ответ за ${trace?.meta.client_latency_s ?? "?"} с — от нажатия Enter до цитат.`,
-      en: `Fact: the client got the answer in ${trace?.meta.client_latency_s ?? "?"} s — from Enter to citations.`,
-    }),
-  },
-  {
-    id: "numbers",
-    viz: "cosmos",
-    title: { ru: "Цифры", en: "The numbers" },
-    narration: ({ nodes, edges }) => ({
-      ru: `Итог: ${nodes.toLocaleString("ru-RU")} сущностей и ${edges.toLocaleString("ru-RU")} связей в подключённом индексе — шапка и карточка «о приложении» читают их с моста живьём, вместе с именем индекса и свежестью данных. Всё, что вы видели — телеметрия одного реального запроса к этой памяти.`,
-      en: `Bottom line: ${nodes.toLocaleString("en-US")} entities and ${edges.toLocaleString("en-US")} relations in the connected index — the header and the about card read them live from the bridge, together with the index id and data freshness. Everything you saw is the telemetry of one real query against this memory.`,
-    }),
-    fact: ({ nodes, edges }) => ({
-      ru: `Факт: ${nodes.toLocaleString("ru-RU")} сущностей · ${edges.toLocaleString("ru-RU")} связей · гибрид (BM25 + вектор + граф + ripgrep) со слиянием RRF/LightGBM — задержка ~160 мс.`,
-      en: `Fact: ${nodes.toLocaleString("en-US")} entities · ${edges.toLocaleString("en-US")} relations · hybrid (BM25 + vector + graph + ripgrep) with RRF/LightGBM — latency ~160ms.`,
+      ru: `Факт: ${trace?.answer_preview.length ?? 0} цитат · ${trace?.context_blocks.entities.length ?? 0} фактов о сущностях · клиент получил ответ за ${trace?.meta.client_latency_s ?? "—"} с. Вызывающая LLM опирается только на эти блоки.`,
+      en: `Fact: ${trace?.answer_preview.length ?? 0} quotes · ${trace?.context_blocks.entities.length ?? 0} entity facts · the client got the answer in ${trace?.meta.client_latency_s ?? "—"} s. The caller's LLM relies on these blocks alone.`,
     }),
   },
 ];
