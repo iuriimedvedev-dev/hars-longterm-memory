@@ -320,6 +320,45 @@ export function compileLiveTrace(
   const inset = seen;
   const gedges = aux.graph.edges.filter(([s, t]) => inset.has(s) && inset.has(t)).slice(0, 1200) as [number, number][];
 
+  // Provenance repair: ChunkHit.entities was built from the context entity
+  // vocabulary (the seeds). A walked neighbour can still be MENTIONED in a
+  // chunk even when it never appears in the context block — scan the raw chunk
+  // text for every displayed node name so step 3 can link neighbour -> chunk.
+  const contentById = new Map<string, string>();
+  for (const c of fc) {
+    if (c.chunk_id && typeof c.content === "string") contentById.set(c.chunk_id, c.content.toLowerCase());
+  }
+  for (const list of [vectorHits, bm25Hits, fusion]) {
+    for (const hit of list) {
+      const body = contentById.get(hit.chunk_id);
+      if (!body) continue;
+      const extra: string[] = [];
+      for (const n of nodes) {
+        if (n.name.length < 3) continue;
+        if (body.includes(n.name.toLowerCase())) extra.push(n.name);
+      }
+      if (extra.length) hit.entities = [...new Set([...hit.entities, ...extra])].slice(0, 6);
+    }
+  }
+
+  // Display subgraph honesty: how many 1-hop neighbours exist in the FULL
+  // graph vs how many the 350-node display cap actually carried. Hub pruning
+  // is a server-side decision this client never sees — leave it null.
+  const fullNeighbourIdx = new Set<number>();
+  for (const s of seedIdx) {
+    for (const nb of adj.get(s) ?? []) {
+      if (!seedIdx.has(nb)) fullNeighbourIdx.add(nb);
+    }
+  }
+  const graphStats = {
+    full_neighbour_count: fullNeighbourIdx.size,
+    node_cap: 350,
+    truncated: seen.size >= 350,
+    hub_cutoff_degree: null,
+    hub_cutoff_fanout: null,
+    pruned_hubs: null,
+  };
+
   const srcBlocks = sources.slice(0, 10).map((s) => {
     const body = typeof s["content"] === "string" ? (s["content"] as string) : "";
     const m = DOC_HDR.exec(body);
@@ -369,6 +408,22 @@ export function compileLiveTrace(
   const denseMs = typeof vecEv?.["latency_ms"] === "number" ? Number(vecEv["latency_ms"]) : (lat["dense_channel"] ?? null);
   const sparseMs = typeof bm25Ev?.["latency_ms"] === "number" ? Number(bm25Ev["latency_ms"]) : (lat["sparse_channel"] ?? null);
   const rerankMs = typeof rerankEv?.["latency_ms"] === "number" ? Number(rerankEv["latency_ms"]) : (lat["rerank_channel"] ?? null);
+  const graphMs = typeof graphEv?.["latency_ms"] === "number" ? Number(graphEv["latency_ms"]) : (lat["graph_channel"] ?? null);
+  const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+  const txt = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  const ripRaw = (h["ripgrep"] ?? null) as Record<string, unknown> | null;
+  const gbRaw = (h["graph_bridge"] ?? null) as Record<string, unknown> | null;
+  const channels = {
+    dense: vectorHits.length,
+    bm25: bm25Hits.length,
+    ripgrep: ripRaw
+      ? { matched: num(ripRaw["matched_count"]), injected: num(ripRaw["injected_count"]), hits: num(ripRaw["hits_count"]), enabled: bool(ripRaw["enabled"]) }
+      : null,
+    graphBridge: gbRaw
+      ? { enabled: bool(gbRaw["enabled"]), reason: txt(gbRaw["reason"]), entities: num(graphEv?.["entity_count"]) }
+      : null,
+  };
   const bm25Chunks = typeof bm25Ev?.["chunks_indexed"] === "number" ? Number(bm25Ev["chunks_indexed"]) : (((h["bm25_index"] as Record<string, unknown> | undefined)?.["chunks_indexed"] as number | null) ?? null);
   const poolSize = typeof fusEv?.["candidate_pool_size"] === "number" ? Number(fusEv["candidate_pool_size"]) : ((h["candidate_pool_size"] as number | null) ?? null);
 
@@ -392,6 +447,7 @@ export function compileLiveTrace(
         dense: denseMs,
         sparse: sparseMs,
         rerank: rerankMs,
+        graph: graphMs,
       },
       confidence: {
         low: (conf["low_confidence"] as boolean | null) ?? null,
@@ -400,16 +456,21 @@ export function compileLiveTrace(
       },
       bm25_chunks: bm25Chunks,
       client_latency_s: clientLatS,
+      channels,
     },
     query: { text: q, xy: queryXy, xyz: queryXyz },
     vector_hits: vectorHits,
     bm25_hits: bm25Hits,
     fusion,
     rerank,
-    graph: { nodes, edges: gedges },
+    graph: { nodes, edges: gedges, stats: graphStats },
     context_blocks: {
       entities: entities.slice(0, 12),
-      relations: relations.filter((x) => seeds.has(x.entity1) || seeds.has(x.entity2)).slice(0, 10),
+      // Keep labels for edges that touch ANY displayed node (seed or reachable
+      // neighbour); filtering to seeds only threw away most edge predicates.
+      relations: relations
+        .filter((x) => nodes.some((n) => n.name === x.entity1 || n.name === x.entity2))
+        .slice(0, 20),
       sources: srcBlocks,
       source_count: sources.length,
     },

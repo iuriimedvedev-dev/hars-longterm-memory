@@ -228,6 +228,21 @@ def main():
         with_xy = sum(1 for nd in nodes for _ in [0] if nd["xy"])
         print(f"  {f.name}: seeds={len(seed_idx)} nodes={len(nodes)} edges={len(gedges)} xy_cov={with_xy}/{len(nodes)}")
 
+        # --- display-subgraph statistics (what the 350-node cap carried) -----
+        full_neighbours = set()
+        for s_i in seed_idx:
+            full_neighbours.update(adj.get(s_i, ()))
+        full_neighbours -= seed_idx
+        graph_stats = {
+            "full_neighbour_count": len(full_neighbours),
+            "node_cap": 350,
+            "truncated": len(seen) >= 350,
+            # server-side hub pruning is not observable from static dumps
+            "hub_cutoff_degree": None,
+            "hub_cutoff_fanout": None,
+            "pruned_hubs": None,
+        }
+
         # --- context blocks (compact; full chunk text joins via chunk_id)
         src_blocks = []
         for s in sources[:10]:
@@ -242,7 +257,12 @@ def main():
             )
         context_blocks = {
             "entities": entities[:12],
-            "relations": [rl for rl in relations if rl.get("entity1") in seeds or rl.get("entity2") in seeds][:10],
+            # keep predicates for every displayed node, not only seeds
+            "relations": [
+                rl for rl in relations
+                if rl.get("entity1") in {nd["name"] for nd in nodes}
+                or rl.get("entity2") in {nd["name"] for nd in nodes}
+            ][:20],
             "sources": src_blocks,
             "source_count": len(sources),
         }
@@ -302,7 +322,7 @@ def main():
             "bm25_hits": bm25_hits,
             "fusion": fusion,
             "rerank": rerank,
-            "graph": {"nodes": nodes, "edges": gedges},
+            "graph": {"nodes": nodes, "edges": gedges, "stats": graph_stats},
             "context_blocks": context_blocks,
             "answer_preview": bullets,
             "full_chunks": [
