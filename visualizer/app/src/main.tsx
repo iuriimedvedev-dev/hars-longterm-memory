@@ -4,6 +4,9 @@ import './index.css'
 // live-query sheet — imported AFTER index.css so its equal-specificity
 // overrides (query-bar width rule + pipeline step list) win the cascade.
 import './query-steps.css'
+// presentation three-column layout — must come after index.css so its
+// deliberate overrides of the old floating presentation chrome win.
+import './presentation-layout.css'
 // ui-scale sheet: #root{zoom} + the .canvaswrap counter-zoom (see ui-scale.css).
 import './ui-scale.css'
 import App from './App.tsx'
