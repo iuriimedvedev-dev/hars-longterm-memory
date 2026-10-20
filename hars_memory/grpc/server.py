@@ -919,6 +919,19 @@ async def _serve() -> None:
 
     health_pb2_grpc.add_HealthServicer_to_server(grpc_health, server)  # type: ignore[attr-defined]
 
+    # Read-only live-trace SSE / cosmos export listener on a sibling port.
+    trace_server = None
+    from hars_memory.trace import trace_config_from_env
+
+    trace_cfg = trace_config_from_env()
+    if trace_cfg is not None:
+        try:
+            from hars_memory.trace import start_trace_server
+
+            trace_server = await start_trace_server(*trace_cfg)
+        except Exception as exc:
+            logger.warning("Live trace SSE endpoint disabled (bind failed): %s", exc)
+
     bind_address = f"{HARS_MEMORY_GRPC_HOST}:{HARS_MEMORY_GRPC_PORT}"
     server.add_insecure_port(bind_address)
 
@@ -939,7 +952,15 @@ async def _serve() -> None:
     await server.start()
     logger.info("gRPC server listening on %s", bind_address)
 
-    await stop_event.wait()
+    try:
+        await stop_event.wait()
+    finally:
+        if trace_server is not None:
+            trace_server.close()
+            try:
+                await trace_server.wait_closed()
+            except Exception:
+                pass
     logger.info("Shutting down gRPC server...")
     await server.stop(grace=5)
 
