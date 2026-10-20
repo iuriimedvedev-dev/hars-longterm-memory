@@ -13,6 +13,17 @@ selection), the document-level metrics that matter:
 * ``ltr_full``      -- the learned ranker over the FULL pool (recommended wiring).
 * ``ltr_gated``     -- the learned ranker over the already top-k-truncated
                        gated pool (what you get if the ranker is hooked LAST).
+* ``fusion_graph``  -- hand-tuned fusion + the hub-damped graph/citation bridge
+                       channel (`retrieval/graph_bridge.py`, `G_chunks`),
+                       merged into the pool BEFORE the window is cut — exactly
+                       where `_compute_hybrid_block` merges it.
+* ``fusion_rog_graph`` -- the same merge, then the production ranked-ripgrep
+                       gate on top.
+
+The two graph variants are skipped (and omitted from the report) when the
+index's graph stores cannot be loaded, so the gate still runs on a bare index.
+The merge never *replaces* an existing candidate's provenance — see
+`graph_bridge.augment_fused_pool`'s contract.
 
 Also reports the ranker's scoring latency (per query and per candidate), which
 must stay well under 1 ms/candidate.
@@ -57,6 +68,7 @@ K_VALUES = (1, 10)
 NDCG_K = 10
 DEFAULT_TOP_K = 10
 DEFAULT_ALPHA = 0.5
+GRAPH_VARIANTS = ("fusion_graph", "fusion_rog_graph")
 
 
 @dataclass
@@ -120,6 +132,7 @@ def _run_variants(
     context: LtrCorpusContext | None,
     ranker: Any,
     per_variant: dict[str, VariantScores],
+    graph_store: Any = None,
 ) -> None:
     pool = bundle.pool
     if not pool:
@@ -132,6 +145,28 @@ def _run_variants(
         pool, bundle.ripgrep_hits_by_basename, top_k=top_k, mode="ranked"
     )
     _score(record, _doc_order(gated, top_k), per_variant["fusion_rog"])
+
+    # 2b. graph/citation bridge channel, merged where production merges it:
+    # into the full pre-truncation pool, before the gate and the window cut.
+    graph_pool = None
+    if graph_store is not None:
+        from hars_memory.retrieval.graph_bridge import augment_fused_pool
+
+        start = time.perf_counter()
+        graph_pool, _report = augment_fused_pool(pool, record.question, store=graph_store)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        per_variant["fusion_graph"].latency_ms.append(elapsed_ms)
+        per_variant["fusion_graph"].candidates += len(graph_pool)
+        _score(record, _doc_order(graph_pool, top_k), per_variant["fusion_graph"])
+
+        start = time.perf_counter()
+        gated_graph = apply_ripgrep_gate(
+            graph_pool, bundle.ripgrep_hits_by_basename, top_k=top_k, mode="ranked"
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        per_variant["fusion_rog_graph"].latency_ms.append(elapsed_ms)
+        per_variant["fusion_rog_graph"].candidates += len(gated_graph)
+        _score(record, _doc_order(gated_graph, top_k), per_variant["fusion_rog_graph"])
 
     # 3 + 4. learned ranker, over the full pool and over the gated pool
     if ranker is not None:
@@ -158,6 +193,7 @@ async def run_gate(
     alpha: float = DEFAULT_ALPHA,
     pool_multiplier: int = DEFAULT_POOL_MULTIPLIER,
     index_dir: str | None = None,
+    include_graph_bridge: bool = True,
 ) -> dict[str, Any]:
     from hars_memory.server.lightrag_init import DEFAULT_WORKING_DIR, create_lightrag
     from hars_memory.retrieval.bm25_index import get_or_build_index
@@ -171,10 +207,25 @@ async def run_gate(
     context = LtrCorpusContext.load(working_dir)
     ranker = load_default_ranker(model_path) if model_path is not None else load_default_ranker()
 
+    graph_store = None
+    if include_graph_bridge:
+        try:
+            from hars_memory.retrieval.graph_bridge import load_store
+
+            graph_store = load_store(working_dir)
+        except Exception as exc:  # noqa: BLE001 - optional offline variant
+            logger.warning("fusion_graph variants skipped: %s", exc)
+
+    variant_names = ["fusion", "fusion_rog"]
+    if graph_store is not None:
+        variant_names.extend(GRAPH_VARIANTS)
+    variant_names.extend(["ltr_full", "ltr_gated"])
+
     report: dict[str, Any] = {
         "index_dir": working_dir,
         "model_path": str(model_path) if model_path else None,
         "ranker_loaded": ranker is not None,
+        "graph_bridge_loaded": graph_store is not None,
         "top_k": top_k,
         "alpha": alpha,
         "sets": {},
@@ -182,10 +233,7 @@ async def run_gate(
 
     for query_file in query_files:
         records = [r for r in load_query_records(query_file) if r.gold_docs]
-        per_variant = {
-            name: VariantScores()
-            for name in ("fusion", "fusion_rog", "ltr_full", "ltr_gated")
-        }
+        per_variant = {name: VariantScores() for name in variant_names}
         for record in records:
             bundle = await build_pool(
                 rag,
@@ -198,7 +246,13 @@ async def run_gate(
                 ll_keywords=record.ll_keywords,
             )
             _run_variants(
-                record, bundle, top_k=top_k, context=context, ranker=ranker, per_variant=per_variant
+                record,
+                bundle,
+                top_k=top_k,
+                context=context,
+                ranker=ranker,
+                per_variant=per_variant,
+                graph_store=graph_store,
             )
         report["sets"][query_file.name] = {
             "n_queries": len(records),
@@ -230,6 +284,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
     parser.add_argument("--pool-multiplier", type=int, default=DEFAULT_POOL_MULTIPLIER)
     parser.add_argument("--index-dir", type=str, default=None)
+    parser.add_argument(
+        "--no-graph-bridge",
+        action="store_true",
+        help="Skip the fusion_graph / fusion_rog_graph variants.",
+    )
     return parser.parse_args(argv)
 
 
@@ -244,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             alpha=args.alpha,
             pool_multiplier=args.pool_multiplier,
             index_dir=args.index_dir,
+            include_graph_bridge=not args.no_graph_bridge,
         )
     )
     _print_report(report)
