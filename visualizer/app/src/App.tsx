@@ -319,6 +319,17 @@ export default function App() {
       });
   }, [applyCosmosData, t]);
 
+  // Presentation chapters 3-8 replay a recall trace. A fresh viewer has no
+  // live trace yet, and the honest gate ("this chapter needs a recall trace")
+  // is a dead end during a demo. Entering the presentation therefore opens the
+  // explicit demo snapshot automatically; the DEMO badge and the "back to live"
+  // button stay visible, so it is never mistaken for live data.
+  useEffect(() => {
+    if (presenting && source.phase !== "demo" && liveTrace === null) {
+      openDemo();
+    }
+  }, [presenting, source.phase, liveTrace, openDemo]);
+
   useEffect(() => {
     const cleanup = loadLive();
     return cleanup;
