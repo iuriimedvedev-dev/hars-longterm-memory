@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from typing import Final
+from typing import Final, Sequence
 
 from hars_memory.retrieval.supersession import apply_supersession_scoring
 
@@ -885,14 +885,15 @@ _MODE_RANKED = "ranked"
 _MODE_INJECTION = "injection"
 _VALID_RIPGREP_MODES: Final[frozenset[str]] = frozenset({_MODE_RANKED, _MODE_INJECTION})
 _DEFAULT_RIPGREP_CHANNEL_MODE = _MODE_RANKED
-# 0.25 is a deliberately conservative default, picked by the 2026-10-17
-# measurement on the 48-query GC-fixed set (see docs/ripgrep-ranked-channel.md
-# for the weight sweep): with the dense/sparse blend capped at 1.0, a 0.25
-# additive bonus is enough to promote a gold chunk that literal-matches while
-# staying far below the margin that separates a dominant dense/sparse win
-# from its nearest competitor. Override for a re-measurement; do not trust it
-# as a swept optimum.
-_DEFAULT_RIPGREP_CHANNEL_WEIGHT: Final[float] = 0.25
+# 0.10 as of the 2026-10-20 chunk-local rework. The 2026-10-17 value (0.25)
+# was swept against FILE-level scores; with chunk-local r/(r+3) scoring the
+# same weight over-promotes chunks that merely repeat an identifier, and
+# hard_1k r@1 fell 1.2 pts below ungated fusion at 0.25. The 2026-10-20 sweep
+# (2026-10-20 retrieval-fixes artifact: 48q + 28q + hard_1k, both indexes) has
+# 0.10 at parity with no-ripgrep r@1 while still gaining r@10 (+0.3/+0.5 pts
+# on production/md_struct hard_1k). Override for a re-measurement; do not
+# trust it as a swept optimum.
+_DEFAULT_RIPGREP_CHANNEL_WEIGHT: Final[float] = 0.10
 
 
 def ripgrep_channel_mode() -> str:
@@ -980,6 +981,91 @@ def _ripgrep_ranked_bonus(chunk_id: str, norms: dict[str, float], weight: float)
     return weight * norms.get(chunk_id, 0.0)
 
 
+# --- chunk-local ranked scoring (2026-10-20 fix) ----------------------------
+# The legacy ranked path clones ONE file-level rg score onto EVERY chunk of a
+# matching file and then min-max normalizes those values across the pool. On a
+# multi-chunk document that is a whole-FILE boost (every chunk moves together),
+# and on hard_1k it measured r@1 -2.5 pts vs the ungated fusion order: a file
+# that merely mentions the identifier anywhere outranked the chunk that
+# actually answers the question.
+#
+# The fix scores each chunk independently from ITS OWN content:
+#     r(c)   = sum over query identifier terms of capped occurrences in c
+#     S_local(c) = r(c) / (r(c) + 3)          (saturating, in [0, 1))
+# and applies the weight ONLY when the query actually contains an
+# identifier-shaped term (`tokenizer.extract_identifier_terms`). Plain
+# natural-language questions therefore get no ripgrep boost at all — the
+# channel was never meant to be a keyword booster (see ripgrep_channel's
+# "identifier-shaped terms only" contract).
+HARS_MEMORY_RIPGREP_CHUNK_LOCAL_ENV = "HARS_MEMORY_RIPGREP_CHUNK_LOCAL"
+#: Per-term occurrence cap inside one chunk (mirrors ripgrep_channel's
+#: MAX_COUNTED_MATCHES_PER_TERM: beyond ~5 occurrences the match is boilerplate,
+#: not evidence).
+_RIPGREP_CHUNK_LOCAL_MATCH_CAP: Final[int] = 5
+#: Saturation constant of `r / (r + scale)`.
+_RIPGREP_CHUNK_LOCAL_SCALE: Final[float] = 3.0
+_TRUTHY_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+_FALSY_VALUES: Final[frozenset[str]] = frozenset({"0", "false", "no", "off"})
+
+
+def ripgrep_chunk_local_enabled() -> bool:
+    """Whether chunk-local ranked scoring is on (default ON; env can revert)."""
+    raw = os.environ.get(HARS_MEMORY_RIPGREP_CHUNK_LOCAL_ENV)
+    if raw is None or not raw.strip():
+        return True
+    value = raw.strip().lower()
+    if value in _TRUTHY_VALUES:
+        return True
+    if value in _FALSY_VALUES:
+        return False
+    return True
+
+
+def _chunk_local_match_counts(
+    fused: list[FusedChunk], terms: Sequence[str]
+) -> dict[str, float]:
+    """`{chunk_id: capped occurrence count}` over each chunk's OWN content."""
+    if not terms:
+        return {}
+    counts: dict[str, float] = {}
+    for chunk in fused:
+        content = chunk.content.casefold()
+        if not content:
+            continue
+        total = 0
+        for term in terms:
+            needle = term.casefold()
+            if not needle:
+                continue
+            total += min(content.count(needle), _RIPGREP_CHUNK_LOCAL_MATCH_CAP)
+        if total:
+            counts[chunk.chunk_id] = float(total)
+    return counts
+
+
+def _chunk_local_norm(count: float) -> float:
+    """Saturating `r / (r + 3)` transform (0 -> 0, 1 -> 0.25, 5 -> 0.625)."""
+    if count <= 0.0:
+        return 0.0
+    return count / (count + _RIPGREP_CHUNK_LOCAL_SCALE)
+
+
+def _ripgrep_terms(
+    question: str | None, ll_keywords: Sequence[str] | None
+) -> list[str]:
+    """Identifier-shaped query terms; empty means "no literal query to score"."""
+    if not question:
+        return []
+    try:
+        from hars_memory.retrieval import ripgrep_channel
+
+        return list(ripgrep_channel.extract_terms(question, list(ll_keywords or ())))
+    except Exception:  # noqa: BLE001 - scoring must never break retrieval
+        from hars_memory.retrieval.tokenizer import extract_identifier_terms
+
+        return list(extract_identifier_terms(question))
+
+
 def _resort_after_rescoring(fused: list["FusedChunk"]) -> list["FusedChunk"]:
     """Re-sort a fused pool that already carries `fused_score`/`dense_score`/
     `sparse_score`, using EXACTLY `fuse()`'s `(quantized_score, zscore
@@ -1057,6 +1143,9 @@ def apply_ripgrep_ranked(
     weight: float | None = None,
     max_injected: int = RIPGREP_MAX_INJECTED,
     enable_injection: bool = True,
+    question: str | None = None,
+    ll_keywords: Sequence[str] | None = None,
+    chunk_local: bool | None = None,
 ) -> list[FusedChunk]:
     """RANKED ripgrep channel: score the whole fused pool with ripgrep's
     literal-match strength and re-slice to `top_k`, so ripgrep can move a
@@ -1102,7 +1191,41 @@ def apply_ripgrep_ranked(
         if basename is not None:
             matched_basenames.add(basename)
 
-    if matched_scores:
+    # Default: chunk-local scoring whenever the caller supplied the question
+    # (production + the offline gate do). `question=None` or an explicit
+    # `chunk_local=False` keeps the legacy file-level path intact for callers
+    # that never had the query text.
+    use_chunk_local = (
+        ripgrep_chunk_local_enabled() if chunk_local is None else chunk_local
+    ) and question is not None
+    if use_chunk_local:
+        terms = _ripgrep_terms(question, ll_keywords)
+        local_counts = _chunk_local_match_counts(fused, terms)
+        if terms and local_counts:
+            # Weight applies only to chunks whose OWN text matches. The
+            # file-level score is still annotated for reporting/the ranker.
+            rescored = [
+                replace(
+                    chunk,
+                    fused_score=chunk.fused_score
+                    + effective_weight
+                    * _chunk_local_norm(local_counts.get(chunk.chunk_id, 0.0)),
+                    ripgrep_score=matched_scores.get(chunk.chunk_id, chunk.ripgrep_score),
+                )
+                for chunk in fused
+            ]
+        else:
+            # No identifier-shaped term in the query: the channel contributes
+            # presence only (injection), never a ranking boost.
+            rescored = [
+                replace(
+                    chunk,
+                    ripgrep_score=matched_scores.get(chunk.chunk_id, chunk.ripgrep_score),
+                )
+                for chunk in fused
+            ]
+        fused = _resort_after_rescoring(rescored)
+    elif matched_scores:
         norms = _min_max_normalize(matched_scores)
         rescored = [
             replace(
@@ -1152,6 +1275,9 @@ def apply_ripgrep_gate(
     enable_injection: bool = True,
     mode: str | None = None,
     weight: float | None = None,
+    question: str | None = None,
+    ll_keywords: Sequence[str] | None = None,
+    chunk_local: bool | None = None,
 ) -> list[FusedChunk]:
     """Additively boost + presence-gate `fused` (the FULL pre-truncation
     dense+sparse fusion pool — callers must NOT have already sliced this to
@@ -1223,6 +1349,9 @@ def apply_ripgrep_gate(
             weight=weight,
             max_injected=max_injected,
             enable_injection=enable_injection,
+            question=question,
+            ll_keywords=ll_keywords,
+            chunk_local=chunk_local,
         )
     if effective_mode not in _VALID_RIPGREP_MODES:
         raise ValueError(f"mode must be one of {sorted(_VALID_RIPGREP_MODES)}, got {effective_mode!r}")
@@ -1706,6 +1835,8 @@ __all__ = [
     "apply_ripgrep_gate",
     "apply_ripgrep_ranked",
     "ripgrep_scores_by_chunk_id",
+    "HARS_MEMORY_RIPGREP_CHUNK_LOCAL_ENV",
+    "ripgrep_chunk_local_enabled",
     "fuse_ripgrep_as_third_weight",
     "HARS_MEMORY_FLAT_CHANNEL_ENV",
     "flat_channel_enabled",
