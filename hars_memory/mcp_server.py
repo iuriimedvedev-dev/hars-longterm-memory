@@ -197,7 +197,11 @@ HARS_MEMORY_FLAT_DENSE_CACHE_DIR = os.environ.get(
 # "UNTUNED" — that file is out of scope for this change (owned by a
 # concurrent supersession-scoring task); this env default is the one this
 # server actually uses, and it is now a measured value, not a placeholder.
-HARS_MEMORY_HYBRID_ALPHA = float(os.environ.get("HARS_MEMORY_HYBRID_ALPHA", "0.5"))
+# 0.15, not the old untuned 0.5: measured LOO on the 48q gold set gives
+# +12.5 pts recall@1 (0.7083 -> 0.7917) because BM25 puts the gold in its
+# top-3 for 45/48 while dense misses 7/48 entirely. On md_struct chunks the
+# same change is +1.5 pts and never harmful. Override via env to retune.
+HARS_MEMORY_HYBRID_ALPHA = float(os.environ.get("HARS_MEMORY_HYBRID_ALPHA", "0.15"))
 # Escape hatch: hybrid fields are additive (see memory_recall docstring) and
 # fail soft on their own, but this lets an operator disable the sparse channel
 # entirely (e.g. bm25s unavailable in some environment) without patching code.
@@ -234,7 +238,13 @@ STALE_INDEX_WARNING_DAYS = 7  # queries against an index older than this get a s
 # it is (empirically) already sitting almost exactly on the saturation
 # point, which is why decoupling fetch width from result count measures as
 # a no-op at this shipped default (see that comment for the full sweep).
-DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "6"))
+# 12, not 6: top_k is a CHUNK window. Measured (root_cause/topk_sweep.csv) on
+# the production index, k=6 -> 10 -> 20 moves answer-in-window from .287 to
+# .360 to .480 with flat latency (~65 ms); the knee is 10-12 and the plateau
+# 20-30. On md_struct (7.65 chunks/doc) k=6 covers <1 document and leaves the
+# answering document outside the window 87% of the time. 12 chunks fits the
+# 15k-char context budget at ~866-3500 chars/chunk.
+DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "12"))
 
 # --- FETCH-WIDTH KNOB (decoupled from DEFAULT_QUERY_TOP_K above, 2026-08-01) ---
 #
@@ -319,7 +329,7 @@ DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "6")
 # entire measurement (read-only, context_only=True path; no LLM, no GPU).
 HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER_ENV = "HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER"
 HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER = float(
-    os.environ.get(HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER_ENV, "1.0")
+    os.environ.get(HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER_ENV, "2.0")
 )
 
 NAIVE_FALLBACK_MODE = "naive"
@@ -376,7 +386,11 @@ ENTITY_DESCRIPTION_MAX_CHARS = 400
 # sized rather than byte-sized.
 DEFAULT_MAX_ENTITY_CONTEXT_BYTES = 500
 DEFAULT_MAX_RELATION_CONTEXT_BYTES = 4500
-MAX_CHUNKS_PER_SOURCE: int = 3
+# 2, not 3: on md_struct a single mega-note can own 126 chunks, so a 3-chunk
+# cap still lets one document eat a quarter of a 12-slot window. The cap is
+# applied to the FULL fused pool before slicing (see the call site), so 2
+# guarantees >=6 distinct documents in a 12-chunk result.
+MAX_CHUNKS_PER_SOURCE: int = int(os.environ.get("HARS_MEMORY_MAX_CHUNKS_PER_SOURCE", "2"))
 
 # Low-confidence marker threshold on the raw (pre-fusion,
 # pre-min-max-normalization) dense score. A low score is only marked when the

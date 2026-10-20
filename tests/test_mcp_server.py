@@ -2189,11 +2189,11 @@ def _write_fetch_knob_chunks(working_dir: Path) -> None:
 class TestFetchTopKResolver:
     """Pure unit tests for _resolve_fetch_top_k — no rag/index needed."""
 
-    def test_omitted_defaults_to_top_k_multiplier_one(self) -> None:
+    def test_omitted_defaults_to_top_k_multiplier_two(self) -> None:
         mod = _load_mcp_module_with_env({})
-        assert mod.HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER == 1.0  # shipped default
+        assert mod.HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER == 2.0  # shipped default
         fetch_top_k, source = mod._resolve_fetch_top_k(10, None)  # type: ignore[attr-defined]
-        assert (fetch_top_k, source) == (10, "multiplier")
+        assert (fetch_top_k, source) == (20, "multiplier")
 
     def test_env_multiplier_widens_the_computed_default(self) -> None:
         mod = _load_mcp_module_with_env({"HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER": "2.5"})
@@ -2284,9 +2284,9 @@ class TestFetchTopKCallToolWiring:
         assert data["ok"] is False
         assert "fetch_top_k" in data["error"]
 
-    def test_omitted_fetch_top_k_matches_top_k_in_query_param(self, tmp_path: Path) -> None:
-        """Backward compatibility: a caller passing only top_k must get
-        chunk_top_k == top_k, exactly like before this knob existed."""
+    def test_omitted_fetch_top_k_widens_chunk_top_k(self, tmp_path: Path) -> None:
+        """The shipped fetch multiplier (2.0) widens the chunk fetch beyond
+        top_k so the 12-chunk result window is filled from a deeper pool."""
         import asyncio
         import json
 
@@ -2308,8 +2308,8 @@ class TestFetchTopKCallToolWiring:
         }))
         data = json.loads(result[0].text)
         assert captured["top_k"] == 7
-        assert captured["chunk_top_k"] == 7
-        assert data["fetch_top_k"] == 7
+        assert captured["chunk_top_k"] == 14
+        assert data["fetch_top_k"] == 14
         assert data["fetch_top_k_source"] == "multiplier"
 
     def test_explicit_fetch_top_k_widens_chunk_top_k_only(self, tmp_path: Path) -> None:

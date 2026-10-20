@@ -245,6 +245,9 @@ class TestConfidentFusionSkip:
             mod, rag = _hybrid_module_with_docs(tmp_path, monkeypatch, docs, {
                 "HARS_MEMORY_RERANK_BACKEND": "http",
                 "HARS_MEMORY_RERANK_HTTP_URL": url,
+                # pin alpha: this test asserts the single-channel fused score
+                # equals alpha, so it must not follow the shipped default.
+                "HARS_MEMORY_HYBRID_ALPHA": "0.5",
             })
             result = asyncio.run(mod._compute_hybrid_block(rag, "question", 3))
 
