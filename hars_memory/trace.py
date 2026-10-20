@@ -286,18 +286,19 @@ _SSE_HEADERS = (
 ).encode("latin-1")
 
 
-def _json_response(status: str, payload: Any) -> bytes:
+def _json_response(status: str, payload: Any, *, head_only: bool = False) -> bytes:
     body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-    return (
+    headers = (
         f"HTTP/1.1 {status}\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"{_CORS}"
         "\r\n"
-    ).encode("utf-8") + body
+    ).encode("utf-8")
+    return headers if head_only else (headers + body)
 
 
-def _export_response(path: str, params: dict[str, str]) -> bytes:
+def _export_response(path: str, params: dict[str, str], *, head_only: bool = False) -> bytes:
     """Handle one /stats | /graph | /coords request (read-only index export).
 
     These run the graphml parse / kv-store counts / UMAP-cache read inline; the
@@ -312,21 +313,22 @@ def _export_response(path: str, params: dict[str, str]) -> bytes:
 
     try:
         if path == "/stats":
-            return _json_response("200 OK", graph_export.stats_payload())
+            return _json_response("200 OK", graph_export.stats_payload(), head_only=head_only)
         if path == "/graph":
-            return _json_response("200 OK", graph_export.graph_payload(params))
-        return _json_response("200 OK", graph_export.coords_payload(params))
+            return _json_response("200 OK", graph_export.graph_payload(params), head_only=head_only)
+        return _json_response("200 OK", graph_export.coords_payload(params), head_only=head_only)
     except graph_export.ExportError as exc:
         body: dict[str, Any] = {"ok": False, "error": str(exc)}
         if exc.hint:
             body["hint"] = exc.hint
         status = {400: "400 Bad Request", 404: "404 Not Found"}.get(exc.status, "503 Service Unavailable")
-        return _json_response(status, body)
+        return _json_response(status, body, head_only=head_only)
     except Exception as exc:  # pragma: no cover - defensive, keep listener alive
         logger.exception("export %s failed", path)
         return _json_response(
             "500 Internal Server Error",
             {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:200]},
+            head_only=head_only,
         )
 
 
@@ -425,17 +427,21 @@ async def _handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWr
     path = split.path.rstrip("/") or "/"
     params = _string_params(split.query)
 
-    if path == "/healthz":
-        writer.write(_json_response("200 OK", {"ok": True, "service": NAME, "trace": True}))
+    if path in ("/healthz", "/graph-stats/healthz"):
+        if method not in ("GET", "HEAD"):
+            writer.write(_json_response("405 Method Not Allowed", {"ok": False, "error": "GET or HEAD only"}))
+        else:
+            writer.write(_json_response("200 OK", {"ok": True, "service": NAME, "trace": True}, head_only=(method == "HEAD")))
         await writer.drain()
         return
 
     # ---- read-only cosmos export (Memory Travel): /stats /graph /coords ----
-    if path in ("/stats", "/graph", "/coords"):
-        if method != "GET":
-            writer.write(_json_response("405 Method Not Allowed", {"ok": False, "error": "GET only"}))
+    export_path = path.removeprefix("/graph-stats")
+    if export_path in ("/stats", "/graph", "/coords"):
+        if method not in ("GET", "HEAD"):
+            writer.write(_json_response("405 Method Not Allowed", {"ok": False, "error": "GET or HEAD only"}))
         else:
-            writer.write(_export_response(path, params))
+            writer.write(_export_response(export_path, params, head_only=(method == "HEAD")))
         await writer.drain()
         return
 
