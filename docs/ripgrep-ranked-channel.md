@@ -72,16 +72,35 @@ path needs one line to select the new mode (§5).
 
 ### Score definition
 
-Per chunk: the best `RipgrepSearchHit.score` among ripgrep hits whose file
-matches the chunk (via the fixed join). That score already encodes the signals
-the channel computes — number of matched query terms (co-occurrence
-multiplier), per-term match count (capped), whole-token vs substring weighting,
-path-type prior, floored recency (`ripgrep_channel.py` "Scoring"). It is then
-min-max normalized **per query over the matched chunks**, with
-`fusion._min_max_normalize` — the *same* convention dense/sparse use, including
-the degenerate single/tied-pool → 0.5 rule. **No WRRF implementation exists in
-this tree** (the module docstring documents why a pure rank fusion was rejected
-for the primary blend), so this is **score-wise min-max fusion**.
+**2026-10-20 — chunk-local scoring (default when the caller passes `question`).**
+The original definition below cloned a FILE-level score onto every chunk of a
+matching file and min-max normalized it across the pool. On a multi-chunk
+document that is a whole-file boost, and on `hard_1k` it measured r@1 −2.0 pts
+vs ungated fusion (production index). The ranked channel now computes, per
+chunk:
+
+```
+r(c)       = sum over query identifier terms of capped occurrences in c.content
+S_local(c) = r(c) / (r(c) + 3)          # saturating, in [0, 1)
+fused_score(c) += weight * S_local(c)   # only if the query has an identifier
+```
+
+Chunks whose own text does not contain the identifier get no boost; queries
+without an identifier-shaped term get no ranking boost at all (injection is
+unchanged). `HARS_MEMORY_RIPGREP_CHUNK_LOCAL=0` restores the file-level path,
+and omitting `question` (older callers) keeps it bit-for-bit.
+
+Per chunk (legacy definition): the best `RipgrepSearchHit.score` among ripgrep
+hits whose file matches the chunk (via the fixed join). That score already
+encodes the signals the channel computes — number of matched query terms
+(co-occurrence multiplier), per-term match count (capped), whole-token vs
+substring weighting, path-type prior, floored recency
+(`ripgrep_channel.py` "Scoring"). It is then min-max normalized **per query
+over the matched chunks**, with `fusion._min_max_normalize` — the *same*
+convention dense/sparse use, including the degenerate single/tied-pool → 0.5
+rule. **No WRRF implementation exists in this tree** (the module docstring
+documents why a pure rank fusion was rejected for the primary blend), so this
+is **score-wise min-max fusion**.
 
 ### Fusion entry point
 
@@ -110,7 +129,8 @@ injection answers "can an index-invisible file still surface at all".
 | --- | --- | --- |
 | `HARS_MEMORY_RIPGREP_CHANNEL` | **`1`** (was `0`) | channel on/off; `0` returns the pre-ripgrep fusion bit-for-bit |
 | `HARS_MEMORY_RIPGREP_CHANNEL_MODE` | `ranked` | `ranked` \| `injection` |
-| `HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT` | `0.25` | additive weight on the normalized literal score |
+| `HARS_MEMORY_RIPGREP_CHANNEL_WEIGHT` | `0.10` (was `0.25`) | additive weight on the (chunk-local) literal score |
+| `HARS_MEMORY_RIPGREP_CHUNK_LOCAL` | `1` | `0` restores file-level min-max scoring |
 | `HARS_MEMORY_RIPGREP_ROOTS` | *(unset)* | comma-separated search roots; falls back to the knowledge-source manifest |
 
 All are read fresh on every call.

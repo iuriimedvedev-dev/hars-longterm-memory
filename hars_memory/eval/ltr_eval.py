@@ -7,9 +7,13 @@ selection), the document-level metrics that matter:
 * ``fusion``        -- the hand-tuned ``alpha*dense + (1-alpha)*sparse`` order
                        over the full pre-truncation pool (the baseline being
                        replaced).
-* ``fusion_rog``    -- the current production default path: the same pool after
-                       the ranked-ripgrep additive gate, truncated to top-k
-                       ("rerank=off": no cross-encoder).
+* ``fusion_rog``    -- the ranked-ripgrep gate over that pool (chunk-local
+                       scoring when the question is passed), truncated to
+                       top-k ("rerank=off": no cross-encoder).
+* ``fusion_div``    -- the FIXED serving window: the ranked gate runs on the
+                       FULL pool, source-diversity selection
+                       (`retrieval/diversity.py`) ranks and slices it, and
+                       additive-channel exclusives are re-appended.
 * ``ltr_full``      -- the learned ranker over the FULL pool (recommended wiring).
 * ``ltr_gated``     -- the learned ranker over the already top-k-truncated
                        gated pool (what you get if the ranker is hooked LAST).
@@ -19,6 +23,12 @@ selection), the document-level metrics that matter:
                        where `_compute_hybrid_block` merges it.
 * ``fusion_rog_graph`` -- the same merge, then the production ranked-ripgrep
                        gate on top.
+
+The window convention is DOCUMENTS by default: `top_k` distinct `file_path`s
+are collected from the ranked pool. `--window chunks` reproduces the old
+"first top_k chunks, then dedupe" convention (kept only so published numbers
+can be re-derived); on an 8.4-chunks/document index it measured far fewer
+documents than its name implied.
 
 The two graph variants are skipped (and omitted from the report) when the
 index's graph stores cannot be loaded, so the gate still runs on a bare index.
@@ -47,7 +57,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from hars_memory.eval.channels import DEFAULT_POOL_MULTIPLIER, install_query_embedding_cache
 from hars_memory.eval.ltr_dataset import (
@@ -88,14 +98,68 @@ def _canonicalize(ranked_docs: list[str], gold_docs: tuple[str, ...]) -> list[st
     return out
 
 
-def _doc_order(pool: list[Any], top_k: int) -> list[str]:
-    """Document order from a CHUNK ordering, using the SAME convention the
-    published baseline uses: keep the first ``top_k`` CHUNKS, then dedupe to
-    documents. Truncating before dedupe is what makes these numbers directly
-    comparable to ``ab_bench``'s ``hybrid_bm25`` row (recall@1 0.7083 /
-    recall@10 0.9792 on the 48-query GC-fixed set)."""
-    window = pool[:top_k]
-    return dedupe_preserve_order([chunk.file_path for chunk in window if chunk.file_path])
+def _doc_order(pool: list[Any], top_k: int, *, window: str = "documents") -> list[str]:
+    """Document order from a CHUNK ordering.
+
+    ``window="documents"`` (default, the fixed convention): walk the ranked
+    pool and collect up to ``top_k`` DISTINCT ``file_path`` values. The metric
+    then means what its name says — recall@10 over ten retrieved documents.
+
+    ``window="chunks"`` (the historical convention, kept for reproducing
+    published numbers): keep the first ``top_k`` CHUNKS, then dedupe to
+    documents. On md_struct (8.4 chunks/document) that window held as few as
+    ~3 distinct documents, so its "recall@10" was really recall@~3 documents —
+    which is why the md_struct-vs-production comparison had to be re-run.
+    """
+    if window == "chunks":
+        return dedupe_preserve_order(
+            [chunk.file_path for chunk in pool[:top_k] if chunk.file_path]
+        )
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in pool:
+        path = getattr(chunk, "file_path", "")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= top_k:
+            break
+    return out
+
+
+def _production_selection(
+    pool: list[Any],
+    ripgrep_hits: dict[str, Any],
+    *,
+    question: str,
+    top_k: int,
+    ll_keywords: Sequence[str] | None = None,
+    diversity: bool = True,
+) -> list[Any]:
+    """The serving path's window: gate the FULL pool, diversify, then slice.
+
+    Mirrors `mcp_server` after the 2026-10-20 fixes: the ranked gate runs with
+    ``top_k=len(pool)`` so it cannot pre-slice away candidates the diversity
+    pass needs, additive-channel exclusives are re-appended after the
+    selection, and the selection itself is source-diversified before slicing.
+    """
+    from hars_memory.retrieval.diversity import select_diverse_fused_chunks
+
+    gated = apply_ripgrep_gate(
+        pool,
+        ripgrep_hits,
+        top_k=len(pool),
+        mode="ranked",
+        question=question,
+        ll_keywords=ll_keywords,
+    )
+    pool_ids = {chunk.chunk_id for chunk in pool}
+    tail = [chunk for chunk in gated if chunk.chunk_id not in pool_ids]
+    selected = select_diverse_fused_chunks(gated, top_k, enable=diversity)
+    selected_ids = {chunk.chunk_id for chunk in selected}
+    selected.extend(chunk for chunk in tail if chunk.chunk_id not in selected_ids)
+    return selected
 
 
 def _score(record: QueryRecord, ranked_docs: list[str], variant: VariantScores) -> None:
@@ -133,18 +197,36 @@ def _run_variants(
     ranker: Any,
     per_variant: dict[str, VariantScores],
     graph_store: Any = None,
+    window: str = "documents",
+    diversity: bool = True,
 ) -> None:
     pool = bundle.pool
     if not pool:
         return
     # 1. hand-tuned fusion over the full pool (the baseline)
-    _score(record, _doc_order(pool, top_k), per_variant["fusion"])
+    _score(record, _doc_order(pool, top_k, window=window), per_variant["fusion"])
 
     # 2. production default: ranked-ripgrep gate, truncated to top-k ("rerank=off")
     gated = apply_ripgrep_gate(
-        pool, bundle.ripgrep_hits_by_basename, top_k=top_k, mode="ranked"
+        pool,
+        bundle.ripgrep_hits_by_basename,
+        top_k=top_k,
+        mode="ranked",
+        question=record.question,
+        ll_keywords=record.ll_keywords,
     )
-    _score(record, _doc_order(gated, top_k), per_variant["fusion_rog"])
+    _score(record, _doc_order(gated, top_k, window=window), per_variant["fusion_rog"])
+
+    # 2a. the FIXED serving window: gate the full pool, source-diversify, slice
+    selected = _production_selection(
+        pool,
+        bundle.ripgrep_hits_by_basename,
+        question=record.question,
+        top_k=top_k,
+        ll_keywords=record.ll_keywords,
+        diversity=diversity,
+    )
+    _score(record, _doc_order(selected, top_k, window=window), per_variant["fusion_div"])
 
     # 2b. graph/citation bridge channel, merged where production merges it:
     # into the full pre-truncation pool, before the gate and the window cut.
@@ -157,16 +239,21 @@ def _run_variants(
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         per_variant["fusion_graph"].latency_ms.append(elapsed_ms)
         per_variant["fusion_graph"].candidates += len(graph_pool)
-        _score(record, _doc_order(graph_pool, top_k), per_variant["fusion_graph"])
+        _score(record, _doc_order(graph_pool, top_k, window=window), per_variant["fusion_graph"])
 
         start = time.perf_counter()
         gated_graph = apply_ripgrep_gate(
-            graph_pool, bundle.ripgrep_hits_by_basename, top_k=top_k, mode="ranked"
+            graph_pool,
+            bundle.ripgrep_hits_by_basename,
+            top_k=top_k,
+            mode="ranked",
+            question=record.question,
+            ll_keywords=record.ll_keywords,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         per_variant["fusion_rog_graph"].latency_ms.append(elapsed_ms)
         per_variant["fusion_rog_graph"].candidates += len(gated_graph)
-        _score(record, _doc_order(gated_graph, top_k), per_variant["fusion_rog_graph"])
+        _score(record, _doc_order(gated_graph, top_k, window=window), per_variant["fusion_rog_graph"])
 
     # 3 + 4. learned ranker, over the full pool and over the gated pool
     if ranker is not None:
@@ -194,6 +281,8 @@ async def run_gate(
     pool_multiplier: int = DEFAULT_POOL_MULTIPLIER,
     index_dir: str | None = None,
     include_graph_bridge: bool = True,
+    window: str = "documents",
+    diversity: bool = True,
 ) -> dict[str, Any]:
     from hars_memory.server.lightrag_init import DEFAULT_WORKING_DIR, create_lightrag
     from hars_memory.retrieval.bm25_index import get_or_build_index
@@ -216,7 +305,7 @@ async def run_gate(
         except Exception as exc:  # noqa: BLE001 - optional offline variant
             logger.warning("fusion_graph variants skipped: %s", exc)
 
-    variant_names = ["fusion", "fusion_rog"]
+    variant_names = ["fusion", "fusion_rog", "fusion_div"]
     if graph_store is not None:
         variant_names.extend(GRAPH_VARIANTS)
     variant_names.extend(["ltr_full", "ltr_gated"])
@@ -228,6 +317,9 @@ async def run_gate(
         "graph_bridge_loaded": graph_store is not None,
         "top_k": top_k,
         "alpha": alpha,
+        "pool_multiplier": pool_multiplier,
+        "window": window,
+        "diversity": diversity,
         "sets": {},
     }
 
@@ -253,6 +345,8 @@ async def run_gate(
                 ranker=ranker,
                 per_variant=per_variant,
                 graph_store=graph_store,
+                window=window,
+                diversity=diversity,
             )
         report["sets"][query_file.name] = {
             "n_queries": len(records),
@@ -285,6 +379,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pool-multiplier", type=int, default=DEFAULT_POOL_MULTIPLIER)
     parser.add_argument("--index-dir", type=str, default=None)
     parser.add_argument(
+        "--window",
+        choices=("documents", "chunks"),
+        default="documents",
+        help="documents: collect top_k DISTINCT files (fixed). chunks: legacy "
+        "top_k chunks then dedupe (only for reproducing pre-2026-10-20 numbers).",
+    )
+    parser.add_argument(
+        "--no-diversity",
+        action="store_true",
+        help="Disable the source-diversity selection in the fusion_div variant.",
+    )
+    parser.add_argument(
         "--no-graph-bridge",
         action="store_true",
         help="Skip the fusion_graph / fusion_rog_graph variants.",
@@ -304,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
             pool_multiplier=args.pool_multiplier,
             index_dir=args.index_dir,
             include_graph_bridge=not args.no_graph_bridge,
+            window=args.window,
+            diversity=not args.no_diversity,
         )
     )
     _print_report(report)
