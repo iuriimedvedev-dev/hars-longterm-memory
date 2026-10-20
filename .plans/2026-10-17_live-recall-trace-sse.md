@@ -9,7 +9,7 @@ replaying saved fixtures. Contract source of truth:
 
 ## Transport decision (deviation from the draft, documented)
 The service is a **stdio MCP server wrapped by supergateway** (`--stateful`,
-`10.66.66.99:8099/mcp`). supergateway is Node and exposes no hook to add a plain
+`memory-host:8099/mcp`). supergateway is Node and exposes no hook to add a plain
 HTTP route, so the draft's `GET /mcp/trace` cannot be hosted there. Instead the
 MCP process itself starts a **sibling read-only HTTP/1.1 + SSE listener** on
 `HARS_MEMORY_TRACE_HTTP_PORT` (default `8098`; host defaults to
