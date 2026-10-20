@@ -7,3 +7,7 @@ __pycache__/
 *.safetensors
 *.pt
 *.log
+
+# confidential SFT splits: never commit
+training/extract_4b/data/
+training/outputs/
