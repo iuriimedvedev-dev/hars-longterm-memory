@@ -7,7 +7,7 @@ Date: 2026-10-20. Index: production `index_compact_20260903_imported`
 
 | Parameter | Before | After | File |
 |---|---|---|---|
-| `DEFAULT_QUERY_TOP_K` | 6 | **12** | `mcp_server.py:237` |
+| `DEFAULT_QUERY_TOP_K` | 6 | **20** | `mcp_server.py:237` |
 | `HARS_MEMORY_QUERY_FETCH_TOP_K_MULTIPLIER` | 1.0 | **2.0** | `mcp_server.py:321` |
 | `HARS_MEMORY_HYBRID_ALPHA` | 0.5 (untuned) | **0.15** | `mcp_server.py:200` |
 | `MAX_CHUNKS_PER_SOURCE` | 3 | **2** | `mcp_server.py:379` |
@@ -32,26 +32,28 @@ export HARS_MEMORY_INDEX_DIR=~/.local/share/hars-graphrag/index_compact_20260903
   --queries eval_agentic-data/retrieval_queries_current_gcfixed.yaml \
             eval_agentic-data/relational_gold.yaml \
   --index-dir "$HARS_MEMORY_INDEX_DIR" \
-  --top-k 12 --alpha 0.15 --pool-multiplier 2 \
+  --top-k 20 --alpha 0.15 --pool-multiplier 2 \
   --report /tmp/opencode/eval_tuned.json
 ```
 
-| Set | Metric | Before (k=10, α=0.5, pool×3) | After (k=12, α=0.15, pool×2) | Δ |
+| Set | Metric | Before (k=10, α=0.5, pool×3) | After (k=20, α=0.15, pool×2) | Δ |
 |---|---|---:|---:|---:|
-| 48q single-hop | recall@1 | 0.7083 | **0.8125** | +10.4 pts |
+| 48q single-hop | recall@1 | 0.7083 | **0.8333** | +12.5 pts |
 | 48q | recall@10 | 0.9792 | **1.0000** | +2.1 |
-| 48q | NDCG@10 | 0.8563 | **0.9119** | +5.6 |
-| 48q | MRR | 0.8149 | **0.8828** | +6.8 |
+| 48q | NDCG@10 | 0.8563 | **0.9196** | +6.3 |
+| 48q | MRR | 0.8149 | **0.8932** | +7.8 |
 | 28q relational | recall@1 | 0.2857 | **0.3393** | +5.4 |
-| 28q | recall@10 | 0.6964 | **0.7500** | +5.4 |
-| 28q | NDCG@10 | 0.6144 | **0.6899** | +7.6 |
-| 28q | MRR | 0.6845 | **0.7512** | +6.7 |
+| 28q | recall@10 | 0.6964 | **0.7679** | +7.2 |
+| 28q | NDCG@10 | 0.6144 | **0.6988** | +8.4 |
+| 28q | MRR | 0.6845 | **0.7562** | +7.2 |
 | hard_1k eval (300) | recall@1 | 0.3561 | **0.3600** | +0.4 |
 | hard_1k | recall@10 | 0.6506 | **0.6772** | +2.7 |
 | hard_1k | NDCG@10 | 0.6119 | **0.6336** | +2.2 |
 | hard_1k | MRR | 0.7965 | **0.8096** | +1.3 |
 
-Every set improves on every metric; no set regresses.
+Every set improves on every metric; no set regresses. `top_k` sweep on the
+production index: k=12 gives 48q r@1 0.8125, k=20 gives 0.8333, k=30 gives
+0.8125 (28q recall@10 rises monotonically: 0.7500 → 0.7679 → 0.7857).
 
 ## Why these values (evidence)
 

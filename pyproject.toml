@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hars-longterm-memory"
-version = "0.7.1"
+version = "0.8.0"
 description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
 requires-python = ">=3.13"
 readme = "README.md"
@@ -138,6 +138,7 @@ exclude = [
   # internal research data / operator paths / fine-tune runbook: never ship
   "eval_agentic-data", "training",
   "docs/FINETUNE.md", "docs/LOCAL_CONTINUE.md", "docs/EVAL_NEW_VS_BASELINE.md",
+  "docs/RETRIEVAL_TUNING_V2.md",
   "verification_results.md", "verification_summary_short.txt",
 ]
 
