@@ -1844,6 +1844,40 @@ async def _compute_hybrid_block(
         else:
             fused_pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
 
+        # Graph/citation bridge channel (`retrieval/graph_bridge.py`) — opt-in
+        # via HARS_MEMORY_GRAPH_BRIDGE (default OFF until measured; see that
+        # module's docstring and eval_agentic/rca/graph_bridge/REPORT.md).
+        # Runs on the ALREADY-FUSED pool, seeded by its top-3 anchor chunks, and
+        # contributes up to 20 provenance-scored chunks BEFORE the ripgrep gate
+        # and the diversity/truncation pass below, so every downstream stage
+        # sees one pool. Fail-soft by construction (`maybe_augment_fused_pool`
+        # never raises): a missing/corrupt graph store degrades this channel to
+        # "contributed nothing" rather than breaking the query.
+        graph_bridge_report: dict[str, Any] = {
+            "enabled": False,
+            "reason": "HARS_MEMORY_GRAPH_BRIDGE=0 (default)",
+        }
+        graph_bridge_started = time.monotonic()
+        from hars_memory.retrieval.graph_bridge import (
+            HARS_MEMORY_GRAPH_BRIDGE_ENV,
+            graph_bridge_enabled,
+            maybe_augment_fused_pool,
+        )
+
+        if graph_bridge_enabled() and fused_pool:
+            fused_pool, graph_bridge_report = maybe_augment_fused_pool(
+                fused_pool, question, index_dir=chunk_wdir
+            )
+            graph_bridge_report["latency_ms"] = round(
+                (time.monotonic() - graph_bridge_started) * 1000.0, 2
+            )
+        else:
+            graph_bridge_report["reason"] = (
+                f"{HARS_MEMORY_GRAPH_BRIDGE_ENV}=0 (default)"
+                if not graph_bridge_enabled()
+                else "empty_pool"
+            )
+
         # Ripgrep channel (retrieval/ripgrep_channel.py) — additive gate over
         # the dense+sparse fusion above, NOT a third convex weight; see
         # retrieval/fusion.py's design note above `apply_ripgrep_gate` for
@@ -2209,11 +2243,13 @@ async def _compute_hybrid_block(
                 "dense_channel": round(dense_elapsed_ms, 2),
                 "ripgrep_channel": ripgrep_report.get("latency_ms"),
                 "flat_dense_channel": flat_report.get("latency_ms"),
+                "graph_bridge_channel": graph_bridge_report.get("latency_ms"),
                 "rerank_channel": round(rerank_elapsed_ms, 2) if rerank_elapsed_ms is not None else None,
             },
             "rerank": rerank_status,
             "ripgrep": ripgrep_report,
             "flat_dense": flat_report,
+            "graph_bridge": graph_bridge_report,
             "confidence": {
                 "top_dense_score": round(top_dense_score, 4) if top_dense_score is not None else None,
                 "low_confidence": low_confidence,
