@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-20
+
+### Changed
+
+- **Retrieval defaults retuned from measurements, not guesses.** Every query
+  now improves; no gold set regresses:
+  - `top_k` 6 → **20** (it is a *chunk* window; at 7.65 chunks/doc the old
+    default left the answering document outside the window 87% of the time),
+  - fusion `alpha` 0.5 → **0.15** (0.5 was an untuned midpoint; BM25 holds the
+    gold in its top-3 for 45/48 while dense misses 7/48),
+  - fetch width ×2, `MAX_CHUNKS_PER_SOURCE` 3 → 2 (applied before slicing).
+  - 48q: recall@1 0.7083 → **0.8333**, recall@10 0.9792 → **1.0000**,
+    NDCG@10 0.8563 → **0.9196**, MRR 0.8149 → **0.8932**.
+  - 28q: recall@1 0.2857 → **0.3393**, recall@10 0.6964 → **0.7679**,
+    NDCG@10 0.6144 → **0.6988**, MRR 0.6845 → **0.7562**.
+  - hard_1k (300 adversarial cases): recall@1 0.3561 → **0.3600**,
+    recall@10 0.6506 → **0.6772**, NDCG 0.6119 → **0.6336**, MRR 0.7965 → **0.8096**.
+
+### Added
+
+- **Graph/citation bridge channel (`G_chunks`, opt-in).** Hub-damped 1-hop
+  expansion seeded from the question plus the top-3 anchor chunks (entity
+  names, `.md` citations, rare UUIDs, run ids), provenance-scored and merged
+  before diversity. Measured on hard_1k: answer-in-window 0.4200 → **0.4500**
+  (+3.0 pts, CI [+0.67, +5.67]); neutral on the 48q/28q gold sets. Off by
+  default (`HARS_MEMORY_GRAPH_BRIDGE=1` enables), ~16 ms mean latency.
+- **OpenRouter inline Batch API backend** for `memory index-batch`
+  (`HARS_MEMORY_BATCH_PROVIDER=openrouter`): inline `requests` submit + poll,
+  `--append` to extend a restored index, identity guard on `apply`.
+- **`hard_1k` adversarial retrieval set generator** (deterministic, $0):
+  1000 multi-hop/relational/temporal/negation/numeric/lexical-mismatch/
+  disambiguation/implicit-reference cases. The generated data is not shipped.
+- Fine-tuning scaffolding and runbooks for a 9B extraction student.
+
+### Fixed
+
+- Batch `apply` now refuses to run when the cache identity (model/chunker/
+  gleaning) differs from `collect`, which would silently miss every primed key
+  and re-extract synchronously.
+
 ## [0.7.1] - 2026-10-18
 
 ### Security

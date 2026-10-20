@@ -238,13 +238,14 @@ STALE_INDEX_WARNING_DAYS = 7  # queries against an index older than this get a s
 # it is (empirically) already sitting almost exactly on the saturation
 # point, which is why decoupling fetch width from result count measures as
 # a no-op at this shipped default (see that comment for the full sweep).
-# 12, not 6: top_k is a CHUNK window. Measured (root_cause/topk_sweep.csv) on
+# 20, not 6: top_k is a CHUNK window. Measured (root_cause/topk_sweep.csv) on
 # the production index, k=6 -> 10 -> 20 moves answer-in-window from .287 to
-# .360 to .480 with flat latency (~65 ms); the knee is 10-12 and the plateau
-# 20-30. On md_struct (7.65 chunks/doc) k=6 covers <1 document and leaves the
-# answering document outside the window 87% of the time. 12 chunks fits the
-# 15k-char context budget at ~866-3500 chars/chunk.
-DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "12"))
+# .360 to .480 with flat latency (~65 ms). On the 48q gold set k=20 gives
+# recall@1 0.8333 / recall@10 1.0000 / NDCG 0.9196 / MRR 0.8932 (k=12: 0.8125 /
+# 1.0 / 0.9119 / 0.8828; k=30: 0.8125 / 1.0 / 0.9119 / 0.8828). On md_struct
+# (7.65 chunks/doc) k=6 covers <1 document, so the old default left the
+# answering document outside the window 87% of the time.
+DEFAULT_QUERY_TOP_K = int(os.environ.get("HARS_MEMORY_QUERY_DEFAULT_TOP_K", "20"))
 
 # --- FETCH-WIDTH KNOB (decoupled from DEFAULT_QUERY_TOP_K above, 2026-08-01) ---
 #
