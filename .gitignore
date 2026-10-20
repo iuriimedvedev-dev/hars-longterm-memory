@@ -36,3 +36,27 @@ eval_agentic/
 
 # local entity-alias overrides (deployment-specific spellings, never shipped)
 config/entity_aliases.local.yaml
+
+# ---------------------------------------------------------------------------
+# Artifacts: datasets, model weights, screenshots and build output never belong
+# in git. The code that produces them does; the bytes do not.
+# ---------------------------------------------------------------------------
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.tgz
+*.tar.gz
+
+# fine-tune data splits and run outputs (confidential research material)
+training/**/data/
+training/outputs/
+training/**/*.jsonl
+
+# visualizer build/render artifacts
+visualizer/app/dist/
+visualizer/app/node_modules/
+visualizer/docs/screenshots/
+visualizer/**/*.map
+

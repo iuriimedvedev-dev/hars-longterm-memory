@@ -136,7 +136,7 @@ exclude = [
   "AGENTS.md", "CLAUDE.md",
   "docs/OPERATIONS_HANDOFF.md", "docs/SWAP_CHECKLIST.md", "docs/VERSION_PIN.md",
   # internal research data / operator paths / fine-tune runbook: never ship
-  "eval_agentic-data", "training",
+  "eval_agentic-data", "training", "visualizer",
   "docs/FINETUNE.md", "docs/LOCAL_CONTINUE.md", "docs/EVAL_NEW_VS_BASELINE.md",
   "docs/RETRIEVAL_TUNING_V2.md",
   "verification_results.md", "verification_summary_short.txt",
