@@ -4,12 +4,13 @@
 // chain with the real counts at every hop, the final answer (with clickable
 // citations) and the presentation controls. Readable from a distance: this is
 // a script panel, not a floating caption.
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { AnswerPart, ChainHop } from "../lib/presChain";
 import { answerParts, contextDocCount } from "../lib/presChain";
 import { CHAPTERS, type PresCtx } from "../lib/presentation";
 import type { TravelTrace } from "../lib/types";
 import { fmt, pick, type Dict, type Lang } from "../i18n/strings";
+import { prefersReducedMotion } from "../lib/motion";
 import { ChevronLeftIcon, ChevronRightIcon, LinkIcon, PauseIcon, PlayIcon, SparkIcon } from "./icons";
 
 interface Props {
@@ -50,8 +51,26 @@ export function PresNarrationPanel({
   dataOpen,
 }: Props) {
   const answer = useMemo(() => (chapter.id === "answer" ? answerParts(trace) : []), [chapter.id, trace]);
+  const rootRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || prefersReducedMotion() || typeof root.animate !== "function") return;
+    // Animate the scrolling body, never the panel root: a filled animation on
+    // the root would override the ask-screen dimming.
+    const body = root.querySelector<HTMLElement>(".pres-script-scroll");
+    body?.animate(
+      [{ opacity: 0, transform: "translateY(8px)" }, { opacity: 1, transform: "none" }],
+      { duration: 320, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)", fill: "both" },
+    );
+    [...root.querySelectorAll<HTMLElement>(".pres-quotes li")].forEach((el, i) => {
+      el.animate(
+        [{ opacity: 0, transform: "translateY(10px)" }, { opacity: 1, transform: "none" }],
+        { duration: 420, delay: 60 + i * 160, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)", fill: "both" },
+      );
+    });
+  }, [chapter.id, trace]);
   return (
-    <aside className="pres-script" aria-label={t.presScript}>
+    <aside ref={rootRef} className="pres-script" aria-label={t.presScript}>
       <div className="pres-script-head">
         <span className="pres-kicker">
           {fmt(t.presChapter, { n: chapterIndex + 1, total: chapterTotal })}

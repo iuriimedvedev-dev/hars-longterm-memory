@@ -56,12 +56,12 @@ const RU = {
   // ---- data source badge: WHAT the starfield renders (live vs demo) ----
   srcProbing: "источник: подключаюсь…",
   srcLiveBadge: "живые данные: {id}",
-  srcDemoBadge: "демо: офлайн-снимок индекса HARS, 2026-10-17",
+  srcDemoBadge: "демо: синтетический снимок HARS",
   srcOfflineBadge: "источник: нет подключения",
   srcBadgeTitle: "какой индекс рендерит космос",
   srcLiveTitle:
     "космос рендерит ПОДКЛЮЧЁННЫЙ индекс: {id} · {docs} док. · {n} узлов · {m} рёбер · ingest {ts}",
-  srcDemoTitle: "ЯВНЫЙ демо-датасет: офлайн-снимок нашего индекса HARS от 2026-10-17. Это НЕ память, подключённая к этому развертыванию.",
+  srcDemoTitle: "ЯВНЫЙ демо-датасет: полностью синтетический снимок HARS Research (id с префиксом demo-, сгенерированные скриптом). Реальных данных корпуса в нём нет, и это НЕ память, подключённая к этому развертыванию.",
   srcSampled: "показан топ-{n} из {total} узлов (по связям)",
   notConnectedTitle: "Нет подключения — живой граф недоступен",
   notConnectedBody:
@@ -69,7 +69,7 @@ const RU = {
   openDemo: "Открыть демо-данные",
   retryConnection: "Повторить подключение",
   backToLive: "вернуться к живым данным",
-  demoLoadedNote: "Показан ДЕМО-снимок (офлайн-снимок индекса HARS, 2026-10-17) — не подключённая память.",
+  demoLoadedNote: "Показан ДЕМО-снимок: синтетический корпус HARS Research — не подключённая память и не рабочие данные.",
   liveLoadFailed: "живой граф не загрузился: {e}",
   // query bar
   qbPlaceholder: "Спроси память… (живой recall, до 120с)",
@@ -139,12 +139,49 @@ const RU = {
   presFullscreen: "полный экран (F)",
   presLoading: "готовлю данные…",
   // presentation: honest gates for fixture-only chapters outside demo mode
-  presGateIngestTitle: "Глава 2 — реплей сохранённой заметки из демо-снимка",
+  presGateIngestTitle: "Глава 2 — разбор синтетической демо-заметки",
   presGateIngestBody:
-    "Эта глава разбирает ОДНУ конкретную заметку с её реальными записями учителя. В живом режиме она не показывается: заметка из снимка — не ваша память. Откройте демо-снимок или вернитесь к живым данным.",
-  presGateTraceTitle: "Для этой главы нужен трейс recall",
+    "Эта глава разбирает ОДНУ синтетическую заметку про архитектуру HARS Memory вместе с записями учителя. В живом режиме она не показывается: демо-заметка не принадлежит подключённому индексу. Вернитесь к демо-снимку, чтобы увидеть её.",
+  presGateTraceTitle: "Живой recall не дал трейса",
   presGateTraceBody:
-    "Главы 3–8 воспроизводят один реальный recall по этапам. Задайте живой вопрос (строка запроса) — глава переиграет его по подключённой памяти, либо явно откройте демо-снимок с сохранёнными трейсами.",
+    "Главы 3–8 воспроизводят один recall по этапам, и трейс строится подключённым индексом на месте. Повторите recall или явно откройте ДЕМО-снимок.",
+  presGateTraceLiveBody:
+    "Трейс строится подключённым индексом на месте. Повторите recall или явно откройте ДЕМО-снимок.",
+  // presentation: ask screen (the deck starts from YOUR question)
+  presAskKicker: "живая презентация · подключённая память",
+  presAskTitle: "Задайте вопрос этой памяти",
+  presAskSub:
+    "Презентация прогонит настоящий recall по подключённому индексу: каналы, обход графа, фьюжн, контекст и цитаты ответа будут построены из вашего вопроса.",
+  presAskPlaceholder: "например: как устроен обход графа при recall?",
+  presAskAria: "вопрос к памяти",
+  presAskGo: "запустить recall",
+  presAskHint:
+    "Ничего не заготовлено: без вопроса нет ни трейса, ни цифр. Каждый новый вопрос — новый прогон.",
+  presAskNew: "новый вопрос",
+  presAskNeedsLive:
+    "Для презентации нужен живой индекс: граф и recall берутся из подключённой памяти. Демо-снимок в презентации не используется.",
+  // presentation: live recall progress + live ingest chapter
+  presLiveRunning: "живой recall · {id}",
+  presLiveNote:
+    "Трейс строится прямо сейчас на подключённом индексе: строки загораются по мере прихода SSE-кадров. Пока кадр не пришёл, значение не показывается.",
+  presRetryRecall: "повторить живой recall",
+  presOpenDemoFallback: "открыть ДЕМО-снимок",
+  presLiveChunk: "реальный чанк из подключённого индекса",
+  presLiveChunkNote:
+    "Это не фикстура: чанк и записи извлечения взяты из текущего recall по подключённой памяти.",
+  presSrcLiveShort: "live",
+  chunkId: "chunk id",
+  presLatency: "клиентская задержка",
+  presScores: "оценки каналов",
+  // presentation: dataset badge (the deck defaults to the synthetic snapshot)
+  presSrcDemo: "ДЕМО · синтетический снимок HARS",
+  presSrcDemoTitle:
+    "Демо-снимок: синтетический корпус HARS Research (id с префиксом demo-, сгенерированные фикстуры). Это не подключённый индекс и не рабочие данные.",
+  presSrcLive: "ЖИВЫЕ ДАННЫЕ · {id}",
+  presSrcLiveTitle:
+    "Включено явно: главы 3-8 показывают recall по подключённому индексу. Переключитесь назад на демо-снимок, чтобы вернуть синтетические данные.",
+  presShowDemo: "вернуться к демо-снимку",
+  presShowLive: "показать живой recall",
   // presentation: docked chapter cards (chapters 3-8, real trace data)
   cardsAria: "данные главы",
   cardQuestion: "вопрос",
@@ -390,7 +427,7 @@ const RU = {
   presIndexIngest: "последний ingest",
   presGraphInventory: "состав графа",
   presTopHubs: "самые связанные",
-  presDemoIndex: "демо-снимок индекса",
+  presDemoIndex: "синтетический демо-снимок",
   presPipeline: "конвейер",
   presQuestion: "вопрос",
   presKeywords: "ключевые слова",
@@ -574,12 +611,12 @@ const EN: Dict = {
   // ---- data source badge: WHAT the starfield renders (live vs demo) ----
   srcProbing: "source: connecting…",
   srcLiveBadge: "live data: {id}",
-  srcDemoBadge: "demo: offline snapshot of the HARS index, 2026-10-17",
+  srcDemoBadge: "demo: synthetic HARS snapshot",
   srcOfflineBadge: "source: not connected",
   srcBadgeTitle: "which index the cosmos renders",
   srcLiveTitle:
     "the cosmos renders the CONNECTED index: {id} · {docs} docs · {n} nodes · {m} edges · ingest {ts}",
-  srcDemoTitle: "EXPLICIT demo dataset: an offline snapshot of our HARS index taken 2026-10-17. This is NOT the memory this deployment is connected to.",
+  srcDemoTitle: "EXPLICIT demo dataset: a fully synthetic HARS Research snapshot (demo-* ids, generated by scripts/gen_demo_fixtures.py). It contains no real corpus data and is NOT the memory this deployment is connected to.",
   srcSampled: "top {n} of {total} nodes shown (by degree)",
   notConnectedTitle: "Not connected — live graph unavailable",
   notConnectedBody:
@@ -587,7 +624,7 @@ const EN: Dict = {
   openDemo: "Open demo data",
   retryConnection: "Retry connection",
   backToLive: "back to live data",
-  demoLoadedNote: "Showing the DEMO snapshot (offline snapshot of the HARS index, 2026-10-17) — not the connected memory.",
+  demoLoadedNote: "Showing the DEMO snapshot: a synthetic HARS Research corpus — not the connected memory and not real working data.",
   liveLoadFailed: "live graph failed to load: {e}",
   qbPlaceholder: "Ask the memory… (live recall, up to 120s)",
   qbAsk: "ask",
@@ -653,12 +690,49 @@ const EN: Dict = {
   presFullscreen: "fullscreen (F)",
   presLoading: "preparing data…",
   // presentation: honest gates for fixture-only chapters outside demo mode
-  presGateIngestTitle: "Chapter 2 replays one captured note from the demo snapshot",
+  presGateIngestTitle: "Chapter 2 dissects one synthetic demo note",
   presGateIngestBody:
-    "This chapter dissects ONE specific note with its real teacher records. In live mode it is not shown: a note from the snapshot is not your memory. Open the demo snapshot, or go back to live data.",
-  presGateTraceTitle: "This chapter needs a recall trace",
+    "This chapter dissects ONE synthetic note about the HARS Memory architecture with its teacher records. It is not shown in live mode: the demo note does not belong to the connected index. Switch back to the demo snapshot to see it.",
+  presGateTraceTitle: "The live recall produced no trace",
   presGateTraceBody:
-    "Chapters 3-8 replay one real recall stage by stage. Ask a live question and the chapter replays it against the connected memory, or explicitly open the demo snapshot with its saved traces.",
+    "Chapters 3-8 replay one recall stage by stage, and the trace is produced by the connected index on demand. Retry the recall, or explicitly open the DEMO snapshot.",
+  presGateTraceLiveBody:
+    "The trace is produced by the connected index on demand. Retry the recall, or explicitly open the DEMO snapshot.",
+  // presentation: ask screen (the deck starts from YOUR question)
+  presAskKicker: "live presentation · connected memory",
+  presAskTitle: "Ask this memory a question",
+  presAskSub:
+    "The deck runs a real recall on the connected index: channels, graph walk, fusion, context and the answer quotes are all built from your question.",
+  presAskPlaceholder: "e.g. how does the graph walk work during a recall?",
+  presAskAria: "question for the memory",
+  presAskGo: "run the recall",
+  presAskHint:
+    "Nothing is pre-recorded: no question means no trace and no numbers. Every new question is a new run.",
+  presAskNew: "new question",
+  presAskNeedsLive:
+    "The deck needs the live index: the graph and the recall come from the connected memory. The demo snapshot is not used here.",
+  // presentation: live recall progress + live ingest chapter
+  presLiveRunning: "live recall · {id}",
+  presLiveNote:
+    "This trace is being produced by the connected index right now: rows light up as SSE frames arrive. A value is shown only after its frame lands.",
+  presRetryRecall: "retry the live recall",
+  presOpenDemoFallback: "open the DEMO snapshot",
+  presLiveChunk: "a real chunk of the connected index",
+  presLiveChunkNote:
+    "Not a fixture: this chunk and these extraction records come from the recall currently on screen, against the connected memory.",
+  presSrcLiveShort: "live",
+  chunkId: "chunk id",
+  presLatency: "client latency",
+  presScores: "channel scores",
+  // presentation: dataset badge (the deck defaults to the synthetic snapshot)
+  presSrcDemo: "DEMO · synthetic HARS snapshot",
+  presSrcDemoTitle:
+    "Demo snapshot: a synthetic HARS Research corpus (demo-* ids, generated fixtures). It is not the connected index and not real working data.",
+  presSrcLive: "LIVE DATA · {id}",
+  presSrcLiveTitle:
+    "Explicitly enabled: chapters 3-8 replay a recall against the connected index. Switch back to the demo snapshot to return to the synthetic data.",
+  presShowDemo: "back to the demo snapshot",
+  presShowLive: "show the live recall",
   cardsAria: "chapter data",
   cardQuestion: "question",
   cardEmbedding: "embedding",
@@ -902,7 +976,7 @@ const EN: Dict = {
   presIndexIngest: "last ingest",
   presGraphInventory: "graph inventory",
   presTopHubs: "most connected",
-  presDemoIndex: "demo snapshot of the index",
+  presDemoIndex: "synthetic demo snapshot",
   presPipeline: "pipeline",
   presQuestion: "question",
   presKeywords: "keywords",

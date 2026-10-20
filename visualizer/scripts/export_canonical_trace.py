@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Export real canonical production trace from the live HARS memory server.
+"""Export one live trace as a fixture (diagnostic tool).
 
-Fetches /trace?question=How does quota claim work?... from localhost:8098,
-compiles it with real graph, entities, and chunk coordinates, and writes
-app/public/data/traces/trace_01.json and app/public/data/traces/manifest.json.
+This is NOT the demo generator: the shipped demo trace is synthetic
+(`scripts/gen_demo_fixtures.py`). Run this only to inspect a real recall, and
+always write OUTSIDE app/public/data so no corpus data can be published.
+
+    python scripts/export_canonical_trace.py --question "..." --out /tmp/trace.json
 """
+import argparse
 import json
 import re
 import urllib.parse
@@ -49,10 +52,19 @@ def parse_context(ctx):
 
 
 def main():
-    TRACES.mkdir(parents=True, exist_ok=True)
-    question = "How does quota claim work?"
-    kws = "quota,claim,jip,namespace"
-    url = f"http://127.0.0.1:8098/trace?question={urllib.parse.quote(question)}&ll_keywords={urllib.parse.quote(kws)}&mode=hybrid&top_k=6&format=json"
+    out_path = Path(args.out).resolve()
+    if DATA.resolve() in out_path.parents:
+        raise SystemExit("refusing to write into app/public/data: the demo trace is synthetic")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--question", required=True)
+    ap.add_argument("--keywords", default="")
+    ap.add_argument("--out", required=True, help="output path (must be outside app/public/data)")
+    ap.add_argument("--base", default="http://127.0.0.1:8098")
+    args = ap.parse_args()
+    question = args.question
+    kws = args.keywords or ",".join(w for w in re.findall(r"[A-Za-z0-9]{4,}", question.lower()))[:120]
+    url = f"{args.base}/trace?question={urllib.parse.quote(question)}&ll_keywords={urllib.parse.quote(kws)}&mode=hybrid&top_k=6&format=json"
 
     print(f"Fetching live trace for: {question}...", flush=True)
     req = urllib.request.urlopen(url)
@@ -216,7 +228,7 @@ def main():
         "meta": {
             "id": "trace_01",
             "question": question,
-            "ll_keywords": ["quota", "claim", "jip", "namespace"],
+            "ll_keywords": [k for k in kws.split(",") if k],
             "hl_keywords": [],
             "mode": r.get("mode", "hybrid"),
             "lightrag_mode": r.get("lightrag_mode", "mix"),
@@ -272,23 +284,9 @@ def main():
         ],
     }
 
-    out_file = TRACES / "trace_01.json"
-    with open(out_file, "w") as f:
+    with open(out_path, "w") as f:
         json.dump(trace, f, indent=2)
-    print(f"Wrote real trace to {out_file} ({out_file.stat().st_size // 1024} KB)")
-
-    # Update manifest
-    manifest = [
-        {
-            "id": "quota-01",
-            "question": question,
-            "file": "traces/trace_01.json",
-            "kb": out_file.stat().st_size // 1024,
-        }
-    ]
-    with open(TRACES / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print("Updated traces/manifest.json")
+    print(f"Wrote trace to {out_path} ({out_path.stat().st_size // 1024} KB)")
 
 
 if __name__ == "__main__":

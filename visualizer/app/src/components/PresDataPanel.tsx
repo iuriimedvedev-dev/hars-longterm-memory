@@ -2,10 +2,10 @@
 //
 // What the CURRENT step actually found or produced: counts, named entities,
 // candidate chunks, channel attribution, top-k lists, tables. Every value is
-// read from the loaded TravelTrace / ingest fixture / graph identity — the
+// read from the loaded TravelTrace / graph identity — the
 // same data the centre canvas draws. A missing field renders as
 // "not recorded", never as an invented number.
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { ReactNode } from "react";
 import { buildGraphWalk } from "../lib/graphWalk";
 import {
@@ -19,18 +19,37 @@ import {
 } from "../lib/presChain";
 import { PIPELINE } from "../lib/presentation";
 import type { GraphStats } from "../lib/cosmosSource";
-import type { ChunkHit, CosmosGraph, IngestFixture, TravelTrace } from "../lib/types";
+import type { ChunkHit, CosmosGraph, TravelTrace } from "../lib/types";
 import { fmt, type Dict, type Lang } from "../i18n/strings";
+import { prefersReducedMotion } from "../lib/motion";
+
+/** Restart the staggered reveal without remounting the panel (React keyed
+ *  remounts proved unreliable here, and a remount would also drop focus). */
+function useStagedReveal(ref: React.RefObject<HTMLElement | null>, deps: unknown[]) {
+  useEffect(() => {
+    const root = ref.current;
+    if (!root || prefersReducedMotion() || typeof root.animate !== "function") return;
+    const items = [...root.querySelectorAll<HTMLElement>(".pd-sec > *")];
+    items.forEach((el, i) => {
+      el.animate(
+        [
+          { opacity: 0, transform: "translateY(6px)" },
+          { opacity: 1, transform: "none" },
+        ],
+        { duration: 300, delay: Math.min(i, 10) * 55, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)", fill: "both" },
+      );
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+}
 
 interface Props {
   chapterId: string;
   trace: TravelTrace | null;
-  fixture: IngestFixture | null;
   identity: GraphStats | null;
   graph: CosmosGraph | null;
   nodes: number;
   edges: number;
-  demo: boolean;
   chapterIndex: number;
   chapterTotal: number;
   open: boolean;
@@ -39,7 +58,6 @@ interface Props {
   activeCite: number | null;
   onFocusAnswer: (part: AnswerPart) => void;
   onFocusChunk: (hit: ChunkHit) => void;
-  onOpenNote: () => void;
 }
 
 const nf = (n: number, lang: Lang) => n.toLocaleString(lang === "ru" ? "ru-RU" : "en-US");
@@ -47,12 +65,10 @@ const nf = (n: number, lang: Lang) => n.toLocaleString(lang === "ru" ? "ru-RU" :
 export function PresDataPanel({
   chapterId,
   trace,
-  fixture,
   identity,
   graph,
   nodes,
   edges,
-  demo,
   chapterIndex,
   chapterTotal,
   open,
@@ -61,21 +77,20 @@ export function PresDataPanel({
   activeCite,
   onFocusAnswer,
   onFocusChunk,
-  onOpenNote,
 }: Props) {
+  const rootRef = useRef<HTMLElement>(null);
+  useStagedReveal(rootRef, [chapterId, trace]);
   return (
-    <aside className="pres-data" data-open={open ? "true" : "false"} aria-label={t.presStepData}>
+    <aside ref={rootRef} className="pres-data" data-open={open ? "true" : "false"} aria-label={t.presStepData}>
       <header className="pres-data-head">
         <span className="pres-kicker">{t.presStepData}</span>
         <span className="pres-data-ch">{fmt(t.presChapter, { n: chapterIndex + 1, total: chapterTotal })}</span>
       </header>
       <div className="pres-data-body">
         {chapterId === "what" && (
-          <WhatBody identity={identity} graph={graph} nodes={nodes} edges={edges} demo={demo} t={t} lang={lang} />
+          <WhatBody identity={identity} graph={graph} nodes={nodes} edges={edges} t={t} lang={lang} />
         )}
-        {chapterId === "ingest" && (
-          <IngestBody fixture={fixture} t={t} lang={lang} onOpenNote={onOpenNote} />
-        )}
+        {chapterId === "ingest" && (trace ? <LiveIngestBody trace={trace} t={t} lang={lang} /> : <Empty t={t} />)}
         {chapterId !== "what" && chapterId !== "ingest" && !trace && (
           <p className="pd-empty">{t.presEmptyTrace}</p>
         )}
@@ -204,7 +219,6 @@ function WhatBody({
   graph,
   nodes,
   edges,
-  demo,
   t,
   lang,
 }: {
@@ -212,7 +226,6 @@ function WhatBody({
   graph: CosmosGraph | null;
   nodes: number;
   edges: number;
-  demo: boolean;
   t: Dict;
   lang: Lang;
 }) {
@@ -233,7 +246,7 @@ function WhatBody({
       <Sec title={t.presIndexIdentity}>
         <Row
           k={t.presIndexId}
-          v={identity?.index_id ?? (demo ? t.presDemoIndex : t.presNotRecorded)}
+          v={identity?.index_id ?? t.presNotRecorded}
           mono
         />
         <Row k={t.cardNodes} v={nf(nodes, lang)} />
@@ -277,59 +290,54 @@ function WhatBody({
   );
 }
 
-function IngestBody({
-  fixture,
-  t,
-  lang,
-  onOpenNote,
-}: {
-  fixture: IngestFixture | null;
-  t: Dict;
-  lang: Lang;
-  onOpenNote: () => void;
-}) {
-  if (!fixture) return <Empty t={t} />;
-  const doc = fixture.doc;
+/** Chapter 2 in live mode: a REAL chunk of the connected index, pulled from the
+ *  recall that is on screen (no snapshot fixture). */
+function LiveIngestBody({ trace, t, lang }: { trace: TravelTrace; t: Dict; lang: Lang }) {
+  const hit = trace.fusion[0] ?? trace.vector_hits[0] ?? null;
+  const full = hit ? trace.full_chunks.find((c) => c.chunk_id === hit.chunk_id) : undefined;
+  const text = (full?.content ?? "").replace(/\s+/g, " ").trim();
+  const ents = trace.context_blocks.entities.slice(0, 8);
+  const rels = trace.context_blocks.relations.slice(0, 6);
   return (
     <>
-      <Sec title={t.presNoteTitle} meta={<button type="button" className="pd-link" onClick={onOpenNote}>{t.presOpenNote}</button>}>
-        <Row k={t.presNoteFile} v={doc.file_path.split("/").pop() ?? doc.file_path} mono />
-        <Row k={t.presNoteSize} v={`${nf(doc.size_chars, lang)} ${lang === "ru" ? "симв." : "chars"}`} />
-        <Row k={t.presNoteLines} v={nf(doc.line_count, lang)} />
-        <Row k={t.presNoteSections} v={fixture.chunks.length} />
-        <p className="pd-snippet">{doc.preview.replace(/\s+/g, " ").slice(0, 220)}…</p>
+      <Sec title={t.presLiveChunk} meta={<span className="pd-badge live">{t.presSrcLiveShort}</span>}>
+        <Row k={t.presNoteFile} v={hit?.doc ?? t.presNotRecorded} mono />
+        <Row k={t.presChunkSection} v={hit?.section || "—"} />
+        <Row k={t.chunkId} v={hit?.chunk_id ?? t.presNotRecorded} mono />
+        <Row k={t.presScores} v={hit ? `${hit.dense.toFixed(3)} dense · ${hit.sparse.toFixed(2)} bm25` : t.presNotRecorded} />
+        {text && <p className="pd-snippet">{text.slice(0, 420)}…</p>}
+        <p className="pd-label">{t.presLiveChunkNote}</p>
       </Sec>
-      <Sec title={t.presChunkRecords} meta={fixture.chunks.length}>
-        <div className="pd-table">
-          <div className="pd-table-head pd-chunk-head">
-            <span>{t.presChunkSection}</span>
-            <span>{t.presChunkLines}</span>
-            <span className="pd-num">{t.presChunkTokens}</span>
-          </div>
-          {fixture.chunks.slice(0, 10).map((c) => (
-            <div className="pd-chunk" key={c.chunk_id} title={c.chunk_id}>
-              <span className="pd-chunksec">
-                {c.heading_path.length ? c.heading_path[c.heading_path.length - 1] : c.section || "—"}
-              </span>
-              <span className="pd-num">
-                {c.start_line}–{c.end_line}
-              </span>
-              <span className="pd-num">{nf(c.tokens, lang)}</span>
-            </div>
-          ))}
-        </div>
-      </Sec>
-      <Sec title={t.presExtractRecords} meta={`${fixture.entities.length} / ${fixture.relations.length}`}>
+      <Sec title={t.presExtractRecords} meta={`${trace.context_blocks.entities.length} / ${trace.context_blocks.relations.length}`}>
         <div className="pd-chips">
-          {fixture.entities.slice(0, 8).map((e) => (
-            <span className="pd-chip" key={`${e.name}-${e.chunk}`}>
-              {e.name}
+          {ents.map((e) => (
+            <span className="pd-chip" key={e.entity}>
+              {e.entity}
               {e.type ? <i>{e.type}</i> : null}
             </span>
           ))}
         </div>
-        <Row k={t.cardEntityFacts} v={fixture.entities.length} />
-        <Row k={t.ingestRelations} v={fixture.relations.length} />
+        {!ents.length && <Empty t={t} />}
+        <Row k={t.cardEntityFacts} v={trace.context_blocks.entities.length} />
+        <Row k={t.ingestRelations} v={trace.context_blocks.relations.length} />
+      </Sec>
+      {rels.length > 0 && (
+        <Sec title={t.ingestRelations} meta={rels.length}>
+          <div className="pd-table">
+            {rels.map((r) => (
+              <div className="pd-chunk" key={`${r.entity1}-${r.entity2}`} title={r.description ?? ""}>
+                <span className="pd-chunksec">{r.entity1} → {r.entity2}</span>
+                <span className="pd-num" />
+                <span className="pd-num" />
+              </div>
+            ))}
+          </div>
+        </Sec>
+      )}
+      <Sec title={t.presPipeline}>
+        <Row k={t.cardBm25Chunks} v={trace.meta.bm25_chunks != null ? nf(trace.meta.bm25_chunks, lang) : t.presNotRecorded} />
+        <Row k={t.cardPool} v={trace.meta.candidate_pool != null ? nf(trace.meta.candidate_pool, lang) : t.presNotRecorded} />
+        <Row k={t.presLatency} v={trace.meta.client_latency_s != null ? `${trace.meta.client_latency_s.toFixed(2)} s` : t.presNotRecorded} />
       </Sec>
     </>
   );
