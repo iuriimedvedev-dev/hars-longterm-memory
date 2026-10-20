@@ -8,6 +8,7 @@ map $http_authorization $final_auth {
 
 server {
     listen 8080;
+    listen 4400;
     server_name _;
     absolute_redirect off;
     root /usr/share/nginx/html;
