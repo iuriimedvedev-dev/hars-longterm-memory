@@ -1,0 +1,18 @@
+# Embedder sizing for the WORK profile. Only valid together with
+# `components/embedder` (uncomment it in kustomization.yaml).
+#
+# `-np 8 -t 6` targets up to ~8 simultaneous recalls on one node with 6 cores
+# available to this pod. Rule of thumb: slots >= expected simultaneous recalls,
+# threads <= CPU limit. See README, "Embedder sizing".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: embedder-config
+data:
+  EMBED_SLOTS: "8"
+  EMBED_THREADS: "6"
+  # Keep per-slot context small for embeddings; batch 512/512 matches the
+  # reference host and amortises scheduling overhead.
+  EMBED_CTX: "2048"
+  EMBED_BATCH: "512"
+  EMBED_UBATCH: "512"
