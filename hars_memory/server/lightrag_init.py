@@ -654,6 +654,28 @@ def create_lightrag(
         _chunker_kwargs["chunking_func"] = md_struct_chunking_func
     logger.info("LightRAG chunker: %s", _chunker)
 
+    # Multi-tenant Qdrant: lightrag's stock storage ignores
+    # HARS_MEMORY_QDRANT_COLLECTION_PREFIX, so two indexes in one container end
+    # up in the same `lightrag_vdb_*` collections (separated only by
+    # workspace_id). Opt in to the prefix-aware subclass when a prefix is set;
+    # with no prefix the stock class — and the existing collection names — are
+    # untouched.
+    if "qdrant" in _vector_storage.lower():
+        if os.environ.get("HARS_MEMORY_QDRANT_COLLECTION_PREFIX", "").strip():
+            from hars_memory.server.qdrant_prefix import register_prefixed_storage
+
+            _vector_storage = register_prefixed_storage()
+            logger.info(
+                "Qdrant collections are prefixed with %r",
+                os.environ["HARS_MEMORY_QDRANT_COLLECTION_PREFIX"].strip(),
+            )
+        else:
+            logger.warning(
+                "HARS_MEMORY_QDRANT_COLLECTION_PREFIX is not set: this index shares "
+                "the unprefixed lightrag_vdb_* collections with every other tenant in "
+                "this Qdrant container (isolated only by workspace_id)."
+            )
+
     rag = LightRAG(
         working_dir=_wdir,
         vector_storage=_vector_storage,
