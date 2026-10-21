@@ -36,31 +36,47 @@ The engine processes used only ~0.3–0.6 cores while throughput saturated: the
 requests were queued on two embedding slots. Adding app replicas against the
 same endpoint lengthens the queue; it does not raise throughput.
 
+Two server-side defects were making this worse and are fixed in the current
+build: every recall embedded its question **twice** (a backend-dispatch bug in
+the offloaded vector query), and every embed opened a **new HTTP connection**
+(no keep-alive). A 16-way slot/thread/batch sweep is in
+[`docs/http-mcp-scaling.md`](../http-mcp-scaling.md) §2. The headline: same
+cores, `-b/-ub 512 → 2048` cut single-call latency 76.5 ms → 26.8 ms and raised
+throughput 33 → 46 req/s; `-t 16 -np 4` collapses to ~1 req/s (thread
+oversubscription), so `-t` must stay ≤ half the cores.
+
 ### Concurrency model
 
 * One uvicorn worker and one shared index per pod.
-* With the bounded engine pool merged (`HARS_MEMORY_MCP_ENGINE_THREADS`,
-  default `min(8, cpus)`), up to that many retrieval calls run concurrently;
-  the queue is `4 × threads`. The pool is not in the committed server yet, so
-  the bundle ships those variables commented out; without it, blocking
-  retrieval runs inline on the event loop.
+* With the bounded engine pool (`HARS_MEMORY_MCP_ENGINE_THREADS`, default
+  `min(8, cpus)`), up to that many retrieval calls run concurrently; the queue
+  is `4 × threads` and past it calls fail fast with a retryable `503`
+  (`/healthz` exposes `engine.overloads`, `queue_wait_ms` and `run_ms`). Set
+  `HARS_MEMORY_MCP_ENGINE_THREADS=0` to get the pre-scaling inline behaviour.
 * One recall issues ~one embedding request (`flat_dense` is off by default), so
   **slots ≈ simultaneous recalls**. Write tools also embed and compete.
-* Parallel: HTTP handling, embedder slots, Qdrant, numpy. Serial: Python
-  fusion/assembly per process (GIL), index writes, OAuth state writes.
+* Parallel: HTTP handling, embedder slots, Qdrant, numpy, the pool's blocking
+  stages. Serial: Python fusion/assembly per process (GIL), index writes, OAuth
+  state writes. See `docs/http-mcp-scaling.md` §1 for the full table.
+* Beyond one pod: `HARS_MEMORY_MCP_MODE=split` puts TLS/OAuth/MCP on N edge
+  workers and the index in one engine per shard, with Qdrant shared.
 
 ### Sizing table
 
 | Simultaneous recalls | `-np` slots | `-t` threads | Pod CPU req/limit | Memory req/limit |
 |---|---|---|---|---|
 | 1–2 (home) | 2 | 4 | 1 / 2 | 1Gi / 2Gi |
-| 3–4 | 4 | 4 | 2 / 4 | 1Gi / 2Gi |
-| 5–8 (work default) | 8 | 6–8 | 4 / 6 | 2Gi / 4Gi |
-| 9–16 | 12–16 | 8 | 6 / 8 | 2Gi / 4Gi |
+| 3–4 | 2–4 | 4 | 2 / 4 | 1Gi / 2Gi |
+| 5–8 (work default) | 4 | 4–6 | 4 / 6 | 2Gi / 4Gi |
+| 9–16 | 4–8 on a **dedicated node** | 4–8 | 6 / 8 | 2Gi / 4Gi |
 | >16 | second embedder Service + split groups, or GPU | | | |
 
-`EMBED_THREADS` must not exceed the CPU limit; a lower limit throttles every
-slot. Keep `EMBED_CTX=2048`, `EMBED_BATCH/UBATCH=512` for 300M models.
+`EMBED_THREADS` must not exceed the CPU limit, and must stay **≤ half the node's
+cores** (≥16 threads per slot group measured *worse* than 4–8: 1 req/s vs 46).
+Keep `EMBED_UBATCH ≤ EMBED_CTX / EMBED_SLOTS`; the shipped default is
+`EMBED_CTX=8192, EMBED_BATCH=UBATCH=2048, EMBED_SLOTS=4, EMBED_THREADS=4`.
+Slots beyond ~4 only help when the pod gets dedicated cores — the embedder and
+the retrieval threads otherwise starve each other on the same node.
 
 ### Enabling the in-cluster embedder
 

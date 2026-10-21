@@ -3,7 +3,8 @@
 #
 # SIZING RULE: one slot blocks on one embedding request. Set EMBED_SLOTS >= the
 # number of simultaneous recalls you expect (see README table). Threads should
-# match the CPU you grant the pod, not exceed it.
+# match the CPU you grant the pod, not exceed it (never -t >= total cores).
+# Full measured sweep: docs/http-mcp-scaling.md §2.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,12 +23,16 @@ data:
   EMBED_SLOTS: "4"
   # CPU threads per slot group (-t). Keep <= the CPU limit.
   EMBED_THREADS: "4"
-  # Per-slot prompt context; embeddings are short, 2048 is ample.
-  EMBED_CTX: "2048"
-  # Logical / physical batch. Bigger batches amortise better under load but
-  # increase per-request latency; 512/512 matches the reference host.
-  EMBED_BATCH: "512"
-  EMBED_UBATCH: "512"
+  # Per-slot prompt context; embeddings are short, but the physical batch
+  # must fit in ONE slot: EMBED_UBATCH <= EMBED_CTX / EMBED_SLOTS.
+  EMBED_CTX: "8192"
+  # Logical / physical batch. Measured 2026-10-21 on the reference CPU host:
+  # -b/-ub 2048 vs 512 (same -t 4 -np 2) cut single-call embed latency from
+  # 76.5 ms to 26.8 ms and raised 16-way throughput from 33 to 46 req/s.
+  # Keep 2048 for a 300M embedding model; raise EMBED_CTX when raising slots so
+  # that EMBED_UBATCH <= EMBED_CTX / EMBED_SLOTS still holds.
+  EMBED_BATCH: "2048"
+  EMBED_UBATCH: "2048"
   EMBED_HOST: "0.0.0.0"
   EMBED_PORT: "8791"
   # Optional: leave empty to require a pre-seeded PVC.
