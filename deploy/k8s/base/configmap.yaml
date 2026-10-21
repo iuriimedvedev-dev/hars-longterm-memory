@@ -142,14 +142,13 @@ data:
   # ---------------------------------------------------------------------
   # Runtime / logging
   # ---------------------------------------------------------------------
-  # Bounded in-process engine pool. These variables are part of the
-  # feat/mcp-scaling work but were NOT in the committed server when this
-  # bundle was written; a build without them ignores the settings. Enable the
-  # block once the pool is merged.
-  # HARS_MEMORY_MCP_ENGINE_THREADS: "4"
-  # HARS_MEMORY_MCP_ENGINE_QUEUE: "16"
-  # HARS_MEMORY_MCP_ENGINE_QUEUE_TIMEOUT_MS: "10000"
-  # HARS_MEMORY_MCP_ENGINE_STATS: "1"
+  # Bounded in-process engine pool (hars_memory/mcp_runtime.py). Bounds the
+  # blocking retrieval stages per process; overflow returns a retryable 503.
+  # 0 = inline (pre-scaling behaviour). See docs/http-mcp-scaling.md.
+  HARS_MEMORY_MCP_ENGINE_THREADS: "4"
+  HARS_MEMORY_MCP_ENGINE_QUEUE: "16"
+  HARS_MEMORY_MCP_ENGINE_QUEUE_TIMEOUT_MS: "10000"
+  HARS_MEMORY_MCP_ENGINE_STATS: "1"
   HARS_MEMORY_LOG_LEVEL: "INFO"
   # Documented in docs/configuration.md but not read by the committed server
   # at the time of writing; harmless when set, enable once implemented.
