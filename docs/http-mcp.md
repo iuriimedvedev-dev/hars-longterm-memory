@@ -4,6 +4,12 @@ The long-term memory MCP server can be served directly over Streamable HTTP —
 no stdio child, no `supergateway` bridge — with one process-wide index and a
 built-in OAuth 2.1 authorization server.
 
+> **Serving several people at once?** Read
+> [`docs/http-mcp-scaling.md`](http-mcp-scaling.md) first: the embedder slot
+> count and per-request retrieval CPU — not this server — set the concurrency
+> ceiling, and there is an edge/engine split for running more than one process
+> against a shared (Qdrant) index.
+
 ```
                         ┌──────────────────────────────────────────────┐
   MCP client A ────────►│  uvicorn (1 process)                         │
@@ -187,8 +193,12 @@ a restart (state file), as do dynamically registered clients.
 | `HARS_MEMORY_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS` | any https | restrict redirect hosts |
 
 Without an inline key the server generates an Ed25519 key at the signing-key
-path (mode 0600), so tokens survive restarts. Run **one** worker: OAuth state is
-in-process; `uvicorn --workers > 1` would fork independent client registries.
+path (mode 0600), so tokens survive restarts. Dynamically registered clients,
+refresh tokens, authorization codes and access-token revocations live in a
+**shared store** (`HARS_MEMORY_MCP_OAUTH_STORE`, SQLite WAL by default) so
+`uvicorn` can run more than one worker; access tokens themselves stay stateless
+JWTs. See [`docs/http-mcp-scaling.md`](http-mcp-scaling.md) for the concurrency
+model, the edge/engine split, embedder sizing and measured scaling numbers.
 
 ## 5. TLS with mkcert
 

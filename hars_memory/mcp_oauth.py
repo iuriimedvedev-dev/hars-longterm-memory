@@ -113,9 +113,14 @@ ENV_REGISTRATION_TOKEN = "HARS_MEMORY_MCP_OAUTH_REGISTRATION_TOKEN"
 ENV_CLIENTS_FILE = "HARS_MEMORY_MCP_OAUTH_CLIENTS_FILE"
 ENV_ALLOWED_REDIRECT_HOSTS = "HARS_MEMORY_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS"
 ENV_CORS_ORIGINS = "HARS_MEMORY_MCP_CORS_ORIGINS"
+ENV_STORE = "HARS_MEMORY_MCP_OAUTH_STORE"
+ENV_STORE_PATH = "HARS_MEMORY_MCP_OAUTH_STORE_PATH"
+ENV_STORE_URL = "HARS_MEMORY_MCP_OAUTH_STORE_URL"
+ENV_REVOCATION_CACHE_TTL = "HARS_MEMORY_MCP_OAUTH_REVOCATION_CACHE_TTL"
 
 DEFAULT_STATE_DIR: Final[Path] = Path.home() / ".local" / "share" / "hars-longterm-memory" / "oauth"
 DEFAULT_STATE_FILE: Final[Path] = DEFAULT_STATE_DIR / "state.json"
+DEFAULT_STORE_PATH: Final[Path] = DEFAULT_STATE_DIR / "state.sqlite3"
 DEFAULT_SIGNING_KEY_FILE: Final[Path] = DEFAULT_STATE_DIR / "signing.key"
 
 DEFAULT_ACCESS_TTL: Final[int] = 3600
@@ -151,6 +156,17 @@ def _int_env(name: str, default: int) -> int:
 def _list_env(name: str) -> list[str]:
     raw = os.environ.get(name, "")
     return [part for part in raw.replace(",", " ").split() if part]
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r; using %s", name, raw, default)
+        return default
 
 
 def b64url(data: bytes) -> str:
@@ -232,12 +248,22 @@ class OAuthSettings:
     clients_file: Path | None = None
     allowed_redirect_hosts: tuple[str, ...] = ()
     cors_origins: tuple[str, ...] = ("*",)
+    #: ``sqlite`` (default, multi-process safe) | ``redis`` | ``json`` (the
+    #: pre-scaling single-process file) | ``memory`` (tests).
+    store_kind: str | None = None
+    store_path: Path | None = None
+    store_url: str | None = None
+    store_prefix: str | None = None
+    #: How long an in-process cache of the revocation set may serve validation
+    #: before refreshing from the store. 0 = query the store on every request.
+    revocation_cache_ttl: float = 5.0
 
     @classmethod
     def from_env(cls) -> "OAuthSettings":
         state_file_raw = os.environ.get(ENV_STATE_FILE, "").strip()
         key_file_raw = os.environ.get(ENV_SIGNING_KEY_FILE, "").strip()
         clients_raw = os.environ.get(ENV_CLIENTS_FILE, "").strip()
+        store_path_raw = os.environ.get(ENV_STORE_PATH, "").strip()
         scopes = tuple(_list_env(ENV_SCOPES)) or ALL_SCOPES
         default_max = tuple(s for s in scopes if s != SCOPE_ADMIN) or (SCOPE_READ,)
         max_scopes = tuple(_list_env(ENV_MAX_SCOPES)) or default_max
@@ -263,6 +289,11 @@ class OAuthSettings:
             clients_file=Path(clients_raw).expanduser() if clients_raw else None,
             allowed_redirect_hosts=tuple(_list_env(ENV_ALLOWED_REDIRECT_HOSTS)),
             cors_origins=cors,
+            store_kind=os.environ.get(ENV_STORE, "").strip() or "sqlite",
+            store_path=Path(store_path_raw).expanduser() if store_path_raw else None,
+            store_url=os.environ.get(ENV_STORE_URL, "").strip() or None,
+            store_prefix=os.environ.get("HARS_MEMORY_MCP_OAUTH_STORE_PREFIX", "").strip() or None,
+            revocation_cache_ttl=_float_env(ENV_REVOCATION_CACHE_TTL, 5.0),
         )
 
     def validate(self) -> None:
@@ -429,52 +460,64 @@ class _AuthCode:
 class OAuthProvider:
     """OAuth 2.1 authorization server + RFC 9068 access-token validation."""
 
-    def __init__(self, settings: OAuthSettings) -> None:
+    def __init__(self, settings: OAuthSettings, store: Any = None) -> None:
         settings.validate()
         self.settings = settings
         self.enabled = settings.enabled
         self.signing = resolve_signing_material(settings) if settings.enabled else None
         self._lock = threading.RLock()
-        self._clients: dict[str, ClientRecord] = {}
-        self._refresh: dict[str, dict[str, Any]] = {}
-        self._revoked: dict[str, int] = {}
-        self._codes: dict[str, _AuthCode] = {}
+        # Mutable cross-worker state lives in the store (SQLite WAL by default,
+        # Redis optional, legacy JSON for rollback); access tokens stay
+        # stateless JWTs and are never looked up here.
+        self.store: Any = store if store is not None else self._build_store()
+        self._rev_cache: set[str] | None = None
+        self._rev_cache_at = 0.0
         if settings.enabled:
-            self._load_state()
+            migrated = self.store.migrate_json(settings.state_file)
+            if any(migrated.values()):
+                logger.info("OAuth store migrated from legacy JSON: %s", migrated)
             self._load_static_clients()
+
+    def _build_store(self) -> Any:
+        from hars_memory.mcp_oauth_store import (
+            JsonOAuthStore,
+            MemoryOAuthStore,
+            build_store,
+        )
+
+        # Precedence, deliberately explicit:
+        #   1. an explicit ``store_kind`` wins (``from_env`` always sets one, so
+        #      the deployed server is SQLite unless told otherwise);
+        #   2. otherwise ``state_file=None`` -> pure in-memory (tests);
+        #   3. otherwise an explicit ``state_file`` -> the legacy JSON store.
+        # (3) is the compatibility rule that keeps every pre-scaling caller —
+        # and the documented one-flag rollback — behaving exactly as before.
+        if self.settings.store_kind is None:
+            if self.settings.state_file is None:
+                return MemoryOAuthStore()
+            return JsonOAuthStore(self.settings.state_file)
+        if self.settings.store_kind == "json" and self.settings.store_path is None:
+            return JsonOAuthStore(self.settings.state_file)
+        return build_store(
+            self.settings.store_kind,
+            path=self.settings.store_path,
+            url=self.settings.store_url,
+            prefix=self.settings.store_prefix,
+        )
 
     # -- state ------------------------------------------------------------
 
-    def _load_state(self) -> None:
-        path = self.settings.state_file
-        if path is None:
-            return
-        if not path.is_file():
-            return
+    def get_client(self, client_id: str) -> ClientRecord | None:
+        data = self.store.get_client(client_id)
+        if data is None:
+            return None
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not read OAuth state %s: %s", path, exc)
-            return
-        now = _now()
-        for data in (payload.get("clients") or {}).values():
-            try:
-                record = ClientRecord.from_dict(data)
-            except (KeyError, TypeError, ValueError):
-                continue
-            self._clients[record.client_id] = record
-        for key, data in (payload.get("refresh_tokens") or {}).items():
-            if int(data.get("expires_at") or 0) > now:
-                self._refresh[key] = data
-        for jti, exp in (payload.get("revoked_jtis") or {}).items():
-            if int(exp) > now:
-                self._revoked[jti] = int(exp)
-        logger.info(
-            "OAuth state loaded: %d clients, %d refresh tokens, %d revoked access tokens",
-            len(self._clients),
-            len(self._refresh),
-            len(self._revoked),
-        )
+            return ClientRecord.from_dict(data)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _put_client(self, record: ClientRecord) -> None:
+        self.store.put_client(record.client_id, record.to_dict())
 
     def _load_static_clients(self) -> None:
         path = self.settings.clients_file
@@ -501,31 +544,8 @@ class OAuthProvider:
                 created_at=_now(),
                 dynamic=False,
             )
-            self._clients[record.client_id] = record
+            self._put_client(record)
         logger.info("Loaded %d static OAuth clients from %s", len(entries), path)
-
-    def _persist(self) -> None:
-        path = self.settings.state_file
-        if path is None:
-            return
-        now = _now()
-        self._refresh = {k: v for k, v in self._refresh.items() if int(v["expires_at"]) > now}
-        self._revoked = {k: v for k, v in self._revoked.items() if v > now}
-        payload = {
-            "version": 1,
-            "updated_at": _iso(now),
-            "clients": {cid: c.to_dict() for cid, c in self._clients.items()},
-            "refresh_tokens": self._refresh,
-            "revoked_jtis": self._revoked,
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(str(tmp), flags, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
 
     # -- metadata ---------------------------------------------------------
 
@@ -575,9 +595,6 @@ class OAuthProvider:
         return metadata
 
     # -- clients ----------------------------------------------------------
-
-    def get_client(self, client_id: str) -> ClientRecord | None:
-        return self._clients.get(client_id)
 
     def register_client(self, payload: dict[str, Any], base: str) -> tuple[dict[str, Any], int]:
         """RFC 7591 dynamic registration. Returns ``(body, status)``."""
@@ -645,8 +662,7 @@ class OAuthProvider:
             dynamic=True,
         )
         with self._lock:
-            self._clients[client_id] = record
-            self._persist()
+            self._put_client(record)
 
         body: dict[str, Any] = {
             "client_id": client_id,
@@ -695,7 +711,7 @@ class OAuthProvider:
                 return None, "invalid_client"
         if not client_id:
             return None, "invalid_client"
-        record = self._clients.get(client_id)
+        record = self.get_client(client_id)
         if record is None:
             return None, "invalid_client"
         if record.client_secret_hash is not None:
@@ -736,20 +752,35 @@ class OAuthProvider:
             code_challenge=challenge,
             expires_at=_now() + self.settings.code_ttl,
         )
-        with self._lock:
-            now = _now()
-            self._codes = {k: v for k, v in self._codes.items() if v.expires_at > now}
-            self._codes[code] = record
+        # Authorization codes live in the same store as refresh tokens: the
+        # /authorize response and the /token request may hit different edge
+        # workers, so a process-local dict would break the flow.
+        self.store.put_code(_token_hash(code), {
+            "client_id": record.client_id,
+            "redirect_uri": record.redirect_uri,
+            "scopes": list(record.scopes),
+            "subject": record.subject,
+            "code_challenge": record.code_challenge,
+            "expires_at": record.expires_at,
+        })
         return code
 
     def _consume_code(self, code: str) -> _AuthCode | None:
-        with self._lock:
-            record = self._codes.pop(code, None)
-        if record is None:
+        data = self.store.pop_code(_token_hash(code))
+        if data is None:
             return None
-        if record.expires_at < _now():
+        try:
+            return _AuthCode(
+                code=code,
+                client_id=str(data["client_id"]),
+                redirect_uri=str(data["redirect_uri"]),
+                scopes=tuple(data.get("scopes") or ()),
+                subject=str(data["subject"]),
+                code_challenge=str(data["code_challenge"]),
+                expires_at=int(data["expires_at"]),
+            )
+        except (KeyError, TypeError, ValueError):
             return None
-        return record
 
     def _sign_access_token(
         self, subject: str, client_id: str, scopes: list[str], issuer: str, resource: str
@@ -794,18 +825,16 @@ class OAuthProvider:
             "scope": " ".join(scopes),
         }
         if with_refresh and "refresh_token" in (
-            self._clients.get(client_id).grant_types if self._clients.get(client_id) else []
+            (self.get_client(client_id).grant_types if self.get_client(client_id) else [])
         ):
             refresh = secrets.token_urlsafe(32)
-            with self._lock:
-                self._refresh[_token_hash(refresh)] = {
-                    "client_id": client_id,
-                    "subject": subject,
-                    "scopes": list(scopes),
-                    "created_at": _now(),
-                    "expires_at": _now() + self.settings.refresh_ttl,
-                }
-                self._persist()
+            self.store.put_refresh(_token_hash(refresh), {
+                "client_id": client_id,
+                "subject": subject,
+                "scopes": list(scopes),
+                "created_at": _now(),
+                "expires_at": _now() + self.settings.refresh_ttl,
+            })
             body["refresh_token"] = refresh
         return body
 
@@ -836,11 +865,15 @@ class OAuthProvider:
         self, *, refresh_token: str, client: ClientRecord, scope: str | None, base: str
     ) -> tuple[dict[str, Any], int]:
         key = _token_hash(refresh_token)
-        with self._lock:
-            record = self._refresh.get(key)
+        # Atomic read-and-delete: with N edge workers, two concurrent refreshes
+        # of the same token must not both succeed (rotation is one-time use).
+        consume = getattr(self.store, "consume_refresh", None)
+        if consume is not None:
+            record = consume(key)
+        else:  # pragma: no cover - every shipped store implements it
+            record = self.store.get_refresh(key)
             if record is not None:
-                del self._refresh[key]
-                self._persist()
+                self.store.delete_refresh(key)
         if record is None:
             return {"error": "invalid_grant", "error_description": "unknown refresh token"}, 400
         if int(record["expires_at"]) < _now():
@@ -887,7 +920,7 @@ class OAuthProvider:
         if payload.get("token_use") not in (None, "access"):
             return None, "invalid_token"
         jti = str(payload.get("jti") or "")
-        if jti and jti in self._revoked:
+        if jti and self._is_revoked(jti):
             return None, "invalid_token"
         scopes = frozenset(self._parse_scope(payload.get("scope")))
         if not scopes:
@@ -905,12 +938,10 @@ class OAuthProvider:
 
     def revoke_token(self, token: str, client: ClientRecord) -> None:
         key = _token_hash(token)
-        with self._lock:
-            record = self._refresh.get(key)
-            if record is not None and record.get("client_id") == client.client_id:
-                del self._refresh[key]
-                self._persist()
-                return
+        record = self.store.get_refresh(key)
+        if record is not None and record.get("client_id") == client.client_id:
+            self.store.delete_refresh(key)
+            return
         try:
             payload = jwt.decode(token, options={"verify_signature": False})
         except jwt.PyJWTError:
@@ -920,16 +951,38 @@ class OAuthProvider:
         jti = str(payload.get("jti") or "")
         exp = int(payload.get("exp") or 0)
         if jti:
-            with self._lock:
-                self._revoked[jti] = exp
-                self._persist()
+            self.store.revoke_jti(jti, exp)
+            if self._rev_cache is not None:
+                self._rev_cache.add(jti)
+
+    def _is_revoked(self, jti: str) -> bool:
+        """Revocation check with a short in-process cache.
+
+        Access tokens are stateless, so this is the only store read on the hot
+        path. With a shared store the cache bounds cross-worker revocation
+        propagation to ``revocation_cache_ttl`` seconds (default 5) while
+        keeping validation at ~microseconds — the JWT signature check still
+        happens on every request.
+        """
+        ttl = float(self.settings.revocation_cache_ttl or 0.0)
+        if ttl <= 0 or not getattr(self.store, "is_shared", False):
+            return self.store.is_revoked(jti)
+        now = time.monotonic()
+        if self._rev_cache is None or (now - self._rev_cache_at) > ttl:
+            try:
+                self._rev_cache = set(self.store.revoked_snapshot())
+            except Exception as exc:  # pragma: no cover - store outage
+                logger.warning("Revocation snapshot failed (%s); falling back to direct check", exc)
+                return self.store.is_revoked(jti)
+            self._rev_cache_at = now
+        return jti in self._rev_cache
 
     # -- authorization endpoint -------------------------------------------
 
     def authorize(self, request: Request, params: dict[str, Any]) -> Response:
         base = self.base_url(request)
         client_id = str(params.get("client_id") or "")
-        client = self._clients.get(client_id)
+        client = self.get_client(client_id)
         if client is None:
             return self._json_error(400, "invalid_request", f"unknown client_id {client_id!r}")
 
