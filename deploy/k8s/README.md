@@ -96,16 +96,22 @@ Both numbers are queueing, not engine CPU: the engine waits on two slots. If
 you deploy for several colleagues, size the embedder **before** touching app
 replicas.
 
+The same sweep also showed that **batch size is nearly free throughput**:
+`-b/-ub 512 → 2048` (same `-t 4 -np 2`) cut single-call embed latency from
+76.5 ms to 26.8 ms and raised 16-way throughput from 33 to 46 req/s, while
+`-t 16` with 4 slots collapsed to ~1 req/s. Full sweep, per-stage breakdown and
+the recommended server flags: [`docs/http-mcp-scaling.md`](../../docs/http-mcp-scaling.md)
+§2.
+
 ### Concurrency model (what is parallel, what is serial)
 
 1. **One uvicorn worker, one shared index.** Every MCP client hits the same
    process; the index is loaded once.
-2. **Bounded thread pool (when merged).** `HARS_MEMORY_MCP_ENGINE_THREADS`
+2. **Bounded thread pool.** `HARS_MEMORY_MCP_ENGINE_THREADS`
    (default `min(8, cpus)`) bounds concurrent retrieval calls; the queue is
-   `4 × threads` and overflow returns an overload error. In this bundle those
-   vars are commented because the pool is not in the committed server; without
-   them, blocking retrieval runs inline on the event loop and requests
-   serialize.
+   `4 × threads` and overflow returns a retryable `503 OverloadedError`.
+   `/healthz` exposes `engine.*` (pool, overloads, queue/run latency) and
+   `loop.*` (event-loop lag). `0` restores the inline, pre-scaling behaviour.
 3. **One recall ≈ one embedding request** (`flat_dense` is off by default).
    So embedder slots ≈ simultaneous recalls. `memory_remember` embeds chunks
    too and competes with reads.
@@ -250,7 +256,7 @@ or a second embedder.
 | **Image registry** | `registry.local/...`, `registry.work.example/...` (+ `registry-credentials` pull secret) | `overlays/*/kustomization.yaml`, `components/image-pull-secret` |
 | **Qdrant endpoint** | external `qdrant.qdrant.svc.cluster.local:6333` or optional StatefulSet | `base/configmap.yaml` (`HARS_MEMORY_QDRANT_URL`) |
 | **Embedder + LLM endpoints** | `embedding.embedding.svc...`, `llm.llm.svc...` | `base/configmap.yaml` |
-| **Embedder sizing** (if in-cluster) | `EMBED_SLOTS=8`, `EMBED_THREADS=8` | `overlays/work/embedder-sizing.patch.yaml` |
+| **Embedder sizing** (if in-cluster) | `EMBED_SLOTS=4`, `EMBED_THREADS=4`, `EMBED_BATCH/UBATCH=2048` | `overlays/work/embedder-sizing.patch.yaml` |
 | **TLS topology** | W1 ingress termination (W2 app termination available) | `components/app-tls` + work overlay |
 
 Everything else (probes, resources, securityContext, `Recreate`, guards) is in
@@ -459,23 +465,20 @@ python scripts/mcp_http_smoke.py --url https://memory.acme.internal \
    "Embedder sizing" above).
 2. the LightRAG working directory (GraphML + KV + doc status) is opened and
    mutated by one process, on a RWO volume;
-3. OAuth state (one JSON file: clients/refresh/revocations) is also single-writer;
+3. OAuth state (clients / refresh tokens / authorization codes / revocations)
+   is single-writer in this bundle: it defaults to a 0600 JSON file. The
+   scaling branch adds a shared SQLite-WAL / Redis store
+   (`HARS_MEMORY_MCP_OAUTH_STORE`), which is what makes N app replicas safe;
 4. a **bounded in-process** thread pool (`HARS_MEMORY_MCP_ENGINE_THREADS`,
-   `_QUEUE`, `_QUEUE_TIMEOUT_MS`) exists in the `feat/mcp-scaling` working tree
-   but was not committed at the time of writing; the bundle ships those vars
-   commented out. It bounds retrieval threads per process; it does **not**
-   implement an engine/edge split, and it does not change the writer count.
-   There is no separate engine and edge workload in this bundle because the
-   code for it is not on the branch.
+   `_QUEUE`, `_QUEUE_TIMEOUT_MS`) bounds retrieval threads per process. It does
+   **not** implement an engine/edge split and does not change the writer count.
+   The engine/edge split (`HARS_MEMORY_MCP_MODE=split|engine`, one engine per
+   index shard, N edge workers over a Unix socket) is available in the code but
+   not shipped as a workload here: a Unix socket cannot cross pods, so it needs
+   either two containers in one pod sharing an `emptyDir`, or the TCP transport.
 
-Once merged, the thread pool keeps concurrent clients from serializing on the
-event loop. The embedder and Qdrant become the ceiling before the pool does.
-
-**App replicas > 1** additionally require: shared Qdrant (already default), a
-shared OAuth store (SQLite/Redis on the scaling branch, not yet in the
-committed server), an identical signing key, and exactly **one** process that
-writes the index. Until those exist, one replica per engine is the correct
-topology; add per-project namespaces instead.
+Until the shared OAuth store and a single index writer are in place, one
+replica per engine is the correct topology; add per-project namespaces instead.
 
 If the embedder is already at the node's core count:
 
