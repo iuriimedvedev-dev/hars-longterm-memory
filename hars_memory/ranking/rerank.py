@@ -142,10 +142,65 @@ def apply_ltr_ranker(
         key=lambda i: (-scores[i], fused[i].chunk_id),
     )
     ranked = [fused[i] for i in order][:limit]
+
+    # Rewrite `fused_score` with the model's score so the ranker's order is
+    # AUTHORITATIVE for every downstream stage. Without this, the ranker only
+    # reorders the list, and a later stage that re-sorts on `-fused_score`
+    # (mcp_server._select_diverse_fused_chunks -> diversity.select_diverse_
+    # fused_chunks, which does `sorted(fused, key=-fused_score)`) silently
+    # RESTORES the pre-ranker order -- measured on the live MCP path: the
+    # ranker changed c1..c5 -> c1,c3,c5,c2,c4 and the diversity pass reverted
+    # it to c1..c5. Scoring the reorder into `fused_score` is the same contract
+    # `select_diverse_fused_chunks` itself uses ("the returned list is ordered
+    # by S_div and carries the adjusted score on fused_score, so order and
+    # reported score agree").
+    #
+    # The model score is an unbounded LightGBM/LambdaRank value, so it is
+    # min-max mapped onto the pool's own fused range: rank-preserving, keeps
+    # `fused_score` on the scale the diversity penalty and the LightRAG score
+    # band are calibrated for, and leaves a degenerate (all-equal) score
+    # vector untouched so ties keep `fuse()`'s own tie-break.
+    ranked = _rescore_with_model(ranked, scores, order, fused)
+
     if return_rows:
         rows_by_id = {row.item_id: row for row in rows}
         return ranked, [rows_by_id[chunk.chunk_id] for chunk in ranked if chunk.chunk_id in rows_by_id]
     return ranked
+
+
+def _rescore_with_model(
+    ranked: list[FusedChunk],
+    scores: list[float],
+    order: list[int],
+    fused: Sequence[FusedChunk],
+) -> list[FusedChunk]:
+    """Return ``ranked`` with ``fused_score`` replaced by a rank-preserving
+    min-max mapping of the model scores onto the pool's own fused range.
+
+    See the call site for why the score must be written (not just the order).
+    A single-element or degenerate score vector is returned unchanged.
+    """
+    from dataclasses import replace
+
+    model_scores = [scores[i] for i in order][: len(ranked)]
+    if not model_scores:
+        return ranked
+    lo = min(model_scores)
+    hi = max(model_scores)
+    pool_scores = [c.fused_score for c in fused]
+    pool_lo = min(pool_scores)
+    pool_hi = max(pool_scores)
+    span = hi - lo
+    if span <= 0.0:
+        # Every candidate scored identically: keep the pool's own scores so the
+        # downstream sort falls back to fuse()'s tie-break rather than a flat
+        # constant that would erase it.
+        return ranked
+    out: list[FusedChunk] = []
+    for chunk, score in zip(ranked, model_scores, strict=True):
+        mapped = pool_lo + (score - lo) / span * (pool_hi - pool_lo)
+        out.append(replace(chunk, fused_score=mapped))
+    return out
 
 
 __all__ = [
