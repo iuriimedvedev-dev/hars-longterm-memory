@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Native HTTP(S) MCP endpoint with OAuth 2.1** (`hars-longterm-memory-mcp-https`,
+  `hars_memory/http_server.py`, `hars_memory/mcp_oauth.py`). One process holds
+  one LightRAG index shared by every client — the `stdio + supergateway
+  --stateful` bridge spawned one child per MCP session, so each new client paid
+  a ~24 s cold start. Includes RFC 9728/RFC 8414 discovery, RFC 7591 dynamic
+  client registration, authorization-code + PKCE S256, refresh-token rotation,
+  revocation, audience-bound Ed25519 access tokens, hierarchical scopes
+  (`memory:read`/`write`/`admin`) enforced at `tools/list` and `tools/call`,
+  optional TLS with mutual-TLS support, and `scripts/mcp_http_smoke.py`.
+  See `docs/http-mcp.md`.
+
 ## [0.8.1] - 2026-10-21
 
 ### Fixed
