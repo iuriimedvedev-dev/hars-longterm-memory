@@ -20,6 +20,7 @@ kind: Kustomization
 # The four knobs: REGISTRY (images below), STORAGE CLASS (pvc patch),
 # OAuth (configmap patch, permanently off here), TLS/Ingress (absent).
 
+namespace: hars-memory
 resources:
   - ../../base
 

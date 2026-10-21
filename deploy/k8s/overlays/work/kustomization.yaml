@@ -22,6 +22,7 @@ kind: Kustomization
 #
 # Exact sed commands are in README.md, "Deploy at work in 5 commands".
 
+namespace: hars-memory
 resources:
   - ../../base
 
