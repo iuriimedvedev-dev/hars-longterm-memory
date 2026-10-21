@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { BRIDGE_DIRECT_URL, type ConnState } from "../lib/live";
 import type { GraphStats } from "../lib/cosmosSource";
+import { fieldOwnsKey } from "../lib/keys";
 import { fmt } from "../i18n/strings";
 import { useI18n } from "../i18n/useI18n";
 import { SparkIcon, XIcon } from "./icons";
@@ -26,6 +27,7 @@ export default function AboutModal({ onClose, conn, onRefreshConn, identity, sou
   const { t, lang } = useI18n();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (fieldOwnsKey(e)) return;
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);

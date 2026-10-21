@@ -23,6 +23,7 @@ import {
   windowOf,
 } from "../lib/chunkingParams";
 import type { IngestFixture } from "../lib/types";
+import { fieldOwnsKey } from "../lib/keys";
 import { fmt, type Dict, type Lang } from "../i18n/strings";
 import { AnimatedCard } from "./AnimatedCard";
 
@@ -118,6 +119,7 @@ export function IngestPanel({
   useEffect(() => {
     if (!docOpen && !recsOpen) return;
     const onKey = (e: KeyboardEvent) => {
+      if (fieldOwnsKey(e)) return;
       if (e.key === "Escape") {
         setDocOpen(false);
         setRecsOpen(false);
