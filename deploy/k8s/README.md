@@ -532,9 +532,22 @@ Validated on the build host:
   checked (including prefix/suffix and namespace rewrites);
 * the bundle was grepped for real secrets, private IPs and host-specific paths.
 
-**Not** validated: `kubectl apply --dry-run`, `kubectl kustomize`, schema
-validation against a live API server, and runtime behaviour. Neither `kubectl`
-nor `kustomize` is installed on the machine that produced these files, so no
-cluster-side dry run was performed. Run
-`kubectl apply -k deploy/k8s/overlays/work --dry-run=server` before the first
-real apply.
+Validated with `kubectl kustomize` (kustomize v5.0.4, kubectl 1.30.6):
+
+* both overlays build cleanly -- `kubectl kustomize deploy/k8s/overlays/work`
+  renders Namespace, ConfigMap, Service, PVC, Deployment, Ingress, and
+  `deploy/k8s/overlays/local` renders the same set without the Ingress.
+
+The bundle as originally authored did **not** build: the components declared
+`kind: Kustomization` (kustomize rejects a component that is not
+`kind: Component`/`apiVersion: kustomize.config.k8s.io/v1alpha1`), and the base
+and component resources hard-coded `namespace: hars-memory`, which made every
+overlay patch target resolve as `[noNs]` and fail. Both are fixed here: the
+namespace is declared once per overlay and the component kind/apiVersion are
+correct.
+
+Other cluster-side validation still **not** performed here: schema/`--dry-run`
+against a live API server and runtime behaviour. Run
+`kubectl apply -k deploy/k8s/overlays/work --dry-run=server` (and check the
+namespace's ResourceQuota and the Kyverno `service-id` namespace policy) before
+the first real apply.
