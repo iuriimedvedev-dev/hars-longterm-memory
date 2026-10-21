@@ -21,7 +21,12 @@ COPY pyproject.toml uv.lock README.md ./
 COPY hars_memory ./hars_memory
 COPY proto ./proto
 
-RUN uv sync --frozen --no-dev \
+# --extra ltr is REQUIRED, not optional: the shipped ranker artifact is
+# `format: lightgbm_txt`, and without `lightgbm` the fail-soft loader
+# (hars_memory/ranking/artifact.py) catches the ImportError and returns None,
+# so `apply_ltr_ranker` silently keeps the hand-tuned order — indistinguishable
+# from success in logs and telemetry. See docs/ltr-ranker.md "Dependency note".
+RUN uv sync --frozen --no-dev --extra ltr \
     && useradd --create-home --uid 10001 hars-memory \
     && mkdir -p /data/index /data/staging /data/hf /data/bm25_cache /data/flat_dense_cache /data/oauth \
     && chown -R hars-memory:hars-memory /data

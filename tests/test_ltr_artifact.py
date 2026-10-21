@@ -18,6 +18,7 @@ from hars_memory.ranking.rerank import (
     load_default_ranker,
     ltr_ranker_enabled,
 )
+from hars_memory.ranking.rerank import _DEFAULT_MANIFEST, _resolve_manifest_path
 from hars_memory.retrieval.fusion import FusedChunk
 
 
@@ -170,3 +171,32 @@ class TestRerankHook:
         _write_linear_manifest(manifest)
         monkeypatch.setenv("HARS_MEMORY_LTR_RANKER", str(manifest))
         assert apply_ltr_ranker([], "q", top_k=5) == []
+
+
+class TestDefaultManifest:
+    """The env-less default must be the RETRAINED md_struct artifact.
+
+    Regression guard: the default was `ranker.json` (the older synthetic-query
+    model) while the retrieval pipeline is tuned for the md_struct retrain, so
+    every deployment that set no HARS_MEMORY_LTR_RANKER silently served the
+    wrong model. See git history for the retrain (commit 999b7b1).
+    """
+
+    def test_default_manifest_is_the_mdstruct_artifact(self) -> None:
+        assert _DEFAULT_MANIFEST.name == "ranker.mdstruct.json"
+        assert _DEFAULT_MANIFEST.exists(), f"shipped default manifest missing: {_DEFAULT_MANIFEST}"
+
+    def test_default_manifest_self_describes_the_mdstruct_model_file(self) -> None:
+        manifest = json.loads(_DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+        assert manifest["format"] == "lightgbm_txt"
+        assert manifest["model_file"] == "ranker.mdstruct.lgb.txt"
+        assert (_DEFAULT_MANIFEST.parent / manifest["model_file"]).exists()
+        assert manifest["training"]["alpha"] == 0.15
+
+    def test_default_resolution_without_env_points_at_mdstruct(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("HARS_MEMORY_LTR_RANKER", raising=False)
+        clear_ranker_cache()
+        assert _resolve_manifest_path(None) == _DEFAULT_MANIFEST
+        assert _resolve_manifest_path(None).name == "ranker.mdstruct.json"

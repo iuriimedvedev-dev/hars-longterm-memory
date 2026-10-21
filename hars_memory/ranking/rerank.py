@@ -37,9 +37,20 @@ logger = logging.getLogger(__name__)
 
 HARS_MEMORY_LTR_RANKER_ENV = "HARS_MEMORY_LTR_RANKER"
 
-# Shipped artifact (small, committed). Trained on the synthetic query set; see
-# docs/ltr-ranker.md for the exact command and the held-out numbers.
-_DEFAULT_MANIFEST = Path(__file__).resolve().parent / "artifacts" / "ranker.json"
+# Shipped artifact (small, committed). The DEFAULT must be the RETRAINED
+# md_struct artifact, not the older synthetic-query one: a plain deployment
+# that sets no env vars must serve the model the retrieval pipeline is tuned
+# for (alpha=0.15 on cleaned md_struct chunks). Before this change the default
+# was `ranker.json` (trained on the 223-query synthetic set, alpha from the
+# pre-mdstruct corpus), so every deployment without an explicit
+# HARS_MEMORY_LTR_RANKER silently served the WRONG model. The older artifact
+# is still shipped next to it for measurement (`ranker.json`).
+#
+# Override with HARS_MEMORY_LTR_RANKER=<manifest path>, or set it to `0` to
+# disable the ranker entirely (see _resolve_manifest_path).
+_DEFAULT_MANIFEST = (
+    Path(__file__).resolve().parent / "artifacts" / "ranker.mdstruct.json"
+)
 
 _cache: dict[str, LtrRankerModel | None] = {}
 

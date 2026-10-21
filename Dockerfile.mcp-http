@@ -14,7 +14,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY hars_memory ./hars_memory
 COPY proto ./proto
 
-RUN uv sync --frozen --no-dev \
+RUN uv sync --frozen --no-dev --extra ltr \
     && useradd --create-home --uid 10001 hars-memory \
     && mkdir -p /data/index /data/staging /data/hf /data/bm25_cache /data/flat_dense_cache /data/oauth \
     && chown -R hars-memory:hars-memory /data
