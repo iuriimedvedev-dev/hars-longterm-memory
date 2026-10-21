@@ -170,12 +170,12 @@ class Client:
     def list_tools(self) -> list[str]:
         return [tool["name"] for tool in self.rpc("tools/list")["result"]["tools"]]
 
-    def recall(self, question: str) -> tuple[float, dict[str, Any]]:
+    def recall(self, question: str, top_k: int = 8) -> tuple[float, dict[str, Any]]:
         payload = self.rpc(
             "tools/call",
             {
                 "name": "memory_recall",
-                "arguments": {"question": question, "mode": "hybrid", "top_k": 8},
+                "arguments": {"question": question, "mode": "hybrid", "top_k": top_k},
             },
         )
         text = payload["result"]["content"][0]["text"]
