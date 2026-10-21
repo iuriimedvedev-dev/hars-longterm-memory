@@ -6,7 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-20
+## [0.8.1] - 2026-10-21
+
+### Fixed
+- **Retrieval improvements**: source-diverse window selection on full pool, chunk-local ripgrep scoring, graph-bridge provenance seeding and degree damping.
+
+### Added
+- **Visualizer**: query-driven live presentation deck without hardcoded fixture traces.
 
 ### Changed
 
