@@ -23,6 +23,7 @@ client ──https──> ingress-nginx ──http──> Service:8099 ──> P
 | `base/` | shared resources: Namespace, ConfigMap, PVC, Deployment, Service. **OAuth off, no Ingress.** |
 | `components/ingress/` | Ingress for `/mcp` + all OAuth endpoints (work only) |
 | `components/oauth-signing-key/` | mounts the signing key from a Secret (work only) |
+| `components/embedder/` | optional shared llama.cpp embedding server (`-np`/`-t` from `embedder-config`) |
 | `components/app-tls/` | optional app-terminated TLS (topology W2) |
 | `components/image-pull-secret/` | work profile `imagePullSecrets: registry-credentials` |
 | `overlays/local/` | home profile: no OAuth, no Ingress, `local-path`, local registry |
@@ -44,7 +45,8 @@ client ──https──> ingress-nginx ──http──> Service:8099 ──> P
 * An external Qdrant, **or** apply the optional `qdrant-statefulset.yaml`.
 * An OpenAI-compatible embedding endpoint whose model produces the **same
   vector dimension as the index** (768 for the embeddinggemma-300m /
-  e5-large-v2 generation).
+  e5-large-v2 generation) -- **or** enable `components/embedder` and let the
+  bundle run a sized llama-server for you (see "Embedder sizing").
 * For `memory_remember` / `memory_upsert_document` only: an extraction LLM.
   Recall works without it.
 * TLS: cert-manager **or** a pre-created `kubernetes.io/tls` secret (work).
@@ -81,6 +83,142 @@ ConfigMap expects. Apply either it **or** point the ConfigMap at an existing
 endpoint — never both, and do not also apply the code-diver bundle's embedded
 Qdrant in the same cluster.
 
+## Embedder: a first-class, sized dependency
+
+The embedding server is **not** a side detail: it is the first throughput
+ceiling. On the reference CPU-only host with llama-server at `-t 4 -np 2`:
+
+* 8 concurrent embedding requests reached only **1.46×** the single-client
+  throughput;
+* 8 concurrent `memory_recall` calls reached only **1.51×**.
+
+Both numbers are queueing, not engine CPU: the engine waits on two slots. If
+you deploy for several colleagues, size the embedder **before** touching app
+replicas.
+
+### Concurrency model (what is parallel, what is serial)
+
+1. **One uvicorn worker, one shared index.** Every MCP client hits the same
+   process; the index is loaded once.
+2. **Bounded thread pool (when merged).** `HARS_MEMORY_MCP_ENGINE_THREADS`
+   (default `min(8, cpus)`) bounds concurrent retrieval calls; the queue is
+   `4 × threads` and overflow returns an overload error. In this bundle those
+   vars are commented because the pool is not in the committed server; without
+   them, blocking retrieval runs inline on the event loop and requests
+   serialize.
+3. **One recall ≈ one embedding request** (`flat_dense` is off by default).
+   So embedder slots ≈ simultaneous recalls. `memory_remember` embeds chunks
+   too and competes with reads.
+4. **Parallel:** HTTP/session handling, the embedder's own slots, Qdrant
+   queries, numpy scoring. **Serial:** Python fusion/diversity/assembly
+   inside one process (GIL), index writes, OAuth state writes.
+5. **The app pod is not the bottleneck.** In the measurement above the engine
+   processes used ~0.3–0.6 cores while throughput saturated.
+
+### Sizing table
+
+`-np` = slots (requests served concurrently), `-t` = CPU threads, `-c` = context
+per slot, `-b`/`-ub` = logical/physical batch.
+
+| Simultaneous recalls | `EMBED_SLOTS` (`-np`) | `EMBED_THREADS` (`-t`) | Pod CPU req/limit | Memory req/limit |
+|---|---|---|---|---|
+| 1–2 (home) | 2 | 4 | 1 / 2 | 1Gi / 2Gi |
+| 3–4 (small team) | 4 | 4 | 2 / 4 | 1Gi / 2Gi |
+| 5–8 (work default) | 8 | 6–8 | 4 / 6 | 2Gi / 4Gi |
+| 9–16 | 12–16 | 8 | 6 / 8 | 2Gi / 4Gi |
+| >16 | shard: second embedder Service + split client groups, or GPU | | | |
+
+Rules of thumb:
+
+* `EMBED_SLOTS >= expected simultaneous recalls`; extra slots beyond that only
+  add RAM/context.
+* `EMBED_THREADS <= pod CPU limit`. A CPU limit below `-t` throttles every
+  slot; raise both together.
+* Keep `-c 2048` and `-b/-ub 512` for 300M embedding models; raise the batch
+  only if inputs are long (code chunks) and latency budget allows.
+* One 300M Q8 model is ~0.4–1 GiB; the rest is per-slot context, small for
+  embeddings.
+* If a single node cannot hold the slots, add a **second** embedder Service and
+  point groups of app instances at different URLs. Do not stack embedder
+  replicas on one node.
+
+### Enable the in-cluster embedder (opt-in)
+
+```bash
+# 1. uncomment the component + its sizing/storage patches in the chosen
+#    overlay (work also has embedder-resources.patch.yaml for its 6-CPU
+#    default; local's component defaults already fit a laptop):
+#      - ../../components/embedder
+#      - path: embedder-sizing.patch.yaml
+#      - path: embedder-resources.patch.yaml
+#      - path: embedder-storageclass.patch.yaml
+
+# 2. provide the model (either)
+#    a) recommended: a URL the init container downloads on first start
+kubectl -n hars-memory create secret generic embedder-model \
+  --from-literal=url='https://models.example.com/embeddinggemma-300M-Q8_0.gguf'
+#       (or set EMBED_MODEL_URL in components/embedder/configmap.yaml)
+#    b) offline: pre-seed the embedder-models volume with
+#       /models/embeddinggemma-300M-Q8_0.gguf before the pod starts; for a
+#       local-path StorageClass that is a directory on the node.
+
+# 3. apply; the component rewrites HARS_MEMORY_EMBED_BASE_URL to
+#    http://embedder:8791/v1
+kubectl apply -k deploy/k8s/overlays/work
+kubectl -n hars-memory rollout status deploy/embedder
+```
+
+`components/embedder/configmap.yaml` holds the knobs (`EMBED_SLOTS`,
+`EMBED_THREADS`, `EMBED_CTX`, `EMBED_BATCH`, `EMBED_UBATCH`, model file/alias).
+Overlays patch that ConfigMap — never edit the Deployment argv.
+
+### Use an external embedder instead
+
+The base ConfigMap points at
+`http://embedding.embedding.svc.cluster.local:8080/v1`. Change that single key
+(`HARS_MEMORY_EMBED_BASE_URL`) plus `HARS_MEMORY_EMBED_HTTP_MODEL` to your
+endpoint/model; the component stays disabled. The model name/dimension must
+match the index (768 for the embeddinggemma/e5 generation). This is the right
+choice when an external embedder is already GPU-backed and shared.
+
+### Measure it
+
+```bash
+# 1. embedder throughput: 1 vs N concurrent requests (replace URL if external)
+kubectl -n hars-memory port-forward svc/embedder 8791:8791 &
+python3 - <<'PY'
+import concurrent.futures, json, time, urllib.request
+URL = "http://127.0.0.1:8791/v1/embeddings"
+BODY = json.dumps({"model": "embeddinggemma-300m", "input": ["def recall(): pass"]}).encode()
+
+def one():
+    req = urllib.request.Request(URL, BODY, {"content-type": "application/json"})
+    t = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=60) as r:
+        r.read()
+    return time.perf_counter() - t
+
+for n in (1, 8):
+    t = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(n) as ex:
+        list(ex.map(lambda _: one(), range(n * 5)))
+    total = time.perf_counter() - t
+    print(f"{n} concurrent: {n*5/total:.2f} req/s")
+PY
+
+# 2. end-to-end recalls, 8 clients x 5 iterations
+python scripts/mcp_http_smoke.py --url https://memory.example.com \
+  --approval-token "$HARS_MEMORY_MCP_OAUTH_APPROVAL_TOKEN" \
+  --clients 8 --repeat 5
+
+# 3. engine/loop stats on /healthz (requires the engine pool)
+curl -s https://memory.example.com/healthz | jq '{index_warm, engine, loop}'
+```
+
+Compare the N-concurrent req/s against 1-concurrent × N. If it is far below
+(e.g. 1.46× at N=8), add slots; if `-t` already equals the CPU limit, add CPU
+or a second embedder.
+
 ## Profiles
 | | `overlays/local` | `overlays/work` |
 |---|---|---|
@@ -90,6 +228,7 @@ Qdrant in the same cluster.
 | StorageClass | `local-path` | `fast-ssd` (placeholder) |
 | Registry | `registry.local/hars-longterm-memory:0.8.1` | `registry.work.example/...` + pull secret |
 | Secrets | **none required** | `hars-memory-oauth`, plus TLS (unless cert-manager) |
+| Embedder | external URL (or optional in-cluster component) | external URL **or** in-cluster component (opt-in) |
 | Resources | 1 CPU / 2 Gi request | 2 CPU / 4 Gi request |
 
 ## The four knobs (never edit `base/`)
@@ -111,6 +250,7 @@ Qdrant in the same cluster.
 | **Image registry** | `registry.local/...`, `registry.work.example/...` (+ `registry-credentials` pull secret) | `overlays/*/kustomization.yaml`, `components/image-pull-secret` |
 | **Qdrant endpoint** | external `qdrant.qdrant.svc.cluster.local:6333` or optional StatefulSet | `base/configmap.yaml` (`HARS_MEMORY_QDRANT_URL`) |
 | **Embedder + LLM endpoints** | `embedding.embedding.svc...`, `llm.llm.svc...` | `base/configmap.yaml` |
+| **Embedder sizing** (if in-cluster) | `EMBED_SLOTS=8`, `EMBED_THREADS=8` | `overlays/work/embedder-sizing.patch.yaml` |
 | **TLS topology** | W1 ingress termination (W2 app termination available) | `components/app-tls` + work overlay |
 
 Everything else (probes, resources, securityContext, `Recreate`, guards) is in
@@ -313,10 +453,14 @@ python scripts/mcp_http_smoke.py --url https://memory.acme.internal \
 
 **Do not set `replicas: 2`.** This is a single-writer engine:
 
-1. the LightRAG working directory (GraphML + KV + doc status) is opened and
+1. **Scale the embedder first.** Measured: 8 concurrent recalls on 2 slots
+   reached only 1.51× single-client throughput. More app replicas against the
+   same saturated embedder make the queue longer, not the service faster (see
+   "Embedder sizing" above).
+2. the LightRAG working directory (GraphML + KV + doc status) is opened and
    mutated by one process, on a RWO volume;
-2. OAuth state (one JSON file: clients/refresh/revocations) is also single-writer;
-3. a **bounded in-process** thread pool (`HARS_MEMORY_MCP_ENGINE_THREADS`,
+3. OAuth state (one JSON file: clients/refresh/revocations) is also single-writer;
+4. a **bounded in-process** thread pool (`HARS_MEMORY_MCP_ENGINE_THREADS`,
    `_QUEUE`, `_QUEUE_TIMEOUT_MS`) exists in the `feat/mcp-scaling` working tree
    but was not committed at the time of writing; the bundle ships those vars
    commented out. It bounds retrieval threads per process; it does **not**
@@ -327,17 +471,21 @@ python scripts/mcp_http_smoke.py --url https://memory.acme.internal \
 Once merged, the thread pool keeps concurrent clients from serializing on the
 event loop. The embedder and Qdrant become the ceiling before the pool does.
 
-If you need more throughput, scale **vertically** first (CPU/RAM), then split:
+**App replicas > 1** additionally require: shared Qdrant (already default), a
+shared OAuth store (SQLite/Redis on the scaling branch, not yet in the
+committed server), an identical signing key, and exactly **one** process that
+writes the index. Until those exist, one replica per engine is the correct
+topology; add per-project namespaces instead.
 
-* shared Qdrant (already the default) makes vector reads multi-process safe;
-* the index directory must move to a shared store or become read-only for
+If the embedder is already at the node's core count:
+
+* add a **second** embedder Service and split client groups across endpoints
+  (do not stack replicas on one node);
+* shared Qdrant (already the default) makes vector reads multi-process safe,
+  but the index directory must move to a shared store or become read-only for
   readers — LightRAG has no cross-process cache invalidation;
-* OAuth state must move to a shared store (the SQLite/Redis store is on the
-  scaling branch but not in the committed server yet; enable
-  `HARS_MEMORY_MCP_OAUTH_STORE` once merged), and the signing key must be
-  identical across pods;
-* exactly one process may still write the index. A future edge/engine split
-  would put stateless HTTP edges in front of one engine, not two engines.
+* a future edge/engine split would put stateless HTTP edges in front of one
+  engine, not two engines.
 
 Until that exists, one replica is the correct topology.
 
