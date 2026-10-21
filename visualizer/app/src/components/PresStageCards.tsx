@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { PIPELINE } from "../lib/presentation";
 import type { ChunkHit, TravelTrace } from "../lib/types";
+import { fieldOwnsKey } from "../lib/keys";
 import { fmt, type Dict, type Lang } from "../i18n/strings";
 import { AnimatedCard, type CardSize, type CardVariant } from "./AnimatedCard";
 
@@ -52,6 +53,7 @@ export function PresStageCards({
   useEffect(() => {
     if (!detail) return;
     const onKey = (e: KeyboardEvent) => {
+      if (fieldOwnsKey(e)) return;
       if (e.key === "Escape") setDetail(null);
     };
     window.addEventListener("keydown", onKey);

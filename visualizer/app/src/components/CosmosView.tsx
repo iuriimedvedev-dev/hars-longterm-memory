@@ -14,7 +14,6 @@ interface Props {
   graph: CosmosGraph | null;
   names: string[] | null;
   loading: string | null;
-  onTour: () => void;
   focusNode: (idx: number) => void;
   /** Which renderer actually came up (for the HUD chip). */
   mode: string | null;
@@ -42,7 +41,7 @@ function readEdgesPref(): boolean {
   }
 }
 
-export default function CosmosView({ cosmos, graph, names, loading, onTour, focusNode, mode, conn }: Props) {
+export default function CosmosView({ cosmos, graph, names, loading, focusNode, mode, conn }: Props) {
   const { t } = useI18n();
   const [q, setQ] = useState("");
   const [hi, setHi] = useState(0);
@@ -433,9 +432,6 @@ export default function CosmosView({ cosmos, graph, names, loading, onTour, focu
 
         <div className="row">
           <button onClick={() => { cosmos?.fit(); setQ(""); }}>{t.resetView}</button>
-          <button className="primary" onClick={onTour} disabled={!graph}>
-            <SparkIcon size={12} /> {t.tourButton}
-          </button>
         </div>
         <p className="hint">{t.hintOrbit}</p>
         <SelectBridge select={select} setHover={setHover} cosmos={cosmos} graph={graph} />

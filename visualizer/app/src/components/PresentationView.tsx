@@ -13,6 +13,7 @@ import { runLiveRecall } from "../lib/liveRecall";
 import { emptySteps, type RecallStep, type StepId } from "../lib/live";
 import { makeTimeline, type Timeline } from "../lib/reveal";
 import { CHAPTERS, type PresCtx } from "../lib/presentation";
+import { fieldOwnsKey } from "../lib/keys";
 import { buildChain, type AnswerPart } from "../lib/presChain";
 import { getUiScale } from "../lib/uiScale";
 import { prefersReducedMotion } from "../lib/motion";
@@ -817,8 +818,12 @@ export default function PresentationView({ onExit, data, source, preferredQuesti
   );
 
   // ---- presenter controls
+  // Window-level, so it also sees keystrokes aimed at the ask field: skip them
+  // (a space must type a space, "f" must type an f, arrows must move the caret).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (fieldOwnsKey(e)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "ArrowRight") { animateRef.current = true; setChapter((c) => Math.min(CHAPTERS.length - 1, c + 1)); }
       else if (e.key === "ArrowLeft") { setChapter((c) => Math.max(0, c - 1)); }
       else if (e.key === " ") { setPlaying((p) => !p); e.preventDefault(); }
