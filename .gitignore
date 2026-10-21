@@ -60,3 +60,6 @@ visualizer/app/node_modules/
 visualizer/docs/screenshots/
 visualizer/**/*.map
 
+
+# Local TLS material for the HTTP MCP endpoint (mkcert output, never committed)
+certs/
