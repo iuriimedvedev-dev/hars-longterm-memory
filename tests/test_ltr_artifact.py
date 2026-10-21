@@ -19,6 +19,7 @@ from hars_memory.ranking.rerank import (
     ltr_ranker_enabled,
 )
 from hars_memory.ranking.rerank import _DEFAULT_MANIFEST, _resolve_manifest_path
+from hars_memory.retrieval.diversity import select_diverse_fused_chunks
 from hars_memory.retrieval.fusion import FusedChunk
 
 
@@ -171,6 +172,37 @@ class TestRerankHook:
         _write_linear_manifest(manifest)
         monkeypatch.setenv("HARS_MEMORY_LTR_RANKER", str(manifest))
         assert apply_ltr_ranker([], "q", top_k=5) == []
+
+    def test_ranker_order_survives_diversity_resort(self, tmp_path: Path, monkeypatch) -> None:
+        """Regression: the ranker must WRITE its score, not just reorder.
+
+        The live recall path runs `apply_ltr_ranker` and then
+        `select_diverse_fused_chunks`, which re-sorts on `-fused_score`. If the
+        ranker only permuted the list, that re-sort silently RESTORED the
+        pre-ranker order. Weight `base_rank_reciprocal` alone and invert it
+        (negative weight) so the model ranks the tail first; the diversity pass
+        must NOT undo it.
+        """
+        idx = LTR_FEATURE_NAMES.index("base_rank_reciprocal")
+        weights = [0.0] * len(LTR_FEATURE_NAMES)
+        weights[idx] = -1.0
+        manifest = tmp_path / "ranker.json"
+        _write_linear_manifest(manifest, weights=weights)
+        monkeypatch.setenv("HARS_MEMORY_LTR_RANKER", str(manifest))
+        pool = [_fused("a", 0.9), _fused("b", 0.5), _fused("c", 0.1)]
+
+        ranked = apply_ltr_ranker(pool, "q", top_k=3)
+        assert [c.chunk_id for c in ranked] == ["c", "b", "a"], "model order not applied"
+        # The pool is score-sorted by `fuse()`; the ranker's reorder must be
+        # carried on `fused_score` so this re-sort agrees with it.
+        assert [c.fused_score for c in ranked] == sorted(
+            (c.fused_score for c in ranked), reverse=True
+        ), "ranker order is not monotone with fused_score"
+
+        selected = select_diverse_fused_chunks(ranked, 3, max_per_source=99)
+        assert [c.chunk_id for c in selected] == ["c", "b", "a"], (
+            "diversity re-sort reverted the ranker order"
+        )
 
 
 class TestDefaultManifest:
