@@ -15,7 +15,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hars-memory-mcp
-  namespace: hars-memory
   labels:
     app.kubernetes.io/name: hars-longterm-memory
     app.kubernetes.io/instance: hars-memory

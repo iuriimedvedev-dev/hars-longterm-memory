@@ -12,7 +12,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: embedder
-  namespace: hars-memory
   labels:
     app.kubernetes.io/name: hars-embedder
     app.kubernetes.io/instance: embedder
