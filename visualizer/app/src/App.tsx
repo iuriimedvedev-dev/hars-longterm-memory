@@ -664,7 +664,6 @@ export default function App() {
               graph={graph}
               names={names}
               loading={progress}
-              onTour={enterPresentation}
               focusNode={focusNode}
               mode={renderMode}
               conn={conn}
