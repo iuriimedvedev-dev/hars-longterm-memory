@@ -82,6 +82,19 @@ EXPECTED_EMBEDDING_DIM = 768
 
 
 def _qdrant_collection_name(namespace: str, prefix: str) -> str:
+    """Qdrant collection for one namespace.
+
+    ``prefix`` is the historical per-project prefix. Empty/``None`` means the
+    PLAIN ``lightrag_vdb_{namespace}`` names — which is what lightrag 1.5.7
+    actually creates at runtime, because ``QdrantVectorDBStorage`` derives the
+    name from ``namespace`` + an (always empty in this repo) model suffix and
+    ignores ``HARS_MEMORY_QDRANT_COLLECTION_PREFIX`` entirely (see
+    ``hars_memory/server/embedder.py::qdrant_collection_names``). Multi-tenant
+    isolation on a shared container is therefore by ``workspace_id``, not by
+    collection name; hard isolation needs a separate Qdrant container.
+    """
+    if not prefix:
+        return f"lightrag_vdb_{namespace}"
     names = qdrant_collection_names(prefix)
     return dict(zip(NAMESPACES.keys(), names))[namespace]
 
@@ -143,6 +156,25 @@ def transplant_namespace_forward(
         namespace, len(data), matrix.shape[1] if matrix.size else EXPECTED_EMBEDDING_DIM,
         path, collection, workspace,
     )
+
+    # A fresh (e.g. newly prefixed) collection does not exist yet: the service
+    # normally creates it on first start, but a migration must not depend on
+    # that ordering. Create it here with the same geometry lightrag uses
+    # (768-dim Cosine) and index the workspace filter, so the copy is usable
+    # immediately and LightRAG adopts it as-is on startup.
+    if not client.collection_exists(collection):
+        logger.info("[%s] creating collection %r (768-dim, cosine)", namespace, collection)
+        client.create_collection(
+            collection_name=collection,
+            vectors_config=models.VectorParams(
+                size=EXPECTED_EMBEDDING_DIM, distance=models.Distance.COSINE
+            ),
+        )
+        client.create_payload_index(
+            collection_name=collection,
+            field_name=WORKSPACE_ID_FIELD,
+            field_schema=models.PayloadSchemaType.KEYWORD,
+        )
 
     points: list[Any] = []
     for i, rec in enumerate(data):
@@ -282,6 +314,112 @@ def transplant_namespace_reverse(
 
 
 # ---------------------------------------------------------------------------
+# Verification: JSON vs Qdrant, same vectors, same ids
+# ---------------------------------------------------------------------------
+
+
+def verify_namespace(
+    *,
+    client: Any,
+    working_dir: Path,
+    namespace: str,
+    workspace: str,
+    collection_prefix: str,
+    samples: int,
+    seed: int = 20261021,
+) -> dict[str, Any]:
+    """Prove a forward transplant is faithful, from the source JSON side.
+
+    Checks, per namespace:
+
+    1. **count** — Qdrant points for this ``workspace_id`` == JSON records;
+    2. **vectors** — for ``samples`` randomly chosen records, the Qdrant vector
+       is (numerically) the JSON vector: cosine >= 0.9999 (float32 round-trip
+       through the REST API is lossless in practice; the threshold leaves room
+       for JSON float serialization only);
+    3. **retrieval** — using a sampled record's OWN vector as the query, the
+       nearest point in Qdrant must be that record (top-1 self-hit), i.e. the
+       ids, payloads and vectors line up the same way they do in NanoVectorDB.
+
+    Returns a JSON-serializable report.
+    """
+    import random
+
+    from qdrant_client import models
+
+    filename, _meta = NAMESPACES[namespace]
+    data, matrix = _load_vdb_json(working_dir / filename)
+    collection = _qdrant_collection_name(namespace, collection_prefix)
+    workspace_filter = models.Filter(
+        must=[models.FieldCondition(key=WORKSPACE_ID_FIELD, match=models.MatchValue(value=workspace))]
+    )
+    count = client.count(collection_name=collection, count_filter=workspace_filter, exact=True).count
+
+    rng = random.Random(seed + len(namespace))
+    indices = sorted(rng.sample(range(len(data)), min(samples, len(data)))) if data else []
+    vectors = matrix[indices] if indices else np.zeros((0, EXPECTED_EMBEDDING_DIM), np.float32)
+    record_ids = [data[i]["__id__"] for i in indices]
+    point_ids = [_compute_point_id(record_id, workspace) for record_id in record_ids]
+
+    cosines: list[float] = []
+    self_hits = 0
+    missing = 0
+    for record_id, point_id, vector in zip(record_ids, point_ids, vectors):
+        got = client.retrieve(
+            collection_name=collection, ids=[point_id], with_vectors=True, with_payload=True
+        )
+        if not got:
+            missing += 1
+            continue
+        stored = np.asarray(got[0].vector, dtype=np.float32)
+        denom = float(np.linalg.norm(stored) * np.linalg.norm(vector)) or 1.0
+        cosines.append(float(np.dot(stored, vector) / denom))
+        if (got[0].payload or {}).get(ID_FIELD) != record_id:
+            continue
+        hits = client.query_points(
+            collection_name=collection,
+            query=vector.tolist(),
+            limit=1,
+            with_payload=True,
+            with_vectors=True,
+            query_filter=workspace_filter,
+        ).points
+        if hits and (hits[0].payload or {}).get(ID_FIELD) == record_id:
+            self_hits += 1
+        elif hits:
+            # The source index contains a handful of EXACT duplicate vectors
+            # (same document, repeated boilerplate chunks), so a top-1 that is a
+            # sibling with an identical vector is the same answer numpy argmax
+            # would give — accept it, but only on numerical identity.
+            sibling = np.asarray(hits[0].vector, dtype=np.float32)
+            denom = float(np.linalg.norm(sibling) * np.linalg.norm(vector)) or 1.0
+            if float(np.dot(sibling, vector) / denom) >= 0.99999:
+                self_hits += 1
+
+    checked = len(cosines)
+    report = {
+        "namespace": namespace,
+        "collection": collection,
+        "source_records": len(data),
+        "qdrant_count": count,
+        "count_matches": count == len(data),
+        "sampled": len(indices),
+        "missing": missing,
+        "cosine_min": round(min(cosines), 6) if cosines else None,
+        "cosine_mean": round(float(np.mean(cosines)), 6) if cosines else None,
+        "self_hit_rate": round(self_hits / checked, 4) if checked else None,
+        "ok": bool(
+            count == len(data)
+            and missing == 0
+            and (not cosines or min(cosines) >= 0.9999)
+            and (not checked or self_hits == checked)
+        ),
+    }
+    logger.info("[%s] verify: %s", namespace, json.dumps(report))
+    return report
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -307,13 +445,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--collection-prefix",
         default=os.environ.get("HARS_MEMORY_QDRANT_COLLECTION_PREFIX"),
-        required="HARS_MEMORY_QDRANT_COLLECTION_PREFIX" not in os.environ,
         help=(
             "Per-project prefix applied to the fixed lightrag_vdb_{chunks,entities,"
-            "relationships} collection names, so multiple projects can share one "
-            "Qdrant container without colliding on schema. Required (env: "
-            "HARS_MEMORY_QDRANT_COLLECTION_PREFIX) — no default."
+            "relationships} collection names (env: HARS_MEMORY_QDRANT_COLLECTION_PREFIX). "
+            "Use --no-collection-prefix for the PLAIN names — which is what lightrag "
+            "1.5.7 creates at runtime, so that is the right choice for an existing "
+            "deployment. Hard multi-tenant isolation needs a separate Qdrant container; "
+            "on a shared container use a distinct --workspace."
         ),
+    )
+    ap.add_argument(
+        "--no-collection-prefix",
+        action="store_true",
+        help="Target the plain lightrag_vdb_{chunks,entities,relationships} collections.",
     )
     ap.add_argument(
         "--namespace",
@@ -323,7 +467,28 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--batch-size", type=int, default=500, help="Forward upsert / reverse scroll batch size.")
     ap.add_argument("--reverse", action="store_true", help="Qdrant -> vdb_*.json instead of the default JSON -> Qdrant.")
-    return ap.parse_args()
+    ap.add_argument(
+        "--verify-samples",
+        type=int,
+        default=0,
+        help="After the copy, verify N sampled records per namespace (count, vector cosine, "
+        "top-1 self-hit). 0 disables; 200 is a good smoke level.",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Report what would be copied, write nothing.")
+    ap.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Skip the copy; only re-run verification (implies --verify-samples default 200).",
+    )
+    args = ap.parse_args()
+    if args.verify_only and not args.verify_samples:
+        args.verify_samples = 200
+    if args.no_collection_prefix:
+        args.collection_prefix = ""
+    elif not args.collection_prefix:
+        ap.error("--collection-prefix (or HARS_MEMORY_QDRANT_COLLECTION_PREFIX) is required, "
+                 "or pass --no-collection-prefix")
+    return args
 
 
 def main() -> None:
@@ -336,6 +501,22 @@ def main() -> None:
 
     results = []
     for namespace in namespaces:
+        if args.dry_run:
+            filename, _meta = NAMESPACES[namespace]
+            path = working_dir / filename
+            data, matrix = _load_vdb_json(path) if path.is_file() else ([], None)
+            results.append(
+                {
+                    "namespace": namespace,
+                    "dry_run": True,
+                    "source": str(path),
+                    "source_records": len(data),
+                    "dim": int(matrix.shape[1]) if matrix is not None and matrix.size else None,
+                    "collection": _qdrant_collection_name(namespace, args.collection_prefix),
+                    "workspace": args.workspace,
+                }
+            )
+            continue
         if args.reverse:
             result = transplant_namespace_reverse(
                 client=client,
@@ -345,6 +526,12 @@ def main() -> None:
                 collection_prefix=args.collection_prefix,
                 scroll_batch_size=args.batch_size,
             )
+        elif args.verify_only:
+            result = {
+                "namespace": namespace,
+                "collection": _qdrant_collection_name(namespace, args.collection_prefix),
+                "verified_only": True,
+            }
         else:
             result = transplant_namespace_forward(
                 client=client,
@@ -354,11 +541,26 @@ def main() -> None:
                 collection_prefix=args.collection_prefix,
                 batch_size=args.batch_size,
             )
+        if args.verify_samples and not args.reverse and not result.get("skipped"):
+            result["verify"] = verify_namespace(
+                client=client,
+                working_dir=working_dir,
+                namespace=namespace,
+                workspace=args.workspace,
+                collection_prefix=args.collection_prefix,
+                samples=args.verify_samples,
+            )
         results.append(result)
 
-    print(json.dumps({"mode": "reverse" if args.reverse else "forward", "results": results}, indent=2))
-    if any(r.get("skipped") for r in results):
-        sys.exit(0)
+    ok = all(
+        r.get("skipped")
+        or r.get("dry_run")
+        or r.get("verify", {}).get("ok", not args.verify_samples)
+        for r in results
+    )
+    print(json.dumps({"mode": "reverse" if args.reverse else "forward", "ok": ok, "results": results}, indent=2))
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -62,8 +62,8 @@ Timeout, retries and concurrency reuse `HARS_MEMORY_LLM_TIMEOUT_SECONDS`, `HARS_
 |---|---|---|
 | `HARS_MEMORY_VECTOR_STORAGE` | `NanoVectorDBStorage` | Vector backend: `NanoVectorDBStorage` (file-based, default), `QdrantVectorDBStorage` (recommended for production) |
 | `HARS_MEMORY_QDRANT_URL` | `http://localhost:6333` | Qdrant gRPC/HTTP endpoint |
-| `HARS_MEMORY_QDRANT_COLLECTION` | — | NOT a Qdrant collection name — LightRAG uses it as the `workspace_id` tenant id written into every payload. Actual collections are always `lightrag_vdb_{chunks,entities,relationships}` |
-| `HARS_MEMORY_QDRANT_COLLECTION_PREFIX` | — | Optional prefix for Qdrant collection names. Shared Qdrant instances need distinct prefixes per tenant |
+| `HARS_MEMORY_QDRANT_COLLECTION` | — | NOT a Qdrant collection name — LightRAG uses it as the `workspace_id` tenant id written into every payload. Actual collections are `{prefix}_lightrag_vdb_{chunks,entities,relationships}` when a prefix is set, otherwise `lightrag_vdb_{chunks,entities,relationships}` |
+| `HARS_MEMORY_QDRANT_COLLECTION_PREFIX` | — | Per-tenant prefix for the Qdrant collection **names**. Set it on a shared container so each index gets its own collections (otherwise every tenant shares `lightrag_vdb_*` and only `workspace_id` separates them). Must match `qdrant_transplant.py --collection-prefix`; see `docs/http-mcp-scaling.md` §5 |
 | `HARS_MEMORY_QDRANT_API_KEY` | — | Qdrant API key for authentication |
 
 ## Retrieval channels

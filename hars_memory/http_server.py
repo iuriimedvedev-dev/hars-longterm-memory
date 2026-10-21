@@ -62,6 +62,12 @@ from hars_memory.mcp_oauth import (
     OAuthSettings,
     build_oauth_app,
 )
+from hars_memory.mcp_runtime import (
+    get_loop_monitor,
+    runtime_health,
+    shutdown_runtime,
+    stats_enabled,
+)
 from hars_memory.trace import start_trace_server, trace_config_from_env
 
 logger = logging.getLogger("memory.http")
@@ -78,6 +84,8 @@ TLS_KEY_ENV = "HARS_MEMORY_MCP_TLS_KEYFILE"
 TLS_CA_ENV = "HARS_MEMORY_MCP_TLS_CA"
 TLS_CLIENT_CERT_ENV = "HARS_MEMORY_MCP_TLS_REQUIRE_CLIENT_CERT"
 TLS_MIN_VERSION_ENV = "HARS_MEMORY_MCP_TLS_MIN_VERSION"
+MODE_ENV = "HARS_MEMORY_MCP_MODE"
+EDGE_WORKERS_ENV = "HARS_MEMORY_MCP_EDGE_WORKERS"
 
 STARTED_AT = time.monotonic()
 WARM_STATE: dict[str, Any] = {"warm": False, "warmup_seconds": None, "error": None}
@@ -202,9 +210,25 @@ class AppWithLifespan:
         self.warmup_project = warmup_project
         self._trace_server: asyncio.Server | None = None
         self._warmup_task: asyncio.Task[None] | None = None
+        self._health_task: asyncio.Task[None] | None = None
         # Set by _serve() so warm-up waits for the listening socket instead of
         # competing with uvicorn's startup for the event loop.
         self.server: Any = None
+
+    async def _poll_engines(self) -> None:
+        """Refresh the engine health cache (edge mode only)."""
+        from hars_memory.mcp_engine import get_router
+
+        router = get_router()
+        if router is None:
+            return
+        interval = float(os.environ.get("HARS_MEMORY_MCP_EDGE_HEALTH_INTERVAL_MS", "5000")) / 1000.0
+        while True:
+            try:
+                await router.probe_health()
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.debug("engine health probe failed: %s", exc)
+            await asyncio.sleep(max(0.5, interval))
 
     async def _start_trace(self) -> None:
         if self.trace is None:
@@ -244,6 +268,12 @@ class AppWithLifespan:
         try:
             async with self.manager.run():
                 await self._start_trace()
+                if stats_enabled():
+                    get_loop_monitor().start()
+                from hars_memory.mcp_engine import get_router
+
+                if get_router() is not None:
+                    self._health_task = asyncio.create_task(self._poll_engines())
                 if self.warmup_project:
                     # Do not block the bind: uvicorn has not started listening
                     # yet inside the lifespan handler.
@@ -255,12 +285,21 @@ class AppWithLifespan:
                         if self._warmup_task is not None:
                             self._warmup_task.cancel()
                             await asyncio.gather(self._warmup_task, return_exceptions=True)
+                        if self._health_task is not None:
+                            self._health_task.cancel()
+                            await asyncio.gather(self._health_task, return_exceptions=True)
+                            from hars_memory.mcp_engine import get_router
+
+                            router = get_router()
+                            if router is not None:
+                                await router.aclose()
                         if self._trace_server is not None:
                             self._trace_server.close()
                             try:
                                 await self._trace_server.wait_closed()
                             except Exception:  # pragma: no cover
                                 pass
+                        await shutdown_runtime()
                         await send({"type": "lifespan.shutdown.complete"})
                         return
         except Exception as exc:
@@ -269,13 +308,31 @@ class AppWithLifespan:
 
 
 def _health_payload(provider: OAuthProvider) -> dict[str, Any]:
+    from hars_memory.mcp_engine import get_router, mode_from_env
+
+    router = get_router()
+    engines = router.stats() if router is not None else None
+    warm: bool | None = bool(WARM_STATE["warm"])
+    warmup_seconds = WARM_STATE["warmup_seconds"]
+    if router is not None:
+        # In split mode the index lives in the engines: report *their* warm
+        # state, not this process's (which never loads an index).
+        states = list((engines or {}).get("engines", {}).values())
+        healthy = [item for item in states if "error" not in item]
+        warm = bool(healthy) and all(item.get("index_warm") for item in healthy)
+        seconds = [item.get("warmup_seconds") for item in healthy if item.get("warmup_seconds")]
+        warmup_seconds = max(seconds) if seconds else None
     return {
         "status": "ok",
+        "mode": mode_from_env(),
         "uptime_seconds": round(time.monotonic() - STARTED_AT, 1),
         "index_shared": True,
-        "index_warm": bool(WARM_STATE["warm"]),
-        "warmup_seconds": WARM_STATE["warmup_seconds"],
+        "index_warm": warm,
+        "warmup_seconds": warmup_seconds,
         "oauth": provider.enabled,
+        "oauth_store": getattr(provider.store, "kind", None),
+        "engine_router": engines,
+        **runtime_health(),
     }
 
 
@@ -375,10 +432,88 @@ def _uvicorn_config(app: Any, host: str, port: int) -> uvicorn.Config:
 # ---------------------------------------------------------------------------
 
 
+def create_app_from_env() -> Any:
+    """Build the ASGI app from the environment.
+
+    Importable by name, which is what ``uvicorn --workers N`` needs: the
+    supervisor re-imports this in every worker process (spawn), so each edge
+    worker gets its own session manager, its own OAuth provider instance and
+    its own connection(s) to the engine socket(s) — while the mutable OAuth
+    state and the index stay shared/out-of-process.
+
+    In split/edge mode the index is **not** warmed here: it belongs to the
+    engine process. ``HARS_MEMORY_MCP_HTTP_WARMUP`` is therefore ignored on the
+    edge (the engine honours it).
+    """
+    from hars_memory.mcp_engine import mode_from_env
+
+    settings = OAuthSettings.from_env()
+    provider = OAuthProvider(settings)
+    mode = mode_from_env()
+    warmup_project = os.environ.get(WARMUP_PROJECT_ENV, "default").strip() or "default"
+    if not _flag(WARMUP_ENV) or mode == "split":
+        warmup_project = None
+    trace_cfg = trace_config_from_env() if mode != "split" else None
+    return create_app(
+        provider,
+        mcp_path=os.environ.get(PATH_ENV, "/mcp").strip() or "/mcp",
+        stateless=_flag(STATELESS_ENV, default=True),
+        json_response=_flag(JSON_RESPONSE_ENV, default=True),
+        trace=trace_cfg,
+        warmup_project=warmup_project,
+    )
+
+
+def _log_banner(provider: OAuthProvider, settings: OAuthSettings, host: str, port: int, path: str) -> None:
+    from hars_memory.mcp_engine import get_router, mode_from_env
+
+    mode = mode_from_env()
+    scheme = "https" if _tls_files() else "http"
+    router = get_router()
+    logger.info(
+        "MCP %s endpoint: %s (mode=%s, index shared per process, stateless=%s, oauth=%s, oauth_store=%s)",
+        scheme,
+        f"{scheme}://{host}:{port}{path}",
+        mode,
+        _flag(STATELESS_ENV, default=True),
+        provider.enabled,
+        getattr(provider.store, "kind", None),
+    )
+    if router is not None:
+        stats = router.stats()
+        logger.info("Engine routing: %d shard(s), pool=%s, affinity=%s",
+                    stats["shards"], stats["pool"], stats["affinity"])
+    if provider.enabled:
+        issuer = settings.issuer or f"{scheme}://{host}:{port}"
+        logger.info("OAuth issuer=%s resource=%s", issuer, settings.resource or f"{issuer}/mcp")
+        if scheme == "http" and host not in {"127.0.0.1", "localhost", "::1"}:
+            logger.warning(
+                "OAuth is enabled on a plain-HTTP listener. Bearer tokens and the "
+                "authorization code are only as private as the network path; keep "
+                "this bind on WireGuard/loopback or terminate TLS (%s / %s).",
+                TLS_CERT_ENV,
+                TLS_KEY_ENV,
+            )
+
+
 async def _serve() -> None:
+    from hars_memory.mcp_engine import mode_from_env
+
+    mode = mode_from_env()
     host = os.environ.get(HOST_ENV, "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.environ.get(PORT_ENV, "8099"))
     path = os.environ.get(PATH_ENV, "/mcp").strip() or "/mcp"
+
+    if mode == "engine":
+        from hars_memory.mcp_engine import serve_engine
+
+        await serve_engine()
+        return
+
+    if mode == "split":
+        await _serve_edge(host, port, path)
+        return
+
     stateless = _flag(STATELESS_ENV, default=True)
     json_response = _flag(JSON_RESPONSE_ENV, default=True)
 
@@ -399,25 +534,7 @@ async def _serve() -> None:
         warmup_project=warmup_project,
     )
 
-    scheme = "https" if _tls_files() else "http"
-    issuer = settings.issuer or f"{scheme}://{host}:{port}"
-    logger.info(
-        "MCP %s endpoint: %s (index shared per process, stateless=%s, oauth=%s)",
-        scheme,
-        f"{scheme}://{host}:{port}{path}",
-        stateless,
-        provider.enabled,
-    )
-    if provider.enabled:
-        logger.info("OAuth issuer=%s resource=%s", issuer, settings.resource or f"{issuer}/mcp")
-        if scheme == "http" and host not in {"127.0.0.1", "localhost", "::1"}:
-            logger.warning(
-                "OAuth is enabled on a plain-HTTP listener. Bearer tokens and the "
-                "authorization code are only as private as the network path; keep "
-                "this bind on WireGuard/loopback or terminate TLS (%s / %s).",
-                TLS_CERT_ENV,
-                TLS_KEY_ENV,
-            )
+    _log_banner(provider, settings, host, port, path)
 
     config = _uvicorn_config(app, host, port)
     server = uvicorn.Server(config)
@@ -425,11 +542,100 @@ async def _serve() -> None:
     await server.serve()
 
 
+async def _serve_edge(host: str, port: int, path: str) -> None:
+    """Run the edge. Single-worker path; multi-worker is handled in :func:`main`."""
+    from hars_memory.mcp_engine import get_router
+
+    settings = OAuthSettings.from_env()
+    provider = OAuthProvider(settings)
+    router = get_router()
+    if router is None:
+        raise RuntimeError(
+            "HARS_MEMORY_MCP_MODE=split requires an engine socket: set "
+            "HARS_MEMORY_MCP_ENGINE_SOCKET (one engine) or "
+            "HARS_MEMORY_MCP_ENGINE_SOCKETS (pool / project affinity)."
+        )
+    if getattr(provider.store, "is_shared", False) is False:
+        logger.warning(
+            "Edge mode with a non-shared OAuth store (%s): /register, /token, "
+            "refresh rotation and revocation will NOT agree across workers. Set "
+            "HARS_MEMORY_MCP_OAUTH_STORE=sqlite (default) or redis.",
+            getattr(provider.store, "kind", "?"),
+        )
+    _log_banner(provider, settings, host, port, path)
+
+    # Same code path as combined mode, one process — keeps the single-worker
+    # deployment (and the tests) identical to a combined server plus a remote
+    # engine.
+    app = create_app_from_env()
+    config = _uvicorn_config(app, host, port)
+    server = uvicorn.Server(config)
+    app.server = server
+    await server.serve()
+
+
+def _run_edge_multiprocess() -> None:
+    """N edge workers via uvicorn's supervisor (sync: it owns its own loop).
+
+    uvicorn's supervisor binds the listening socket once and re-imports the
+    factory in each child (spawn), so the socket is shared without
+    ``SO_REUSEPORT`` games and every worker builds its own ASGI app, OAuth
+    provider instance and engine connection(s).
+    """
+    from hars_memory.mcp_engine import get_router
+
+    host = os.environ.get(HOST_ENV, "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get(PORT_ENV, "8099"))
+    path = os.environ.get(PATH_ENV, "/mcp").strip() or "/mcp"
+    workers = max(1, int(os.environ.get(EDGE_WORKERS_ENV, "1")))
+
+    settings = OAuthSettings.from_env()
+    provider = OAuthProvider(settings)
+    if get_router() is None:
+        raise RuntimeError(
+            "HARS_MEMORY_MCP_MODE=split requires HARS_MEMORY_MCP_ENGINE_SOCKET or "
+            "HARS_MEMORY_MCP_ENGINE_SOCKETS"
+        )
+    if getattr(provider.store, "is_shared", False) is False:
+        logger.warning(
+            "Edge mode with a non-shared OAuth store (%s): state will not agree "
+            "across workers.",
+            getattr(provider.store, "kind", "?"),
+        )
+    _log_banner(provider, settings, host, port, path)
+
+    tls = _tls_files()
+    kwargs: dict[str, Any] = {}
+    if tls is not None:
+        kwargs["ssl_certfile"], kwargs["ssl_keyfile"] = tls
+        kwargs["ssl_context_factory"] = _ssl_context_factory
+
+    logger.info("Starting %d edge workers (uvicorn supervisor)", workers)
+    uvicorn.run(
+        "hars_memory.http_server:create_app_from_env",
+        factory=True,
+        host=host,
+        port=port,
+        workers=workers,
+        log_level="info",
+        lifespan="on",
+        access_log=False,
+        **kwargs,
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    from hars_memory.mcp_engine import mode_from_env
+
+    if mode_from_env() == "split" and int(os.environ.get(EDGE_WORKERS_ENV, "1")) > 1:
+        # uvicorn's multi-worker supervisor calls asyncio.run() itself, so it
+        # must not be nested inside ours.
+        _run_edge_multiprocess()
+        return
     asyncio.run(_serve())
 
 

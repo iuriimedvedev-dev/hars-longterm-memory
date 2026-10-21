@@ -27,6 +27,7 @@ Only memory_consolidate and memory_forget(apply=True) touch the durable index.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime
 import json
 import logging
@@ -82,11 +83,13 @@ from hars_memory.auth import (
     get_default_token_store,
     is_auth_enabled,
 )
+from hars_memory.mcp_engine import EngineError, EngineUnavailable, get_router
 from hars_memory.mcp_oauth import (
     GRANT_SCOPE_KEY,
     Grant,
     required_scope_for_tool,
 )
+from hars_memory.mcp_runtime import EngineOverloaded, run_blocking
 from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
@@ -1600,6 +1603,159 @@ def _ripgrep_keywords(ll_keywords: list[str] | None) -> list[str]:
     return sorted(terms, key=lambda term: not _ripgrep_term_is_specific(term))
 
 
+# ---------------------------------------------------------------------------
+# Vector-store query: keep the backend's blocking client call off the loop
+# ---------------------------------------------------------------------------
+# `chunks_vdb.query()` is an `async` method whose last act is a *synchronous*
+# backend call: NanoVectorDB runs a numpy matmul over the whole in-process
+# matrix, and QdrantVectorDBStorage (lightrag 1.5.7) issues a blocking
+# `QdrantClient.query_points` round trip through the sync client. Awaited
+# directly, that call blocks the one asyncio event loop for every other
+# client — the measured cause of "4 concurrent recalls cost 2.7x a single
+# one". `_vector_query` embeds on the loop (the embedder call is genuinely
+# async: HTTP client or its own thread), then runs the backend call on the
+# bounded engine pool (see hars_memory/mcp_runtime.py).
+#
+# The result shaping below mirrors lightrag==1.5.7 exactly (pyproject pins the
+# version the stores were built with). Anything unexpected — unknown backend,
+# missing attribute, a future lightrag shape, an engine-pool overload — falls
+# back to the storage's own `query()`, i.e. correct but loop-blocking, so this
+# is a performance fast path, never a correctness fork.
+# `test_mcp_runtime.py` asserts byte-identical results against `query()` for
+# both backends.
+
+
+async def _vector_query(vdb: Any, query: str, top_k: int) -> list[dict[str, Any]]:
+    """`vdb.query()` with the blocking backend call on the engine pool."""
+    rows, _timings = await _vector_query_timed(vdb, query, top_k)
+    return rows
+
+
+async def _vector_query_timed(
+    vdb: Any, query: str, top_k: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Like :func:`_vector_query`, plus the split between embedding and backend.
+
+    The two halves have completely different scaling behaviour — the embedder
+    is a shared external service, the backend call is local (numpy) or a
+    network hop (Qdrant) — so a recall's own latency breakdown has to separate
+    them to be actionable.
+    """
+    started = time.perf_counter()
+    try:
+        rows = await _vector_query_offloaded(vdb, query, top_k)
+    except EngineOverloaded:
+        raise
+    except Exception as exc:
+        logger.debug(
+            "Offloaded vector query unavailable (%s: %s); using the storage's own query()",
+            type(exc).__name__,
+            exc,
+        )
+        rows = await vdb.query(query, top_k=top_k)
+        return rows, {
+            "backend": "fallback",
+            "embed_ms": None,
+            "backend_ms": round((time.perf_counter() - started) * 1000.0, 2),
+        }
+    return rows, _VECTOR_TIMINGS.get() or {}
+
+
+#: Filled by `_vector_query_offloaded` for the current task (one recall = one
+#: task in the MCP server), read back by `_vector_query_timed`.
+_VECTOR_TIMINGS: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "hars_memory_vector_timings", default=None
+)
+
+
+async def _vector_query_offloaded(
+    vdb: Any, query: str, top_k: int
+) -> list[dict[str, Any]]:
+    try:
+        from lightrag.constants import DEFAULT_QUERY_PRIORITY  # type: ignore[import-not-found]
+
+        embedding_started = time.perf_counter()
+        embedding = await vdb.embedding_func(
+            [query], context="query", _priority=DEFAULT_QUERY_PRIORITY
+        )
+    except (ImportError, TypeError):  # pragma: no cover - lightrag shape drift
+        embedding_started = time.perf_counter()
+        embedding = await vdb.embedding_func([query], context="query")
+    embed_ms = (time.perf_counter() - embedding_started) * 1000.0
+    vector = embedding[0]
+    backend_started = time.perf_counter()
+
+    # Dispatch on the backend CLASS, not on attribute sniffing: lightrag's
+    # BaseVectorStorage gives *every* storage a `final_namespace`, so a
+    # `hasattr(vdb, "final_namespace")` check sends NanoVectorDBStorage down
+    # the Qdrant branch (where it raises on `effective_workspace`, gets caught
+    # by the fallback in `_vector_query` and re-embeds the query — measured as
+    # 2x embedding cost and no offload at all). Class-name dispatch is explicit
+    # and the version is pinned in pyproject.
+    backend = type(vdb).__name__.lower()
+    if "qdrant" in backend and getattr(vdb, "_client", None) is not None:
+        # Qdrant: sync QdrantClient -> engine pool.
+        from lightrag.kg.qdrant_impl import workspace_filter_condition  # type: ignore[import-not-found]
+        from qdrant_client import models  # type: ignore[import-not-found]
+
+        client = vdb._client
+        namespace = vdb.final_namespace
+        workspace = vdb.effective_workspace
+        threshold = getattr(vdb, "cosine_better_than_threshold", None)
+
+        def _query_qdrant() -> Any:
+            return client.query_points(
+                collection_name=namespace,
+                query=vector,
+                limit=top_k,
+                with_payload=True,
+                score_threshold=threshold,
+                query_filter=models.Filter(must=[workspace_filter_condition(workspace)]),
+            ).points
+
+        points = await run_blocking(_query_qdrant)
+        _VECTOR_TIMINGS.set({
+            "backend": type(vdb).__name__,
+            "embed_ms": round(embed_ms, 2),
+            "backend_ms": round((time.perf_counter() - backend_started) * 1000.0, 2),
+        })
+        return [
+            {
+                **(point.payload or {}),
+                "distance": point.score,
+                "created_at": (point.payload or {}).get("created_at"),
+            }
+            for point in points
+        ]
+
+    # NanoVectorDB: numpy matmul over the in-process matrix -> engine pool.
+    if "nano" not in backend and not hasattr(vdb, "_get_client"):  # pragma: no cover - unknown backend
+        raise TypeError(f"no offloaded fast path for {type(vdb).__name__}")
+    client = await vdb._get_client()
+    from lightrag.kg.write_seq import WRITE_SEQ_FIELD  # type: ignore[import-not-found]
+
+    threshold = vdb.cosine_better_than_threshold
+
+    def _query_nano() -> list[dict[str, Any]]:
+        return client.query(query=vector, top_k=top_k, better_than_threshold=threshold)
+
+    rows = await run_blocking(_query_nano)
+    _VECTOR_TIMINGS.set({
+        "backend": type(vdb).__name__,
+        "embed_ms": round(embed_ms, 2),
+        "backend_ms": round((time.perf_counter() - backend_started) * 1000.0, 2),
+    })
+    return [
+        {
+            **{k: v for k, v in row.items() if k not in ("vector", WRITE_SEQ_FIELD)},
+            "id": row["__id__"],
+            "distance": row["__metrics__"],
+            "created_at": row.get("__created_at__"),
+        }
+        for row in rows
+    ]
+
+
 async def _compute_hybrid_block(
     rag: object,
     question: str,
@@ -1808,12 +1964,22 @@ async def _compute_hybrid_block(
                     routing_status["twin"]["used"] = False
                 logger.info("Multilingual retrieval fell back to base: %s", routing_status["fallback_reason"])
 
+        # NOTE (measured 2026-10-21): launching BM25, the dense query and the
+        # ripgrep scan concurrently was tried and reverted. On this host the
+        # three channels are already overlapped *across* requests (each is
+        # awaited on a thread/subprocess), and forcing all three of one request
+        # to run at once only tripled the instantaneous runnable set: at 16
+        # clients the load average went past 40 and p50 latency tripled. The
+        # constraint is per-request CPU, not the dependency chain, so the
+        # sequential order below is kept.
         sparse_start = time.monotonic()
         sparse_search_hits = await bm25_index.asearch(retrieval_query, pool_size)
         sparse_elapsed_ms = (time.monotonic() - sparse_start) * 1000
 
         dense_start = time.monotonic()
-        dense_raw = await rag.chunks_vdb.query(retrieval_query, top_k=pool_size)  # type: ignore[attr-defined]
+        dense_raw, dense_timings = await _vector_query_timed(
+            rag.chunks_vdb, retrieval_query, pool_size  # type: ignore[attr-defined]
+        )
         dense_elapsed_ms = (time.monotonic() - dense_start) * 1000
 
         sparse_hits = {
@@ -1871,62 +2037,71 @@ async def _compute_hybrid_block(
         # already be in the first top_k dense/sparse slots (which, by
         # definition of "off-index", it never is). Sliced to top_k right
         # before being returned, whichever path runs.
-        if routing_status is not None and routing_status["profile_applied"] in {"3way", "3way_twin"}:
-            routed_channels = [
-                {chunk_id: hit.score for chunk_id, hit in dense_hits.items()},
-                qwen_scores,
-                {chunk_id: hit.score for chunk_id, hit in sparse_hits.items()},
-            ]
-            # Use the same pool cutoff for each channel and preserve score
-            # order from each retriever before the deterministic fusion sort.
-            fused_pool = _fuse_routing_channels(
-                routed_channels, dense_hits, sparse_hits, bm25_index, pool_size
-            )
-        else:
-            fused_pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
+        # Fusion + learned ranker + graph bridge are pure CPU (numpy / LightGBM
+        # / networkx) and used to run inline on the event loop for the whole
+        # candidate pool. Run them as one unit on the engine pool: they are
+        # strictly sequential with respect to each other, so splitting them
+        # into several offloads would only add queueing overhead.
+        def _rank_candidate_pool() -> tuple[list[Any], dict[str, Any]]:
+            if routing_status is not None and routing_status["profile_applied"] in {"3way", "3way_twin"}:
+                routed_channels = [
+                    {chunk_id: hit.score for chunk_id, hit in dense_hits.items()},
+                    qwen_scores,
+                    {chunk_id: hit.score for chunk_id, hit in sparse_hits.items()},
+                ]
+                # Use the same pool cutoff for each channel and preserve score
+                # order from each retriever before the deterministic fusion sort.
+                pool = _fuse_routing_channels(
+                    routed_channels, dense_hits, sparse_hits, bm25_index, pool_size
+                )
+            else:
+                pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
 
-        # Learned channel-fusion ranker (opt-in via HARS_MEMORY_LTR_RANKER,
-        # fail-soft). Applied to the FULL pre-truncation pool so it can improve
-        # recall, not just reorder a truncated window — mirrors the offline
-        # `ltr_full` variant. No artifact / unloadable -> pool unchanged.
-        from hars_memory.retrieval.fusion import apply_ltr_ranker, ltr_ranker_enabled
+            # Learned channel-fusion ranker (opt-in via HARS_MEMORY_LTR_RANKER,
+            # fail-soft). Applied to the FULL pre-truncation pool so it can improve
+            # recall, not just reorder a truncated window — mirrors the offline
+            # `ltr_full` variant. No artifact / unloadable -> pool unchanged.
+            from hars_memory.retrieval.fusion import apply_ltr_ranker, ltr_ranker_enabled
 
-        if ltr_ranker_enabled():
-            fused_pool = apply_ltr_ranker(fused_pool, question)
+            if ltr_ranker_enabled():
+                pool = apply_ltr_ranker(pool, question)
 
-        # Graph/citation bridge channel (`retrieval/graph_bridge.py`) — opt-in
-        # via HARS_MEMORY_GRAPH_BRIDGE (default OFF until measured; see that
-        # module's docstring and eval_agentic/rca/graph_bridge/REPORT.md).
-        # Runs on the ALREADY-FUSED pool, seeded by its top-3 anchor chunks, and
-        # contributes up to 20 provenance-scored chunks BEFORE the ripgrep gate
-        # and the diversity/truncation pass below, so every downstream stage
-        # sees one pool. Fail-soft by construction (`maybe_augment_fused_pool`
-        # never raises): a missing/corrupt graph store degrades this channel to
-        # "contributed nothing" rather than breaking the query.
-        graph_bridge_report: dict[str, Any] = {
-            "enabled": False,
-            "reason": "HARS_MEMORY_GRAPH_BRIDGE=0 (default)",
-        }
-        graph_bridge_started = time.monotonic()
-        from hars_memory.retrieval.graph_bridge import (
-            HARS_MEMORY_GRAPH_BRIDGE_ENV,
-            graph_bridge_enabled,
-            maybe_augment_fused_pool,
-        )
+            # Graph/citation bridge channel (`retrieval/graph_bridge.py`) — opt-in
+            # via HARS_MEMORY_GRAPH_BRIDGE (default OFF until measured; see that
+            # module's docstring and eval_agentic/rca/graph_bridge/REPORT.md).
+            # Runs on the ALREADY-FUSED pool, seeded by its top-3 anchor chunks, and
+            # contributes up to 20 provenance-scored chunks BEFORE the ripgrep gate
+            # and the diversity/truncation pass below, so every downstream stage
+            # sees one pool. Fail-soft by construction (`maybe_augment_fused_pool`
+            # never raises): a missing/corrupt graph store degrades this channel to
+            # "contributed nothing" rather than breaking the query.
+            report: dict[str, Any] = {
+                "enabled": False,
+                "reason": "HARS_MEMORY_GRAPH_BRIDGE=0 (default)",
+            }
+            started = time.monotonic()
+            from hars_memory.retrieval.graph_bridge import (
+                HARS_MEMORY_GRAPH_BRIDGE_ENV,
+                graph_bridge_enabled,
+                maybe_augment_fused_pool,
+            )
 
-        if graph_bridge_enabled() and fused_pool:
-            fused_pool, graph_bridge_report = maybe_augment_fused_pool(
-                fused_pool, question, index_dir=chunk_wdir
-            )
-            graph_bridge_report["latency_ms"] = round(
-                (time.monotonic() - graph_bridge_started) * 1000.0, 2
-            )
-        else:
-            graph_bridge_report["reason"] = (
-                f"{HARS_MEMORY_GRAPH_BRIDGE_ENV}=0 (default)"
-                if not graph_bridge_enabled()
-                else "empty_pool"
-            )
+            if graph_bridge_enabled() and pool:
+                pool, report = maybe_augment_fused_pool(
+                    pool, question, index_dir=chunk_wdir
+                )
+                report["latency_ms"] = round((time.monotonic() - started) * 1000.0, 2)
+            else:
+                report["reason"] = (
+                    f"{HARS_MEMORY_GRAPH_BRIDGE_ENV}=0 (default)"
+                    if not graph_bridge_enabled()
+                    else "empty_pool"
+                )
+            return pool, report
+
+        fusion_started = time.monotonic()
+        fused_pool, graph_bridge_report = await run_blocking(_rank_candidate_pool)
+        fusion_rank_ms = (time.monotonic() - fusion_started) * 1000.0
 
         # Ripgrep channel (retrieval/ripgrep_channel.py) — additive gate over
         # the dense+sparse fusion above, NOT a third convex weight; see
@@ -1996,19 +2171,23 @@ async def _compute_hybrid_block(
                 # Keep the FULL pool through the ranked gate: the diversity
                 # selection below must see pre-truncation candidates, and the
                 # gate's own exclusive tail is re-appended after it so the
-                # presence guarantee is unchanged.
-                _pool_ids = {chunk.chunk_id for chunk in fused_pool}
-                _gated = apply_ripgrep_gate(
-                    fused_pool,
-                    _rg_hits_by_basename,
-                    top_k=len(fused_pool),
-                    question=question,
-                    ll_keywords=_ripgrep_keywords(ll_keywords),
-                )
-                additive_tail.extend(
-                    chunk for chunk in _gated if chunk.chunk_id not in _pool_ids
-                )
-                fused = _gated
+                # presence guarantee is unchanged. Ranked-gate scoring is
+                # synchronous Python over the whole pool -> engine pool.
+                def _gate_pool() -> tuple[list[Any], list[Any]]:
+                    pool_ids = {chunk.chunk_id for chunk in fused_pool}
+                    gated = apply_ripgrep_gate(
+                        fused_pool,
+                        _rg_hits_by_basename,
+                        top_k=len(fused_pool),
+                        question=question,
+                        ll_keywords=_ripgrep_keywords(ll_keywords),
+                    )
+                    return gated, [
+                        chunk for chunk in gated if chunk.chunk_id not in pool_ids
+                    ]
+
+                fused, injected = await run_blocking(_gate_pool)
+                additive_tail.extend(injected)
             else:
                 fused = list(fused_pool)
             ripgrep_report = {
@@ -2146,12 +2325,19 @@ async def _compute_hybrid_block(
         # Source-diversity selection over the FULL pre-truncation pool, then
         # slice to top_k. Additive-channel exclusives (ripgrep:/flat:) are not
         # part of that competition; they are re-appended afterwards, preserving
-        # their "never evicts, only appends" presence guarantee.
-        fused = _select_diverse_fused_chunks(fused, top_k)
-        selected_ids = {chunk.chunk_id for chunk in fused}
-        fused.extend(
-            chunk for chunk in additive_tail if chunk.chunk_id not in selected_ids
-        )
+        # their "never evicts, only appends" presence guarantee. Pure CPU over
+        # the whole pool -> engine pool.
+        def _select_and_append() -> list[Any]:
+            selected = _select_diverse_fused_chunks(fused, top_k)
+            selected_ids = {chunk.chunk_id for chunk in selected}
+            selected.extend(
+                chunk for chunk in additive_tail if chunk.chunk_id not in selected_ids
+            )
+            return selected
+
+        select_started = time.monotonic()
+        fused = await run_blocking(_select_and_append)
+        select_ms = (time.monotonic() - select_started) * 1000.0
 
         # Pre-rerank order — the TRUE fusion order v1 could only approximate
         # (compile_trace reconstructed "before" from dense scores). Captured
@@ -2301,67 +2487,82 @@ async def _compute_hybrid_block(
             routing_status["latency_ms"]["total"] = round(
                 (time.monotonic() - routing_started) * 1000.0, 2
             )
-        result = {
-            "enabled": True,
-            "alpha": HARS_MEMORY_HYBRID_ALPHA,
-            "alpha_status": "MEASURED 2026-07-29 empirical optimum (ndcg@10=0.7216 on the "
-                             "46-query retrieval_queries.yaml set) — see HARS_MEMORY_HYBRID_ALPHA "
-                             "comment in this file",
-            "candidate_pool_size": pool_size,
-            "fetch_top_k": effective_fetch_top_k,
-            "bm25_index": {
-                "chunks_indexed": bm25_index.chunk_count,
-                "cache_dir": HARS_MEMORY_BM25_CACHE_DIR,
-                "cache_status": bm25_cache_status,
-            },
-            "latency_ms": {
-                "sparse_channel": round(sparse_elapsed_ms, 2),
-                "dense_channel": round(dense_elapsed_ms, 2),
-                "ripgrep_channel": ripgrep_report.get("latency_ms"),
-                "flat_dense_channel": flat_report.get("latency_ms"),
-                "graph_bridge_channel": graph_bridge_report.get("latency_ms"),
-                "rerank_channel": round(rerank_elapsed_ms, 2) if rerank_elapsed_ms is not None else None,
-            },
-            "rerank": rerank_status,
-            "ripgrep": ripgrep_report,
-            "flat_dense": flat_report,
-            "graph_bridge": graph_bridge_report,
-            "confidence": {
-                "top_dense_score": round(top_dense_score, 4) if top_dense_score is not None else None,
-                "low_confidence": low_confidence,
-                "threshold": NO_ANSWER_DENSE_SCORE_THRESHOLD,
-                "note": (
-                    "top_dense_score is the best RAW dense cosine similarity across the "
-                    "retrieved candidate pool for this question — NOT fused_chunks[].fused_score "
-                    "(that value is per-query min-max normalized and is near-1.0 for almost any "
-                    "top hit, uninformative for this purpose). low_confidence=true means this "
-                    "score falls in the range measured for verified-absent (no_answer) queries "
-                    "on this corpus. This is a MARKER, not a filter: results below threshold are "
-                    "still returned in full here and in `context`/`answer` — treat them as "
-                    "unverified, not as evidence, before citing them to the user."
-                ),
-            },
-            "identifier_query_detected": bool(identifier_terms),
-            "identifiers": identifier_terms,
-            "identifier_matches": identifier_matches or None,
-            "fused_chunks": [
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "fused_score": round(chunk.fused_score, 4),
-                    "dense_score": chunk.dense_score,
-                    "sparse_score": chunk.sparse_score,
-                    "file_path": chunk.file_path,
-                    "content": chunk.content,
-                    "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
-                    **_chunk_location_fields(
-                        chunk_wdir, chunk.chunk_id, _extract_breadcrumb_from_content(chunk.content)
+        # Response assembly: per-chunk location lookups (`chunk_location`)
+        # and the serialization of every fused chunk are synchronous file/CPU
+        # work; build the payload on the engine pool so a large response does
+        # not stall other clients' requests.
+        def _build_hybrid_result() -> dict[str, Any]:
+            result = {
+                "enabled": True,
+                "alpha": HARS_MEMORY_HYBRID_ALPHA,
+                "alpha_status": "MEASURED 2026-07-29 empirical optimum (ndcg@10=0.7216 on the "
+                                 "46-query retrieval_queries.yaml set) — see HARS_MEMORY_HYBRID_ALPHA "
+                                 "comment in this file",
+                "candidate_pool_size": pool_size,
+                "fetch_top_k": effective_fetch_top_k,
+                "bm25_index": {
+                    "chunks_indexed": bm25_index.chunk_count,
+                    "cache_dir": HARS_MEMORY_BM25_CACHE_DIR,
+                    "cache_status": bm25_cache_status,
+                },
+                "latency_ms": {
+                    "sparse_channel": round(sparse_elapsed_ms, 2),
+                    "dense_channel": round(dense_elapsed_ms, 2),
+                    "dense_embed": dense_timings.get("embed_ms"),
+                    "dense_backend": dense_timings.get("backend_ms"),
+                    "vector_backend": dense_timings.get("backend"),
+                    "fusion_rank": round(fusion_rank_ms, 2),
+                    "select": round(select_ms, 2),
+                    "ripgrep_channel": ripgrep_report.get("latency_ms"),
+                    "flat_dense_channel": flat_report.get("latency_ms"),
+                    "graph_bridge_channel": graph_bridge_report.get("latency_ms"),
+                    "rerank_channel": round(rerank_elapsed_ms, 2) if rerank_elapsed_ms is not None else None,
+                },
+                "rerank": rerank_status,
+                "ripgrep": ripgrep_report,
+                "flat_dense": flat_report,
+                "graph_bridge": graph_bridge_report,
+                "confidence": {
+                    "top_dense_score": round(top_dense_score, 4) if top_dense_score is not None else None,
+                    "low_confidence": low_confidence,
+                    "threshold": NO_ANSWER_DENSE_SCORE_THRESHOLD,
+                    "note": (
+                        "top_dense_score is the best RAW dense cosine similarity across the "
+                        "retrieved candidate pool for this question — NOT fused_chunks[].fused_score "
+                        "(that value is per-query min-max normalized and is near-1.0 for almost any "
+                        "top hit, uninformative for this purpose). low_confidence=true means this "
+                        "score falls in the range measured for verified-absent (no_answer) queries "
+                        "on this corpus. This is a MARKER, not a filter: results below threshold are "
+                        "still returned in full here and in `context`/`answer` — treat them as "
+                        "unverified, not as evidence, before citing them to the user."
                     ),
-                }
-                for chunk in fused
-            ],
-        }
-        if routing_status is not None:
-            result["routing"] = routing_status
+                },
+                "identifier_query_detected": bool(identifier_terms),
+                "identifiers": identifier_terms,
+                "identifier_matches": identifier_matches or None,
+                "fused_chunks": [
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "fused_score": round(chunk.fused_score, 4),
+                        "dense_score": chunk.dense_score,
+                        "sparse_score": chunk.sparse_score,
+                        "file_path": chunk.file_path,
+                        "content": chunk.content,
+                        "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
+                        **_chunk_location_fields(
+                            chunk_wdir, chunk.chunk_id, _extract_breadcrumb_from_content(chunk.content)
+                        ),
+                    }
+                    for chunk in fused
+                ],
+            }
+            if routing_status is not None:
+                result["routing"] = routing_status
+            return result
+
+        build_started = time.monotonic()
+        result = await run_blocking(_build_hybrid_result)
+        result["latency_ms"]["assemble"] = round((time.monotonic() - build_started) * 1000.0, 2)
         return result
     except BM25IndexUnavailableError as exc:
         result = {"enabled": False, "reason": str(exc), "rerank": rerank_status}
@@ -3866,13 +4067,54 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
-    project_id = str(args.get("project") or "default").strip()
-    raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
+    """MCP tool entry point.
 
+    In **combined** mode this *is* the implementation. In **edge** mode
+    (``HARS_MEMORY_MCP_MODE=split``) the tool call is scope-checked here — the
+    engine process has no OAuth grant and must never be trusted to — and then
+    forwarded over the engine socket. Tool *listing* stays local: the schema is
+    static, so no index is needed to answer ``tools/list``.
+    """
+    args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
     grant = _http_grant()
     if grant is not None and not grant.has_scope(required_scope_for_tool(name)):
         return _scope_error(grant, name)
+
+    router = get_router()
+    if router is not None:
+        project_id = str(args.get("project") or "default").strip()
+        client = router.client_for(project_id)
+        if client is not None:
+            try:
+                return await client.call_tool(name, arguments)
+            except EngineUnavailable as exc:
+                logger.error("Engine unavailable for tool %s (project=%s): %s", name, project_id, exc)
+                return json_text({
+                    "ok": False,
+                    "error_type": "EngineUnavailableError",
+                    "error": f"{exc}. Check the engine process and "
+                             f"$HARS_MEMORY_MCP_ENGINE_SOCKET(S).",
+                    "code": 503,
+                    "retryable": True,
+                })
+            except EngineError as exc:
+                logger.error("Engine error for tool %s (project=%s): %s", name, project_id, exc)
+                return json_text({
+                    "ok": False,
+                    "error_type": "OverloadedError" if exc.overloaded else "EngineError",
+                    "error": exc.message,
+                    "code": 503 if exc.overloaded else 500,
+                    "retryable": exc.overloaded,
+                })
+
+    return await execute_tool(name, arguments)
+
+
+async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
+    """Execute one MCP tool in this process (the engine's real body)."""
+    args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
+    project_id = str(args.get("project") or "default").strip()
+    raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
 
     registry = get_default_project_registry()
     token_store = TokenStore(config_path=HARS_MEMORY_TOKENS_CONFIG) if HARS_MEMORY_TOKENS_CONFIG else get_default_token_store()
@@ -5243,6 +5485,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         return json_text({"ok": False, "error": f"Unknown tool: {name}"})
 
+    except EngineOverloaded as exc:
+        # Bounded-queue backpressure: the engine pool is saturated (workers +
+        # queue full). Refuse fast with a retryable signal instead of letting
+        # latency grow without bound; see hars_memory/mcp_runtime.py.
+        logger.warning("Tool %s refused: %s", name, exc)
+        return json_text({
+            "ok": False,
+            "error_type": "OverloadedError",
+            "error": str(exc),
+            "code": 503,
+            "retryable": True,
+        })
     except Exception as exc:
         logger.exception("Unhandled error in tool %s", name)
         error_type = type(exc).__name__
