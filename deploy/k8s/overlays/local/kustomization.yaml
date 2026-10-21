@@ -28,9 +28,18 @@ images:
     newName: registry.local/hars-longterm-memory
     newTag: "0.8.1"
 
+# OPTIONAL in-cluster embedder. With one user, an external embedder is often
+# simpler; enable this to run llama-server next to the app (see README,
+# "Embedder sizing").
+# components:
+#   - ../../components/embedder
+
 patches:
   - path: configmap.patch.yaml
   - path: pvc.patch.yaml
   - path: deployment-resources.patch.yaml
   # Optional: publish on a node port for a home LAN / WireGuard interface.
   # - path: service-nodeport.patch.yaml
+  # Embedder component only (uncomment the component below, then these):
+  # - path: embedder-sizing.patch.yaml
+  # - path: embedder-storageclass.patch.yaml
