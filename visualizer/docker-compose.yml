@@ -17,7 +17,10 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        VITE_BASE: /
+        # Built for same-origin hosting under /memory/ (the HARS GUI embeds it over
+        # HTTPS). The nginx config also keeps location / working, so a direct
+        # http://host:4400/ still renders.
+        VITE_BASE: /memory/
     image: memory-travel:local
     container_name: hars-memory-travel
     network_mode: host
