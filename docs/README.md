@@ -15,6 +15,7 @@ and CPU-only embeddings.
 | [Incremental refresh](incremental-refresh.md) | `plan / apply / audit / repair-orphans` CLI for refreshing a large LightRAG index without a full rebuild |
 | [Release process](release-process.md) | How to publish a new version — PyPI package, container image, CI/CD |
 | [Index service](index-service.md) | HTTP index-job service — SDK, API, deployment, artifact stores |
+| [Kubernetes deployment](deployment/kubernetes.md) | HTTP MCP + OAuth on k8s: topologies, embedder sizing, apply/restore |
 | [gRPC reference](grpc-reference.md) | gRPC service — 7 RPCs, client usage, configuration, health check |
 | [Ripgrep ranked channel](ripgrep-ranked-channel.md) | The literal-search channel as a first-class RANKED fusion channel (default ON): structural verdict, scoring, flags, measurements, deployment |
 | [Channel hygiene](CHANNEL_HYGIENE.md) | Per-channel audit: what is live, dormant, redundant, or a deletion candidate |
