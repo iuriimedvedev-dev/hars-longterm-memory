@@ -1847,6 +1847,15 @@ async def _compute_hybrid_block(
         else:
             fused_pool = fuse(dense_hits, sparse_hits, HARS_MEMORY_HYBRID_ALPHA)
 
+        # Learned channel-fusion ranker (opt-in via HARS_MEMORY_LTR_RANKER,
+        # fail-soft). Applied to the FULL pre-truncation pool so it can improve
+        # recall, not just reorder a truncated window — mirrors the offline
+        # `ltr_full` variant. No artifact / unloadable -> pool unchanged.
+        from hars_memory.retrieval.fusion import apply_ltr_ranker, ltr_ranker_enabled
+
+        if ltr_ranker_enabled():
+            fused_pool = apply_ltr_ranker(fused_pool, question)
+
         # Graph/citation bridge channel (`retrieval/graph_bridge.py`) — opt-in
         # via HARS_MEMORY_GRAPH_BRIDGE (default OFF until measured; see that
         # module's docstring and eval_agentic/rca/graph_bridge/REPORT.md).
