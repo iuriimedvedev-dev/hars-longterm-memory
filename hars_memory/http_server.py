@@ -41,15 +41,17 @@ Entry point: ``hars-longterm-memory-mcp-https``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import ssl
 import time
+import uuid
 from typing import Any
 
 import uvicorn
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -102,6 +104,38 @@ def _json(status: int, body: dict[str, Any], extra: dict[str, str] | None = None
     return JSONResponse(body, status_code=status, headers=headers)
 
 
+class _PeekedReceive:
+    """Capture the request body, then delegate unchanged.
+
+    Streamable HTTP clients (the memory visualizer among them) require a
+    ``Mcp-Session-Id`` header on the ``initialize`` response. The server runs
+    the SDK session manager in stateless mode, which does not assign one, so
+    the gateway assigns an opaque per-initialize id. Peeking at the body is
+    enough to tell an ``initialize`` apart from ``tools/list`` / ``tools/call``.
+    """
+
+    def __init__(self, receive: Any) -> None:
+        self._receive = receive
+        self.body = b""
+
+    async def __call__(self) -> dict[str, Any]:
+        message = await self._receive()
+        if message.get("type") == "http.request":
+            self.body += message.get("body", b"") or b""
+        return message
+
+
+def _is_initialize(body: bytes) -> bool:
+    """True when the JSON-RPC body is an ``initialize`` request."""
+    try:
+        payload = json.loads(body or b"null")
+    except (ValueError, TypeError):
+        return False
+    items = payload if isinstance(payload, list) else [payload]
+    return any(isinstance(item, dict) and item.get("method") == "initialize" for item in items)
+
+
+
 class MCPGateway:
     """Route ``/mcp`` to the session manager behind the bearer-token gate.
 
@@ -123,6 +157,17 @@ class MCPGateway:
         if scope["type"] != "http" or scope.get("path") != self.path:
             await self.inner(scope, receive, send)
             return
+
+        peeked = _PeekedReceive(receive)
+        receive = peeked
+        original_send = send
+
+        async def send_with_session(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start" and _is_initialize(peeked.body):
+                MutableHeaders(scope=message).setdefault("Mcp-Session-Id", uuid.uuid4().hex)
+            await original_send(message)
+
+        send = send_with_session
 
         if not self.provider.enabled:
             await self.manager.handle_request(scope, receive, send)
