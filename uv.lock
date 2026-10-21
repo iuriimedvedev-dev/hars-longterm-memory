@@ -804,7 +804,7 @@ wheels = [
 
 [[package]]
 name = "hars-longterm-memory"
-version = "0.8.0"
+version = "0.8.1"
 source = { editable = "." }
 dependencies = [
     { name = "bm25s" },
@@ -823,6 +823,7 @@ dependencies = [
     { name = "qdrant-client" },
     { name = "requests" },
     { name = "sentence-transformers" },
+    { name = "starlette" },
     { name = "tenacity" },
     { name = "tiktoken" },
     { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
@@ -891,6 +892,7 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=5.0.0" },
     { name = "sqlalchemy", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "sqlalchemy", marker = "extra == 'server'", specifier = ">=2.0.0" },
+    { name = "starlette", specifier = ">=0.37" },
     { name = "tenacity", specifier = ">=9.0.0" },
     { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "torch", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cpu" },

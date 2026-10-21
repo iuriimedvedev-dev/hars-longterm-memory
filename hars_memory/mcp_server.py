@@ -82,6 +82,11 @@ from hars_memory.auth import (
     get_default_token_store,
     is_auth_enabled,
 )
+from hars_memory.mcp_oauth import (
+    GRANT_SCOPE_KEY,
+    Grant,
+    required_scope_for_tool,
+)
 from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
@@ -814,6 +819,39 @@ ENTITY_ALIASES.update(_load_extra_entity_aliases())
 # App
 # ---------------------------------------------------------------------------
 app = Server("hars-longterm-memory")
+
+#: Set on the ASGI scope by ``hars_memory.http_server`` when OAuth is enabled;
+#: absent on the stdio path (auth then stays token-store based, as before).
+GRANT_SCOPE_ATTR = GRANT_SCOPE_KEY
+
+
+def _http_grant() -> Grant | None:
+    """The OAuth grant for the current HTTP request, or None on stdio."""
+    try:
+        request = app.request_context.request
+    except (LookupError, AttributeError):
+        return None
+    if request is None:
+        return None
+    scope = getattr(request, "scope", None) or {}
+    grant = scope.get(GRANT_SCOPE_ATTR)
+    return grant if isinstance(grant, Grant) else None
+
+
+def _scope_error(grant: Grant, tool_name: str) -> list[TextContent]:
+    required = required_scope_for_tool(tool_name)
+    return json_text({
+        "ok": False,
+        "error": "insufficient_scope",
+        "error_description": (
+            f"{tool_name} requires the '{required}' scope; token has "
+            f"{sorted(grant.scopes)}"
+        ),
+        "required_scope": required,
+        "granted_scopes": sorted(grant.scopes),
+        "error_type": "ForbiddenError",
+        "code": 403,
+    })
 
 # Lazy-initialised LightRAG instance (only for actual queries, not status).
 _rag_instance: object | None = None
@@ -3408,7 +3446,7 @@ def _merge_context_with_fusion(
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
         tool(
             "memory_recall",
             (
@@ -3814,6 +3852,11 @@ async def list_tools() -> list[Tool]:
             {},
         ),
     ]
+    grant = _http_grant()
+    if grant is None:
+        return tools
+    # HTTP/OAuth path: never advertise a tool the presented token cannot call.
+    return [item for item in tools if grant.has_scope(required_scope_for_tool(item.name))]
 
 
 # ---------------------------------------------------------------------------
@@ -3826,6 +3869,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
     project_id = str(args.get("project") or "default").strip()
     raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
+
+    grant = _http_grant()
+    if grant is not None and not grant.has_scope(required_scope_for_tool(name)):
+        return _scope_error(grant, name)
 
     registry = get_default_project_registry()
     token_store = TokenStore(config_path=HARS_MEMORY_TOKENS_CONFIG) if HARS_MEMORY_TOKENS_CONFIG else get_default_token_store()
