@@ -228,6 +228,28 @@ class TestOAuthFlow:
         assert body["result"]["serverInfo"]["name"] == "hars-longterm-memory"
         assert "tools" in body["result"]["capabilities"]
 
+    def test_initialize_returns_mcp_session_id(self, client):
+        """Stateless mode assigns no session; the gateway still must return one
+        because Streamable HTTP clients (the memory visualizer) require it."""
+        tokens = full_flow(client)
+        response = initialize(client, tokens["access_token"])
+        assert response.status_code == 200, response.text
+        session_id = response.headers.get("mcp-session-id")
+        assert session_id
+        assert len(session_id) == 32
+
+        follow = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={
+                **MCP_HEADERS,
+                "authorization": f"Bearer {tokens['access_token']}",
+                "mcp-session-id": session_id,
+            },
+        )
+        assert follow.status_code == 200, follow.text
+        assert "tools" in follow.json()["result"]
+
     def test_missing_bearer_is_401_with_resource_metadata(self, client):
         response = initialize(client, None)
         assert response.status_code == 401
