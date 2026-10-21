@@ -7,6 +7,10 @@ standalone `hars-longterm-memory-mcp` entrypoint).
 All tools use `stdio` transport. The server is CPU-only for queries — no GPU
 required after indexing.
 
+> Serving the same tools over Streamable HTTP(S) from one shared-index process,
+> with OAuth 2.1 and per-scope tool visibility, is documented in
+> [`http-mcp.md`](http-mcp.md).
+
 ## Tool overview
 
 | Tool | Purpose | GPU-free | Admin |
