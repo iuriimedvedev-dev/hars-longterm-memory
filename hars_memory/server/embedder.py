@@ -261,10 +261,51 @@ def _make_async_client(timeout: float) -> object:
 
     Module-level indirection so tests can monkeypatch in an
     httpx.MockTransport-backed client without any real network.
+
+    The client is meant to be **long-lived** (one per event loop, see
+    ``_shared_client``): a fresh ``AsyncClient`` per embedding call costs a TCP
+    handshake per recall and defeats llama-server's keep-alive, which measured
+    as 5x worse embed latency at 8 concurrent clients than the embedder's own
+    capacity. The connection pool is bounded by
+    ``HARS_MEMORY_EMBED_HTTP_MAX_CONNECTIONS`` (default 32) so a burst of
+    recalls cannot open unbounded sockets against the embedder.
     """
     import httpx
 
-    return httpx.AsyncClient(timeout=timeout)
+    try:
+        max_connections = max(1, int(os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_CONNECTIONS", "32")))
+    except ValueError:
+        max_connections = 32
+    keepalive = max(
+        1,
+        int(os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_KEEPALIVE", str(max_connections))),
+    )
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=min(keepalive, max_connections),
+        ),
+    )
+
+
+#: Long-lived embedder clients, one per (embed function, event loop). Closed by
+#: :func:`aclose_http_clients` from the server's shutdown path.
+_OPEN_CLIENTS: list[object] = []
+
+
+def _register_client(client: object) -> None:
+    _OPEN_CLIENTS.append(client)
+
+
+async def aclose_http_clients() -> None:
+    """Close the pooled embedder clients (best effort, idempotent)."""
+    while _OPEN_CLIENTS:
+        client = _OPEN_CLIENTS.pop()
+        try:
+            await client.aclose()  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - best effort
+            pass
 
 
 class _BatchSizeLimitError(RuntimeError):
@@ -431,6 +472,12 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
         "tokens_known": True,  # False once a response omits usage.prompt_tokens
         "last_request_at": 0.0,
     }
+
+    #: id(loop) -> (loop, AsyncClient). One pooled client per event loop, so a
+    #: multi-loop process (tests, benchmarks, TestClient portals) never shares
+    #: an AsyncClient across loops while the server itself keeps one connection
+    #: pool for its whole life.
+    _shared: dict[int, tuple[object, object]] = {}
 
     logger.info(
         "HTTP embedder: model=%r @ %s (batch=%d, max_inputs=%d, timeout=%.0fs, "
@@ -669,6 +716,8 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
         return out
 
     async def embed(texts: list[str], context: str | None = None, **_kwargs: object) -> "np.ndarray":
+        import asyncio
+
         import numpy as np
 
         if not texts:
@@ -686,10 +735,24 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
         # remote-API per-request input limit.
         step = min(batch_size, max_inputs_per_request)
 
-        async with _make_async_client(timeout) as client:  # type: ignore[attr-defined]
-            vectors: list[list[float]] = []
-            for start in range(0, len(inputs), step):
-                vectors.extend(await _embed_chunk(client, inputs[start : start + step]))
+        # ONE client per event loop, reused across calls. Creating a client per
+        # call (the previous behaviour) meant a TCP handshake per recall and no
+        # keep-alive — at 8 concurrent recalls that alone cost ~5x the
+        # embedder's own latency budget.
+        loop = asyncio.get_running_loop()
+        entry = _shared.get(id(loop))
+        if entry is None or entry[0] is not loop:
+            client = _make_async_client(timeout)  # type: ignore[assignment]
+            _register_client(client)
+            entry = (loop, client)
+            _shared[id(loop)] = entry
+            logger.info(
+                "HTTP embedder client pool created (max_connections=%s, keep-alive)",
+                os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_CONNECTIONS", "32"),
+            )
+        vectors: list[list[float]] = []
+        for start in range(0, len(inputs), step):
+            vectors.extend(await _embed_chunk(entry[1], inputs[start : start + step]))
 
         run["texts"] += len(texts)
         token_summary = (
