@@ -1,6 +1,6 @@
 # MCP tool reference
 
-The `hars-longterm-memory` package exposes 7 MCP tools. All tools are registered
+The `hars-longterm-memory` package exposes 15 MCP tools. All tools are registered
 in `.mcp.json` and launched via `uv run --project <project> memory-mcp` (or the
 standalone `hars-longterm-memory-mcp` entrypoint).
 
@@ -17,11 +17,19 @@ required after indexing.
 |---|---|---|---|
 | `memory_recall` | Query the knowledge graph (primary workhorse) | Yes | No |
 | `memory_remember` | Save a knowledge note into staging | Yes | No |
+| `memory_compact` | Persist one session compaction (summary + dropped facts) | No (extractor) | No |
+| `memory_merge_session` | Consolidate a split-mode session into the main graph | No (extractor) | No |
+| `memory_session_status` | Session compaction inventory and merge state | Yes | No |
 | `memory_entities` | Search entities by name + 1-hop neighbourhood | Yes | No |
+| `memory_inspect_entity` | Full entity detail: properties, description, relationships | Yes | No |
 | `memory_related` | N-hop subgraph traversal from an entity | Yes | No |
 | `memory_status` | Index health, freshness, source breakdown | Yes | No |
+| `memory_sync_status` | Zero-LLM divergence check between disk sources and index | Yes | No |
 | `memory_consolidate` | Trigger incremental reindex | No (if GPU guard configured) | Yes |
 | `memory_forget` | Purge stale documents by date | Yes | Yes |
+| `memory_upsert_document` | Insert or update one document | No (extractor) | No |
+| `memory_delete_document` | Delete one document and its unshared entities | No (extractor) | Yes |
+| `memory_list_projects` | List knowledge base projects visible to the token | Yes | No |
 
 ---
 
@@ -46,6 +54,7 @@ candidate ranking, with the LightRAG graph pass as an independent second branch.
 | `context_priority` | `enum` | `merged` | Context assembly: `merged` (score-ordered chunk assembly across both branches with supersession rescoring; `fusion_only` is reported when the graph branch was skipped), `lightrag` (original LightRAG order — also forces the graph branch on). Only affects `context_only=true` |
 | `max_chars` | `integer` | `15000` | Per-call total char budget for the assembled `context`; `0` = no cap. Default from `HARS_MEMORY_CONTEXT_MAX_CHARS` |
 | `debug` | `boolean` | `false` | Include debug data: `fused_chunks`, `latency_breakdown`, `llm_usage`, `raw_result` |
+| `session_id` | `string` | — | Optional session id: appends that session's unmerged compaction chunks (cosine + lexical F1) as `session:<sid>:<chunk_id>` entries, adds a `session` status block. No behavior change when omitted |
 
 ### Response shape
 
@@ -177,6 +186,141 @@ run. No LLM, no GPU — instant file write.
 - Filename is prefixed with the current date
 - Tags are written as YAML frontmatter in the markdown file
 - No LLM call, no GPU — purely a filesystem write
+
+---
+
+## memory_compact
+
+Persist one agent-session compaction into long-term memory: the summary plus the
+facts from the context the compaction dropped. This is what stops knowledge from
+evaporating on the next context compaction.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `session_id` | `string` | **required** | Session identifier: 1–128 chars from `[A-Za-z0-9._-]` (traversal-safe) |
+| `summary` | `string` | **required** | The compaction summary kept in context |
+| `dropped_context` | `string[] \| string` | — | Facts from the dropped context: an array of strings (one fact each) or a single newline-separated string |
+| `metadata` | `object` | — | Optional small JSON object stored as one `Metadata:` line |
+| `seq` | `integer` | auto | Explicit sequence number. Omit to allocate `1 + max seen` |
+| `project` | `string` | `default` | Project id |
+
+### Response shape
+
+```json
+{
+  "ok": true,
+  "session_id": "sess-42",
+  "seq": 7,
+  "doc_id": "session:sess-42:c7",
+  "mode": "split",
+  "index_dir": "/var/lib/hars/index/sessions/sess-42"
+}
+```
+
+### Key behaviours
+
+- **Two modes** (`HARS_MEMORY_SESSION_MODE`):
+  `split` (default) keeps each session in its own LightRAG working directory
+  under `HARS_MEMORY_SESSIONS_DIR`; `subgraph` indexes the compaction directly
+  into the main graph and links entities there
+- **Traversal-safe ids**: path separators, unicode, empty and over-long ids are
+  rejected with `ok: false`
+- **Sequence sidecar**: `seq.json` is written atomically before the ingest and
+  rolled back if the ingest fails, so a failed compaction never burns a number
+- **Fingerprint no-op**: re-compacting the same `(session_id, seq)` with
+  identical content is skipped by the content-fingerprint gate
+- **Storage isolation**: split-mode ingests force `NanoVectorDBStorage` +
+  `NetworkXStorage` even when the main index uses Qdrant
+- **Fact normalisation**: `dropped_context` items are flattened to one bullet
+  each; internal newlines are collapsed, blank items are dropped
+
+---
+
+## memory_merge_session
+
+Consolidate a completed split-mode session into the MAIN knowledge graph.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `session_id` | `string` | **required** | Session identifier |
+| `delete_source` | `boolean` | `false` | Remove the session working directory after a successful merge |
+| `project` | `string` | `default` | Project id |
+
+### Response shape
+
+```json
+{
+  "ok": true,
+  "session_id": "sess-42",
+  "merged": true,
+  "merged_at": "2026-10-22T18:04:11",
+  "compactions": 30,
+  "chars": 18420,
+  "alias_hints": ["LightRAG Server -> LightRAG", "Nano VectorDB -> NanoVectorDB"],
+  "merged_doc_id": "session:sess-42:merged",
+  "delete_source": false
+}
+```
+
+### Key behaviours
+
+- Builds **one chronological document** (`## Compaction <n>` sections plus an
+  `## Entity aliases` section) and re-ingests it into the main index, letting
+  LightRAG's own extraction resolve entities
+- Alias hints come from exact normalised name matches between the session and
+  main GraphML graphs, plus `difflib` near-duplicates (cutoff 0.92)
+- **Idempotent**: `merged.json` acts as a merge marker — a second call returns
+  the recorded payload with `already_merged: true` and does NOT re-ingest
+- **Subgraph mode** returns `merged: false` with a reason (nothing to merge)
+- A missing session directory returns `ok: false` with an `unknown session` error
+- On success the MCP graph/BM25 caches are invalidated
+
+---
+
+## memory_session_status
+
+Report session compaction inventory and merge state. GPU-free, no LLM calls.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `session_id` | `string` | — | Omit to list every session; supply to get one detail block |
+| `project` | `string` | `default` | Project id |
+
+### Response shape
+
+```json
+{
+  "ok": true,
+  "mode": "split",
+  "sessions_dir": "/var/lib/hars/index/sessions",
+  "sessions": [
+    {
+      "session_id": "sess-42",
+      "mode": "split",
+      "exists": true,
+      "index_dir": "/var/lib/hars/index/sessions/sess-42",
+      "compactions": 30,
+      "merged": false,
+      "merged_at": null,
+      "entities": 41,
+      "relations": 76
+    }
+  ]
+}
+```
+
+### Key behaviours
+
+- With `session_id`, the response is one detail block instead of a `sessions` list
+- **Fail-soft statistics**: corrupt/missing JSON or GraphML files read as zeros
+  and `exists: false` for an unknown session — the call still succeeds
+- Invalid session ids are rejected with `ok: false`
 
 ---
 
