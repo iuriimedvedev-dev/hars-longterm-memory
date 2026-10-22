@@ -77,6 +77,9 @@ def test_real_mcp_stdio_transport_is_llm_and_network_free(tmp_path: Path) -> Non
                     "memory_list_projects",
                     "memory_consolidate",
                     "memory_forget",
+                    "memory_compact",
+                    "memory_merge_session",
+                    "memory_session_status",
                 }
 
                 status = json.loads(

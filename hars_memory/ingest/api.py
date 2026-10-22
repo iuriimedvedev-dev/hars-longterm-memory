@@ -134,7 +134,15 @@ class IngestResult:
     errors: list[str] = field(default_factory=list)
 
 
-def ingest_documents(docs: list[Document], *, index_dir: Path) -> IngestResult:
+def ingest_documents(
+    docs: list[Document],
+    *,
+    index_dir: Path,
+    vector_storage: str | None = None,
+    graph_storage: str | None = None,
+    batch_size: int | None = None,
+    embed_batch_size: int | None = None,
+) -> IngestResult:
     """Ingest pre-built `Document` objects into the index at `index_dir`.
 
     This is the integration point for any document source that isn't a
@@ -155,11 +163,47 @@ def ingest_documents(docs: list[Document], *, index_dir: Path) -> IngestResult:
     how many incoming documents were excluded from ``ainsert()`` this call
     for exactly that reason. See this module's docstring for what "written"
     does and does not guarantee about downstream LLM extraction.
+
+    ``vector_storage`` / ``graph_storage``:
+        Optional explicit LightRAG storage backends for THIS index directory.
+        ``None`` (the default) keeps the existing env-driven behaviour
+        (``HARS_MEMORY_VECTOR_STORAGE`` / ``HARS_MEMORY_GRAPH_STORAGE``), so
+        every pre-existing caller is unaffected. Callers that write an
+        isolated sub-index (e.g. ``session_memory``'s per-session working
+        directory) pass file-backed names explicitly so a Qdrant-backed main
+        index cannot mix that data into its own collections.
+
+    ``batch_size``:
+        Documents handed to ``ainsert()`` per call. ``None`` (the default)
+        keeps reading ``HARS_MEMORY_INSERT_BATCH_SIZE`` exactly as before.
+
+    ``embed_batch_size``:
+        CPU embedding batch size for the LightRAG instance built for this
+        call. ``None`` (the default) keeps ``create_lightrag``'s own default
+        (32), so pre-existing callers are unchanged. Session compaction
+        indexing passes its own batch-size knob here.
     """
-    return asyncio.run(_ingest_documents_async(docs, index_dir))
+    return asyncio.run(
+        _ingest_documents_async(
+            docs,
+            index_dir,
+            vector_storage=vector_storage,
+            graph_storage=graph_storage,
+            batch_size=batch_size,
+            embed_batch_size=embed_batch_size,
+        )
+    )
 
 
-async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> IngestResult:
+async def _ingest_documents_async(
+    docs: list[Document],
+    index_dir: Path,
+    *,
+    vector_storage: str | None = None,
+    graph_storage: str | None = None,
+    batch_size: int | None = None,
+    embed_batch_size: int | None = None,
+) -> IngestResult:
     if not docs:
         return IngestResult(documents_written=0, documents_skipped=0, errors=[])
 
@@ -178,7 +222,12 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
     from hars_memory.server.lightrag_init import create_lightrag
     from lightrag.base import DocStatus  # type: ignore[import-not-found]
 
-    rag = create_lightrag(working_dir=str(index_dir))
+    rag = create_lightrag(
+        working_dir=str(index_dir),
+        vector_storage=vector_storage,
+        graph_storage=graph_storage,
+        **({"embed_batch_size": embed_batch_size} if embed_batch_size is not None else {}),
+    )
     written = 0
     errors: list[str] = []
     initialized = False
@@ -191,10 +240,16 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
             # LightRAG's doc_id-based dedupe cannot silently keep it.
             await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
         if to_insert:
-            batch_size = int(
-                os.environ.get(_INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE))
+            effective_batch_size = (
+                batch_size
+                if batch_size is not None
+                else int(
+                    os.environ.get(
+                        _INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE)
+                    )
+                )
             )
-            await _insert_all_batches(rag, to_insert, batch_size)
+            await _insert_all_batches(rag, to_insert, effective_batch_size)
 
             inserted_ids = [doc.doc_id for doc in to_insert]
             # _insert_all_batches()/ainsert() not raising only means the
