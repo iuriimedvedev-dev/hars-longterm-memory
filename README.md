@@ -514,3 +514,12 @@ To add a dependency:
 ```bash
 uv add --project tools/memory <package>
 ```
+
+## License and attribution
+
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+If you use this software in a product, publication or service, you must keep
+the NOTICE file and cite the project:
+
+    https://github.com/iuriimedvedev-dev/hars-longterm-memory

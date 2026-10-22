@@ -8,6 +8,7 @@ version = "0.8.1"
 description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
 requires-python = ">=3.13"
 readme = "README.md"
+license = { text = "Apache-2.0" }
 
 dependencies = [
   # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall.
